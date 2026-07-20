@@ -2,15 +2,13 @@
   "name": "agenttown",
   "private": true,
   "license": "AGPL-3.0-only",
+  "packageManager": "pnpm@11.9.0",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck",
-    "probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake",
-    "probe:real": "powershell -NoProfile -File scripts/run-real-probes.ps1",
-    "benchmark:frameworks": "powershell -NoProfile -File scripts/run-framework-benchmark.ps1"
+    "typecheck": "pnpm -r --if-present typecheck"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

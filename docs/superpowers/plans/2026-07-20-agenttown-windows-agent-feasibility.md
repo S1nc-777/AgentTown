@@ -62,7 +62,7 @@ docs/adr/0001-desktop-and-core-runtime.md  技术选型记录
 
 **Interfaces:**
 - Consumes: Windows, Node.js 22+, pnpm 10+.
-- Produces: `pnpm test`, `pnpm typecheck`, `pnpm probe:fake`, `pnpm probe:real` and workspace package discovery.
+- Produces: `pnpm test`, `pnpm typecheck` and workspace package discovery.
 
 - [ ] **Step 1: Add the root workspace files**
 
@@ -71,13 +71,11 @@ docs/adr/0001-desktop-and-core-runtime.md  技术选型记录
   "name": "agenttown",
   "private": true,
   "license": "AGPL-3.0-only",
+  "packageManager": "pnpm@11.9.0",
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck",
-    "probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake",
-    "probe:real": "powershell -NoProfile -File scripts/run-real-probes.ps1",
-    "benchmark:frameworks": "powershell -NoProfile -File scripts/run-framework-benchmark.ps1"
+    "typecheck": "pnpm -r --if-present typecheck"
   }
 }
 ```
@@ -132,6 +130,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -139,7 +139,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm probe:fake
 ```
 
 - [ ] **Step 3: Install and lock the shared dependencies**
@@ -335,6 +334,8 @@ git commit -m "feat: define feasibility probe contract"
 ### Task 3: Scripted fake Agent and incremental JSONL reader
 
 **Files:**
+- Modify: `package.json`
+- Modify: `.github/workflows/feasibility.yml`
 - Create: `packages/fake-agent/package.json`
 - Create: `packages/fake-agent/src/cli.ts`
 - Create: `packages/fake-agent/test/cli.test.ts`
@@ -344,7 +345,7 @@ git commit -m "feat: define feasibility probe contract"
 
 **Interfaces:**
 - Consumes: `ProbeEvent` from `@agenttown/probe-contract`.
-- Produces: executable fake Agent modes `normal`, `malformed`, `silent`, `approval`, `crash`, `slow`; `JsonlReader.push(chunk)` and `JsonlReader.end()`.
+- Produces: executable fake Agent modes `normal`, `malformed`, `silent`, `approval`, `crash`, `slow`; `JsonlReader.push(chunk)`, `JsonlReader.end()` and a working `pnpm probe:fake` CI command.
 
 - [ ] **Step 1: Write failing JSONL chunk-boundary tests**
 
@@ -448,6 +449,8 @@ if (!new Set(["crash", "silent"]).has(mode)) {
 Register `SIGINT` and emit `{ "type": "interrupted" }` before exiting with code `130`. In `slow` mode, emit one output every 500 ms for ten iterations.
 
 - [ ] **Step 6: Verify all fake-Agent modes and commit**
+
+Add `"probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake"` to the root `scripts` object. Add `- run: pnpm probe:fake` after `pnpm test` in `.github/workflows/feasibility.yml`. This wiring is added only after `@agenttown/probe-runner` exists, so every committed CI workflow remains runnable.
 
 Run:
 
@@ -911,6 +914,7 @@ git commit -m "spike: evaluate Tauri runtime"
 ### Task 9: Parallel, interruption, and recovery benchmark
 
 **Files:**
+- Modify: `package.json`
 - Create: `packages/probe-runner/src/benchmark.ts`
 - Create: `packages/probe-runner/test/benchmark.test.ts`
 - Create: `scripts/run-real-probes.ps1`
@@ -957,6 +961,17 @@ Implement a queue with explicit concurrency, per-session log paths and a `finall
 6. Exit nonzero if a required capability is false.
 
 `run-framework-benchmark.ps1` runs both packaged candidates three times and writes median cold-start and stable install size to their metric files.
+
+Add these root scripts only after both PowerShell files exist:
+
+```json
+{
+  "scripts": {
+    "probe:real": "powershell -NoProfile -File scripts/run-real-probes.ps1",
+    "benchmark:frameworks": "powershell -NoProfile -File scripts/run-framework-benchmark.ps1"
+  }
+}
+```
 
 Add this exact script to `packages/probe-runner/package.json`:
 
