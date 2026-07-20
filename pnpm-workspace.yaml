@@ -1,0 +1,8 @@
+packages:
+  - packages/*
+  - spikes/electron
+
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild

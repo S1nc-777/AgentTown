@@ -1,0 +1,21 @@
+{
+  "name": "agenttown",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake",
+    "probe:real": "powershell -NoProfile -File scripts/run-real-probes.ps1",
+    "benchmark:frameworks": "powershell -NoProfile -File scripts/run-framework-benchmark.ps1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

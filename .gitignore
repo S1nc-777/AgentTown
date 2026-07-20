@@ -1,1 +1,10 @@
 .worktrees/
+node_modules/
+dist/
+target/
+artifacts/feasibility/**/raw.log
+artifacts/feasibility/**/events.jsonl
+*.log
+.env
+.env.*
+!.env.example
