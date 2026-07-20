@@ -19,15 +19,38 @@ export interface ProbeArtifactPaths {
 }
 
 const SECRET_ASSIGNMENT = /(\b[A-Z0-9_]*(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_?KEY)[A-Z0-9_]*\b\s*=\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'`,;}\]]+)/giu;
-const SENSITIVE_JSON_KEY = /(?:APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATEKEY)/u;
+const SENSITIVE_JSON_KEY_SUFFIXES = new Set([
+  "API_KEY",
+  "ACCESS_TOKEN",
+  "AUTH_TOKEN",
+  "REFRESH_TOKEN",
+  "ID_TOKEN",
+  "BEARER_TOKEN",
+  "CLIENT_SECRET",
+  "PRIVATE_KEY",
+  "PASSWORD",
+  "PASSWD",
+  "SECRET",
+  "AUTHORIZATION",
+  "CREDENTIAL"
+]);
+const PORTABLE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/iu;
 
 export function redactOutput(output: string): string {
   return output.replace(SECRET_ASSIGNMENT, "$1[REDACTED]");
 }
 
 function redactJsonValue(key: string, value: unknown): unknown {
-  const normalizedKey = key.replace(/[^a-z0-9]/giu, "").toUpperCase();
-  return SENSITIVE_JSON_KEY.test(normalizedKey) ? "[REDACTED]" : value;
+  const normalizedKey = key
+    .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
+    .replace(/[^A-Za-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "")
+    .toUpperCase();
+  const sensitive = [...SENSITIVE_JSON_KEY_SUFFIXES].some(
+    (suffix) => normalizedKey === suffix || normalizedKey.endsWith(`_${suffix}`)
+  );
+  return sensitive ? "[REDACTED]" : value;
 }
 
 function serializeRedactedJson(value: unknown, space?: number): string {
@@ -36,14 +59,12 @@ function serializeRedactedJson(value: unknown, space?: number): string {
 
 function resolveRunDirectory(rootDir: string, runId: string): string {
   if (
-    runId.length === 0
-    || runId === "."
-    || runId === ".."
-    || /[\\/]/u.test(runId)
+    !PORTABLE_RUN_ID.test(runId)
+    || WINDOWS_RESERVED_NAME.test(runId)
     || isAbsolute(runId)
     || win32.isAbsolute(runId)
   ) {
-    throw new Error("runId must be a single safe path segment");
+    throw new Error("runId must be a portable 1-64 character path segment");
   }
 
   const root = resolve(rootDir);

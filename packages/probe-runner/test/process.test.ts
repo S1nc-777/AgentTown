@@ -1,9 +1,18 @@
 import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { runProcess } from "../src/process.js";
 
 const execFileAsync = promisify(execFile);
+
+interface WindowsProcessIdentity {
+  ProcessId: number;
+  CreationDate: string;
+  CommandLine: string | null;
+}
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -23,12 +32,68 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
   return !isProcessAlive(pid);
 }
 
-async function forceKillTree(pid: number): Promise<void> {
-  if (process.platform !== "win32" || !isProcessAlive(pid)) return;
-  await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-    windowsHide: true,
-    timeout: 2_000
-  }).catch(() => undefined);
+async function queryWindowsProcessIdentities(
+  pids: number[],
+  timeoutMs = 5_000
+): Promise<WindowsProcessIdentity[]> {
+  if (pids.length === 0) return [];
+  const filter = pids.map((pid) => `ProcessId = ${pid}`).join(" OR ");
+  const command = [
+    `$filter = '${filter}'`,
+    "$items = @(Get-CimInstance Win32_Process -Filter $filter | Select-Object ProcessId,CreationDate,CommandLine)",
+    "ConvertTo-Json -InputObject $items -Compress"
+  ].join("; ");
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", command],
+    { encoding: "utf8", windowsHide: true, timeout: timeoutMs }
+  );
+  const parsed = JSON.parse(stdout) as WindowsProcessIdentity[] | WindowsProcessIdentity;
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+function isExpectedIdentity(
+  actual: WindowsProcessIdentity,
+  expectedPid: number,
+  nonce: string
+): boolean {
+  return actual.ProcessId === expectedPid
+    && typeof actual.CreationDate === "string"
+    && actual.CreationDate.length > 0
+    && actual.CommandLine?.includes(nonce) === true;
+}
+
+async function forceKillVerifiedProcesses(
+  expectedPids: number[],
+  nonce: string
+): Promise<void> {
+  if (process.platform !== "win32" || expectedPids.length === 0) return;
+  const actualProcesses = await queryWindowsProcessIdentities(expectedPids);
+  for (const actual of actualProcesses) {
+    if (actual.CommandLine === null
+      || !expectedPids.includes(actual.ProcessId)
+      || !isExpectedIdentity(actual, actual.ProcessId, nonce)
+      || !actual.CommandLine.includes("node.exe")) {
+      throw new Error(`Refusing to taskkill PID ${actual.ProcessId}: Win32_Process identity changed`);
+    }
+  }
+  for (const actual of actualProcesses) {
+    try {
+      await execFileAsync("taskkill.exe", ["/PID", String(actual.ProcessId), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 2_000
+      });
+    } catch (error) {
+      const [remaining] = await queryWindowsProcessIdentities([actual.ProcessId]);
+      if (!remaining) continue;
+      if (!isExpectedIdentity(remaining, actual.ProcessId, nonce)) {
+        throw new Error(`Refusing further cleanup for PID ${actual.ProcessId}: identity changed`, {
+          cause: error
+        });
+      }
+      throw new Error(`Verified test process ${actual.ProcessId} survived taskkill`, { cause: error });
+    }
+  }
 }
 
 describe("runProcess", () => {
@@ -62,10 +127,18 @@ describe("runProcess", () => {
   it.runIf(process.platform === "win32")(
     "terminates the complete Windows process tree after a bounded timeout",
     async () => {
+      const nonce = `agenttown-tree-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const identityDirectory = await mkdtemp(join(tmpdir(), "agenttown-tree-identity-"));
+      const identityPath = join(identityDirectory, "pids.json");
       const parentScript = [
         "const { spawn } = require('node:child_process');",
-        "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', windowsHide: true });",
-        "console.log(JSON.stringify({ parentPid: process.pid, grandchildPid: grandchild.pid }));",
+        "const { writeFileSync } = require('node:fs');",
+        "const nonce = process.argv[1];",
+        "const identityPath = process.argv[2];",
+        "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', nonce], { detached: true, stdio: 'ignore', windowsHide: true });",
+        "const identity = { parentPid: process.pid, grandchildPid: grandchild.pid, nonce };",
+        "writeFileSync(identityPath, JSON.stringify(identity), 'utf8');",
+        "console.log(JSON.stringify(identity));",
         "setInterval(() => {}, 1000);"
       ].join("");
       let parentPid: number | undefined;
@@ -75,25 +148,33 @@ describe("runProcess", () => {
         const wallStartedAt = Date.now();
         const result = await runProcess({
           file: process.execPath,
-          args: ["-e", parentScript],
+          args: ["-e", parentScript, nonce, identityPath],
           cwd: process.cwd(),
-          timeoutMs: 250
+          timeoutMs: 750
         });
         const wallDurationMs = Date.now() - wallStartedAt;
         const pidLine = result.rawOutput.split(/\r?\n/u).find((line) => line.startsWith("{"));
         expect(pidLine).toBeDefined();
-        ({ parentPid, grandchildPid } = JSON.parse(pidLine!) as {
+        const payload = JSON.parse(pidLine!) as {
           parentPid: number;
           grandchildPid: number;
-        });
+          nonce: string;
+        };
+        ({ parentPid, grandchildPid } = payload);
 
+        expect(payload.nonce).toBe(nonce);
         expect(result.timedOut).toBe(true);
         expect(wallDurationMs).toBeLessThan(4_000);
         expect(await waitForProcessExit(parentPid, 2_000)).toBe(true);
         expect(await waitForProcessExit(grandchildPid, 2_000)).toBe(true);
       } finally {
-        if (parentPid !== undefined) await forceKillTree(parentPid);
-        if (grandchildPid !== undefined) await forceKillTree(grandchildPid);
+        const recorded = await readFile(identityPath, "utf8")
+          .then((text) => JSON.parse(text) as { parentPid: number; grandchildPid: number; nonce: string })
+          .catch(() => undefined);
+        if (recorded?.nonce === nonce) {
+          await forceKillVerifiedProcesses([recorded.parentPid, recorded.grandchildPid], nonce);
+        }
+        await rm(identityDirectory, { recursive: true, force: true });
       }
     },
     10_000

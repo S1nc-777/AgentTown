@@ -55,6 +55,34 @@ describe("writeProbeArtifacts", () => {
     expect(`${raw}${events}${report}`).not.toContain("report-secret");
   });
 
+  it("preserves token usage counters in a real usage event", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agenttown-artifacts-"));
+    temporaryDirectories.push(rootDir);
+
+    const paths = await writeProbeArtifacts({
+      rootDir,
+      runId: "usage-counters",
+      run: {
+        command: ["agent"],
+        startedAt: "2026-07-20T00:00:00.000Z",
+        durationMs: 1,
+        exitCode: 0,
+        rawOutput: "",
+        timedOut: false
+      },
+      events: [{ type: "usage", inputTokens: 10, outputTokens: 5 }],
+      report: { tokenCount: 15, tokenBudget: 100 }
+    });
+
+    expect(await readFile(paths.eventsPath, "utf8")).toBe(
+      '{"type":"usage","inputTokens":10,"outputTokens":5}\n'
+    );
+    expect(JSON.parse(await readFile(paths.reportPath, "utf8"))).toMatchObject({
+      tokenCount: 15,
+      tokenBudget: 100
+    });
+  });
+
   it.each(["", ".", "..", "nested/run", "nested\\run"])(
     "rejects unsafe run id %j without writing outside its run directory",
     async (runId) => {
@@ -84,6 +112,63 @@ describe("writeProbeArtifacts", () => {
       }
     }
   );
+
+  it.each([
+    "-leading-dash",
+    "_leading-underscore",
+    "contains:colon",
+    "trailing.",
+    "trailing ",
+    "CON",
+    "prn",
+    "AUX",
+    "nul",
+    "COM1",
+    "com9",
+    "LPT1",
+    "lpt9",
+    `a${"b".repeat(64)}`
+  ])("rejects non-portable run id %j", async (runId) => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agenttown-artifacts-portable-"));
+    temporaryDirectories.push(rootDir);
+
+    await expect(writeProbeArtifacts({
+      rootDir,
+      runId,
+      run: {
+        command: ["agent"],
+        startedAt: "2026-07-20T00:00:00.000Z",
+        durationMs: 1,
+        exitCode: 0,
+        rawOutput: "should-not-be-written",
+        timedOut: false
+      },
+      events: [],
+      report: {}
+    })).rejects.toThrow(/runId/u);
+  });
+
+  it.each(["run-1", "Run_2026", "9"])("accepts portable run id %j", async (runId) => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agenttown-artifacts-portable-"));
+    temporaryDirectories.push(rootDir);
+
+    const paths = await writeProbeArtifacts({
+      rootDir,
+      runId,
+      run: {
+        command: ["agent"],
+        startedAt: "2026-07-20T00:00:00.000Z",
+        durationMs: 1,
+        exitCode: 0,
+        rawOutput: "",
+        timedOut: false
+      },
+      events: [],
+      report: {}
+    });
+
+    expect(paths.directory).toBe(join(rootDir, runId));
+  });
 
   it("rejects an absolute run id without writing to that location", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "agenttown-artifacts-"));
