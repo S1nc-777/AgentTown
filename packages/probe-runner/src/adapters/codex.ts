@@ -223,7 +223,7 @@ export async function probeCodex(options: ProbeCodexOptions): Promise<Capability
       const failure = knownLaunchFailure(error);
       if (failure === undefined) throw error;
       notes.push(`error_code:${failure.code}`);
-      return await finish(failure.blocker);
+      return await finish("temporary_repo_init_failed");
     }
     if (gitRun.timedOut || gitRun.exitCode !== 0) {
       return await finish("temporary_repo_init_failed");

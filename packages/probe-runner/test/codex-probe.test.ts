@@ -151,6 +151,35 @@ describe("probeCodex", () => {
     }
   );
 
+  it.each(["ENOENT", "EACCES", "EPERM"] as const)(
+    "classifies Git initialization %s as a temporary-repository blocker",
+    async (code) => {
+      const rootDir = await artifactRoot();
+      const report = await probeCodex({
+        timeoutMs: 1_000,
+        artifactRootDir: rootDir,
+        runId: `codex-git-${code.toLowerCase()}`,
+        runProcess: async (options) => {
+          if (options.args[0] === "--version") return result("codex-cli 9.9.9\n");
+          if (options.file === "git") {
+            throw Object.assign(new Error("sensitive Git executable path"), { code });
+          }
+          throw new TypeError("Codex execution must not start after Git initialization fails");
+        }
+      });
+
+      expect(report.notes).toContain(`error_code:${code}`);
+      expect(report.notes).toContain("blocker:temporary_repo_init_failed");
+      expect(report.notes).not.toContain("blocker:executable_not_found");
+      expect(report.notes).not.toContain("blocker:launch_failed");
+      const persisted = await readFile(
+        join(rootDir, `codex-git-${code.toLowerCase()}`, "report.json"),
+        "utf8"
+      );
+      expect(persisted).not.toContain("sensitive Git executable path");
+    }
+  );
+
   it("maps authentication output from resume before generic resume failure", async () => {
     const calls: PtyOptions[] = [];
     const rootDir = await artifactRoot();

@@ -51,6 +51,14 @@ The known intermittent node-pty `AttachConsole failed` helper stderr appeared on
 
 No Claude, OpenCode, or Task 6+ adapter work was added.
 
+## Final review fix: stage-aware Git launch errors
+
+- RED reproduced that Git initialization `ENOENT`, `EACCES`, and `EPERM` reused the Codex executable blocker taxonomy.
+- The Git stage now retains only the allow-listed `error_code:<code>` evidence and always reports `blocker:temporary_repo_init_failed`.
+- Codex version and execution stages retain their existing `executable_not_found` / `launch_failed` mapping, while unknown Git exceptions such as `TypeError` still propagate.
+- Focused Codex tests: 23 passed plus 1 opt-in real-test skip.
+- Probe-runner full tests: 71 passed plus 1 opt-in skip; full workspace tests and typechecks passed; `pnpm probe:fake` passed; `git diff --check` passed; `ORPHAN_COUNT=0`.
+
 ## Review fixes
 
 - Replaced broad exception-to-blocker catches with a strict launch-error taxonomy: `ENOENT` maps to `executable_not_found`, `EACCES`/`EPERM` map to `launch_failed`, and every unknown exception is rethrown.
