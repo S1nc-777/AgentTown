@@ -448,6 +448,8 @@ if (!new Set(["crash", "silent"]).has(mode)) {
 
 Register `SIGINT` and emit `{ "type": "interrupted" }` before exiting with code `130`. In `slow` mode, emit one output every 500 ms for ten iterations.
 
+The plain `node:child_process` SIGINT assertion runs only on platforms where `child.kill("SIGINT")` delivers a catchable signal. On Windows it terminates the child directly, so the handler remains implemented but its real Ctrl+C behavior is verified through ConPTY in Task 4. Task 3 must not claim Windows interrupt support from a plain child-process test.
+
 - [ ] **Step 6: Verify all fake-Agent modes and commit**
 
 Add `"probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake"` to the root `scripts` object. Add `- run: pnpm probe:fake` after `pnpm test` in `.github/workflows/feasibility.yml`. This wiring is added only after `@agenttown/probe-runner` exists, so every committed CI workflow remains runnable.

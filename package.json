@@ -7,8 +7,10 @@
     "node": ">=22"
   },
   "scripts": {
+    "pretypecheck": "pnpm --filter @agenttown/probe-contract build",
     "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "typecheck": "pnpm -r --if-present typecheck",
+    "probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

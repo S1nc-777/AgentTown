@@ -1,0 +1,14 @@
+{
+  "name": "@agenttown/probe-runner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "probe:fake": "pnpm --filter @agenttown/fake-agent test"
+  },
+  "dependencies": {
+    "@agenttown/probe-contract": "workspace:*"
+  }
+}

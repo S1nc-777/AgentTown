@@ -1,0 +1,14 @@
+{
+  "name": "@agenttown/fake-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pretypecheck": "pnpm --filter @agenttown/probe-contract build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agenttown/probe-contract": "workspace:*"
+  }
+}
