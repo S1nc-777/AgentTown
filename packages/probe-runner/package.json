@@ -9,6 +9,7 @@
     "probe:fake": "pnpm --filter @agenttown/fake-agent test"
   },
   "dependencies": {
-    "@agenttown/probe-contract": "workspace:*"
+    "@agenttown/probe-contract": "workspace:*",
+    "node-pty": "^1.1.0"
   }
 }
