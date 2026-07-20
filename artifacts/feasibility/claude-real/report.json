@@ -1,0 +1,17 @@
+{
+  "agent": "claude",
+  "version": "2.1.214 (Claude Code)",
+  "command": "claude -p Reply with exactly AGENTTOWN_PROBE_OK --output-format stream-json --verbose --permission-mode plan",
+  "durationMs": 21569,
+  "rawLogPath": "raw.log",
+  "notes": [],
+  "launch": true,
+  "streamOutput": true,
+  "sessionId": true,
+  "resume": true,
+  "interrupt": false,
+  "tokenUsage": true,
+  "nonInteractive": true,
+  "interactivePty": false,
+  "parallelThree": false
+}
