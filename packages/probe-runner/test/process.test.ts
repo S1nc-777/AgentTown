@@ -5,14 +5,12 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { runProcess } from "../src/process.js";
+import {
+  cleanupVerifiedProcessTree,
+  type WindowsProcessIdentity
+} from "./windows-process-cleanup.js";
 
 const execFileAsync = promisify(execFile);
-
-interface WindowsProcessIdentity {
-  ProcessId: number;
-  CreationDate: string;
-  CommandLine: string | null;
-}
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -32,15 +30,13 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
   return !isProcessAlive(pid);
 }
 
-async function queryWindowsProcessIdentities(
-  pids: number[],
+async function queryWindowsProcessIdentity(
+  pid: number,
   timeoutMs = 5_000
-): Promise<WindowsProcessIdentity[]> {
-  if (pids.length === 0) return [];
-  const filter = pids.map((pid) => `ProcessId = ${pid}`).join(" OR ");
+): Promise<WindowsProcessIdentity | undefined> {
   const command = [
-    `$filter = '${filter}'`,
-    "$items = @(Get-CimInstance Win32_Process -Filter $filter | Select-Object ProcessId,CreationDate,CommandLine)",
+    `$filter = 'ProcessId = ${pid}'`,
+    "$items = @(Get-CimInstance Win32_Process -Filter $filter | Select-Object ProcessId,CreationDate,Name,CommandLine)",
     "ConvertTo-Json -InputObject $items -Compress"
   ].join("; ");
   const { stdout } = await execFileAsync(
@@ -49,51 +45,14 @@ async function queryWindowsProcessIdentities(
     { encoding: "utf8", windowsHide: true, timeout: timeoutMs }
   );
   const parsed = JSON.parse(stdout) as WindowsProcessIdentity[] | WindowsProcessIdentity;
-  return Array.isArray(parsed) ? parsed : [parsed];
+  return Array.isArray(parsed) ? parsed[0] : parsed;
 }
 
-function isExpectedIdentity(
-  actual: WindowsProcessIdentity,
-  expectedPid: number,
-  nonce: string
-): boolean {
-  return actual.ProcessId === expectedPid
-    && typeof actual.CreationDate === "string"
-    && actual.CreationDate.length > 0
-    && actual.CommandLine?.includes(nonce) === true;
-}
-
-async function forceKillVerifiedProcesses(
-  expectedPids: number[],
-  nonce: string
-): Promise<void> {
-  if (process.platform !== "win32" || expectedPids.length === 0) return;
-  const actualProcesses = await queryWindowsProcessIdentities(expectedPids);
-  for (const actual of actualProcesses) {
-    if (actual.CommandLine === null
-      || !expectedPids.includes(actual.ProcessId)
-      || !isExpectedIdentity(actual, actual.ProcessId, nonce)
-      || !actual.CommandLine.includes("node.exe")) {
-      throw new Error(`Refusing to taskkill PID ${actual.ProcessId}: Win32_Process identity changed`);
-    }
-  }
-  for (const actual of actualProcesses) {
-    try {
-      await execFileAsync("taskkill.exe", ["/PID", String(actual.ProcessId), "/T", "/F"], {
-        windowsHide: true,
-        timeout: 2_000
-      });
-    } catch (error) {
-      const [remaining] = await queryWindowsProcessIdentities([actual.ProcessId]);
-      if (!remaining) continue;
-      if (!isExpectedIdentity(remaining, actual.ProcessId, nonce)) {
-        throw new Error(`Refusing further cleanup for PID ${actual.ProcessId}: identity changed`, {
-          cause: error
-        });
-      }
-      throw new Error(`Verified test process ${actual.ProcessId} survived taskkill`, { cause: error });
-    }
-  }
+async function taskkillProcessTree(pid: number): Promise<void> {
+  await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    windowsHide: true,
+    timeout: 2_000
+  });
 }
 
 describe("runProcess", () => {
@@ -172,7 +131,10 @@ describe("runProcess", () => {
           .then((text) => JSON.parse(text) as { parentPid: number; grandchildPid: number; nonce: string })
           .catch(() => undefined);
         if (recorded?.nonce === nonce) {
-          await forceKillVerifiedProcesses([recorded.parentPid, recorded.grandchildPid], nonce);
+          await cleanupVerifiedProcessTree(recorded, {
+            queryIdentity: (pid) => queryWindowsProcessIdentity(pid),
+            killTree: taskkillProcessTree
+          });
         }
         await rm(identityDirectory, { recursive: true, force: true });
       }

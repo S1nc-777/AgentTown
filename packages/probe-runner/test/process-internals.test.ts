@@ -58,6 +58,28 @@ describe("terminateWindowsProcessTree", () => {
       vi.useRealTimers();
     }
   });
+
+  it("turns a hard-timer taskkill kill throw into the termination rejection", async () => {
+    vi.useFakeTimers();
+    try {
+      const launchTaskkill: TaskkillLauncher = () => ({
+        kill: () => { throw new Error("simulated hard-kill throw"); }
+      });
+      const completion = terminateWindowsProcessTree(123, {
+        launchTaskkill,
+        taskkillTimeoutMs: 20,
+        hardTimeoutMs: 25
+      });
+      const observed = completion.catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(await observed).toEqual(expect.objectContaining({
+        message: expect.stringMatching(/hard-kill.*threw/iu)
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("runProcessWithDependencies", () => {
@@ -83,6 +105,64 @@ describe("runProcessWithDependencies", () => {
 
       expect(directKill).toHaveBeenCalledOnce();
       expect(Date.now() - wallStartedAt).toBeLessThan(1_000);
+    }
+  );
+
+  it.runIf(process.platform === "win32")(
+    "bounded-rejects when direct-child kill throws after tree termination succeeds",
+    async () => {
+      const run = runProcessWithDependencies({
+        file: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: process.cwd(),
+        timeoutMs: 25
+      }, {
+        platform: "win32",
+        terminateWindowsProcessTree: async () => undefined,
+        killDirectChild: (child) => {
+          child.kill("SIGKILL");
+          throw new Error("simulated direct-child kill throw");
+        },
+        processCloseGraceMs: 250
+      });
+
+      await expect(Promise.race([
+        run,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("runProcess did not settle after direct-child kill throw")),
+          1_000
+        ))
+      ])).rejects.toThrow(/direct-child.*kill.*threw/iu);
+    }
+  );
+
+  it.runIf(process.platform === "win32")(
+    "bounded-rejects when both tree cleanup and direct-child kill throw",
+    async () => {
+      const run = runProcessWithDependencies({
+        file: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: process.cwd(),
+        timeoutMs: 25
+      }, {
+        platform: "win32",
+        terminateWindowsProcessTree: async () => {
+          throw new Error("simulated tree cleanup failure");
+        },
+        killDirectChild: (child) => {
+          child.kill("SIGKILL");
+          throw new Error("simulated direct-child kill throw");
+        },
+        processCloseGraceMs: 250
+      });
+
+      await expect(Promise.race([
+        run,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("runProcess did not settle after two cleanup failures")),
+          1_000
+        ))
+      ])).rejects.toThrow(/tree.*direct-child/iu);
     }
   );
 });

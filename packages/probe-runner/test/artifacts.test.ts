@@ -83,6 +83,50 @@ describe("writeProbeArtifacts", () => {
     });
   });
 
+  it("redacts explicit token, credential, and secret-access JSON keys without harming usage", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agenttown-artifacts-"));
+    temporaryDirectories.push(rootDir);
+    const report = {
+      token: "plain-token-secret",
+      apiToken: "api-token-secret",
+      service_token: "service-token-secret",
+      credentials: "credential-secret",
+      awsSecretAccessKey: "aws-secret-access-key",
+      tokenCount: 15,
+      tokenBudget: 100
+    };
+
+    const paths = await writeProbeArtifacts({
+      rootDir,
+      runId: "explicit-secret-keys",
+      run: {
+        command: ["agent"],
+        startedAt: "2026-07-20T00:00:00.000Z",
+        durationMs: 1,
+        exitCode: 0,
+        rawOutput: "",
+        timedOut: false
+      },
+      events: [{ type: "usage", inputTokens: 10, outputTokens: 5 }],
+      report
+    });
+
+    expect(JSON.parse(await readFile(paths.eventsPath, "utf8"))).toMatchObject({
+      type: "usage",
+      inputTokens: 10,
+      outputTokens: 5
+    });
+    expect(JSON.parse(await readFile(paths.reportPath, "utf8"))).toEqual({
+      token: "[REDACTED]",
+      apiToken: "[REDACTED]",
+      service_token: "[REDACTED]",
+      credentials: "[REDACTED]",
+      awsSecretAccessKey: "[REDACTED]",
+      tokenCount: 15,
+      tokenBudget: 100
+    });
+  });
+
   it.each(["", ".", "..", "nested/run", "nested\\run"])(
     "rejects unsafe run id %j without writing outside its run directory",
     async (runId) => {
@@ -227,14 +271,16 @@ describe("writeProbeArtifacts", () => {
       report
     });
 
-    const persisted = `${await readFile(paths.eventsPath, "utf8")}${await readFile(paths.reportPath, "utf8")}`;
+    const persistedReport = await readFile(paths.reportPath, "utf8");
+    const persisted = `${await readFile(paths.eventsPath, "utf8")}${persistedReport}`;
     expect(persisted).not.toContain("natural-event-secret");
     expect(persisted).not.toContain("array-event-secret");
     expect(persisted).not.toContain("report-password");
     expect(persisted).not.toContain("report-private-key");
     expect(persisted).not.toContain("embedded-event-secret");
     expect(persisted).not.toContain("embedded-report-secret");
-    expect(persisted.match(/\[REDACTED\]/gu)?.length).toBe(6);
+    expect(JSON.parse(persistedReport)).toMatchObject({ credentials: "[REDACTED]" });
+    expect(persisted.match(/\[REDACTED\]/gu)?.length).toBe(5);
     expect(events).toEqual(originalEvents);
     expect(report).toEqual(originalReport);
   });

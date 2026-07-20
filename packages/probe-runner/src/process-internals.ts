@@ -91,9 +91,13 @@ export function terminateWindowsProcessTree(
     hardTimer = setTimeout(() => {
       try {
         taskkill?.kill("SIGKILL");
-      } finally {
         finish(new Error(
           `taskkill did not report completion while terminating Windows process tree ${pid}`
+        ));
+      } catch (error) {
+        finish(new Error(
+          `taskkill hard-kill threw while terminating Windows process tree ${pid}`,
+          { cause: error }
         ));
       }
     }, hardTimeoutMs);
@@ -174,6 +178,25 @@ export function runProcessWithDependencies(
         reject(new Error(message, { cause: windowsTerminationError }));
       }, processCloseGraceMs);
     };
+    const killDirectChildAndWait = (treeError?: Error) => {
+      windowsTerminationPending = false;
+      windowsTerminationError = treeError;
+      try {
+        if (!closed) killDirectChild(child);
+      } catch (error) {
+        const directKillError = error instanceof Error ? error : new Error(String(error));
+        windowsTerminationError = treeError
+          ? new AggregateError(
+            [treeError, directKillError],
+            "Windows tree cleanup and direct-child kill both failed"
+          )
+          : new Error("Direct-child kill threw after Windows tree termination", {
+            cause: directKillError
+          });
+      } finally {
+        waitForClose();
+      }
+    };
     const timeoutTimer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
@@ -181,15 +204,12 @@ export function runProcessWithDependencies(
         windowsTerminationPending = true;
         void terminateTree(child.pid).then(
           () => {
-            windowsTerminationPending = false;
-            if (!closed) killDirectChild(child);
-            waitForClose();
+            killDirectChildAndWait();
           },
           (error: unknown) => {
-            windowsTerminationPending = false;
-            windowsTerminationError = error instanceof Error ? error : new Error(String(error));
-            killDirectChild(child);
-            waitForClose();
+            killDirectChildAndWait(
+              error instanceof Error ? error : new Error(String(error))
+            );
           }
         );
         return;
