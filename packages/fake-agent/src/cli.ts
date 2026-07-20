@@ -17,7 +17,7 @@ process.once("SIGINT", () => {
 emit({ type: "ready", pid: process.pid });
 emit({ type: "session", sessionId });
 if (mode === "crash") {
-  process.exit(23);
+  process.exitCode = 23;
 } else if (mode === "silent") {
   setTimeout(() => process.exit(0), 30_000);
 } else {
