@@ -28,6 +28,7 @@ describe.runIf(process.env.AGENTTOWN_REAL_CODEX === "1")("Codex real probe", () 
     expect(report.agent).toBe("codex");
     expect(report.rawLogPath).toMatch(/raw\.log$/u);
     if (blockers.length > 0) {
+      expect(blockers).toHaveLength(1);
       expect(blockers.every((blocker) => knownBlockers.has(blocker))).toBe(true);
       return;
     }
@@ -37,5 +38,6 @@ describe.runIf(process.env.AGENTTOWN_REAL_CODEX === "1")("Codex real probe", () 
     expect(report.sessionId).toBe(true);
     expect(report.resume).toBe(true);
     expect(report.tokenUsage).toBe(true);
+    expect(report.nonInteractive).toBe(true);
   }, 240_000);
 });

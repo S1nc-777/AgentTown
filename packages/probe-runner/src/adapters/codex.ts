@@ -102,8 +102,17 @@ function containsAuthenticationFailure(rawOutput: string): boolean {
   return /authentication|not logged in|unauthori[sz]ed|login required|\b401\b/iu.test(rawOutput);
 }
 
-function executableFailure(error: unknown): "executable_not_found" | "launch_failed" {
-  return isRecord(error) && error.code === "ENOENT" ? "executable_not_found" : "launch_failed";
+interface KnownLaunchFailure {
+  blocker: "executable_not_found" | "launch_failed";
+  code: "ENOENT" | "EACCES" | "EPERM";
+}
+
+function knownLaunchFailure(error: unknown): KnownLaunchFailure | undefined {
+  if (!isRecord(error)) return undefined;
+  if (error.code === "ENOENT") return { blocker: "executable_not_found", code: "ENOENT" };
+  if (error.code === "EACCES") return { blocker: "launch_failed", code: "EACCES" };
+  if (error.code === "EPERM") return { blocker: "launch_failed", code: "EPERM" };
+  return undefined;
 }
 
 function combineRuns(runs: RunResult[], fallbackRawOutput = ""): RunResult {
@@ -153,7 +162,7 @@ export async function probeCodex(options: ProbeCodexOptions): Promise<Capability
     const report: CapabilityReport = {
       agent: "codex",
       version,
-      command: [executable, ...firstArgs].join(" "),
+      command: ["codex", ...firstArgs].join(" "),
       durationMs: Date.now() - startedAt,
       rawLogPath: predictedRawLogPath,
       notes,
@@ -194,7 +203,10 @@ export async function probeCodex(options: ProbeCodexOptions): Promise<Capability
       if (versionRun.exitCode !== 0) return await finish("launch_failed");
       version = versionRun.rawOutput.trim() || "unknown";
     } catch (error) {
-      return await finish(executableFailure(error));
+      const failure = knownLaunchFailure(error);
+      if (failure === undefined) throw error;
+      notes.push(`error_code:${failure.code}`);
+      return await finish(failure.blocker);
     }
 
     temporaryRepository = await mkdtemp(join(tmpdir(), "agenttown-codex-probe-"));
@@ -207,8 +219,11 @@ export async function probeCodex(options: ProbeCodexOptions): Promise<Capability
         timeoutMs: options.timeoutMs
       });
       runs.push(gitRun);
-    } catch {
-      return await finish("temporary_repo_init_failed");
+    } catch (error) {
+      const failure = knownLaunchFailure(error);
+      if (failure === undefined) throw error;
+      notes.push(`error_code:${failure.code}`);
+      return await finish(failure.blocker);
     }
     if (gitRun.timedOut || gitRun.exitCode !== 0) {
       return await finish("temporary_repo_init_failed");
@@ -235,7 +250,10 @@ export async function probeCodex(options: ProbeCodexOptions): Promise<Capability
       launch = true;
       nonInteractive = true;
     } catch (error) {
-      return await finish(executableFailure(error));
+      const failure = knownLaunchFailure(error);
+      if (failure === undefined) throw error;
+      notes.push(`error_code:${failure.code}`);
+      return await finish(failure.blocker);
     }
 
     const firstEvents = parseOutput(firstRun.rawOutput);
@@ -261,16 +279,21 @@ export async function probeCodex(options: ProbeCodexOptions): Promise<Capability
         timeoutMs: options.timeoutMs
       });
       runs.push(resumeRun);
-    } catch {
-      return await finish("resume_failed");
+    } catch (error) {
+      const failure = knownLaunchFailure(error);
+      if (failure === undefined) throw error;
+      notes.push(`error_code:${failure.code}`);
+      return await finish(failure.blocker);
     }
     const resumeEvents = parseOutput(resumeRun.rawOutput);
     events.push(...resumeEvents);
+    if (resumeRun.timedOut) return await finish("timeout");
+    if (containsAuthenticationFailure(resumeRun.rawOutput)) return await finish("authentication");
     resume = !resumeRun.timedOut
       && resumeRun.exitCode === 0
       && !resumeEvents.some((event) => event.type === "parse_error")
       && containsOutput(resumeEvents, "AGENTTOWN_RESUME_OK");
-    if (!resume) return await finish(resumeRun.timedOut ? "timeout" : "resume_failed");
+    if (!resume) return await finish("resume_failed");
     if (!tokenUsage) return await finish("token_usage_missing");
     return await finish();
   } finally {

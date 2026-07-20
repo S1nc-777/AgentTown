@@ -50,3 +50,21 @@ The known intermittent node-pty `AttachConsole failed` helper stderr appeared on
 ## Scope
 
 No Claude, OpenCode, or Task 6+ adapter work was added.
+
+## Review fixes
+
+- Replaced broad exception-to-blocker catches with a strict launch-error taxonomy: `ENOENT` maps to `executable_not_found`, `EACCES`/`EPERM` map to `launch_failed`, and every unknown exception is rethrown.
+- Persisted only the allow-listed OS error code as evidence; exception messages, executable paths, usernames, and credentials are never copied into the report.
+- Kept the configured executable for actual process launch while recording the portable logical command name `codex` in both in-memory and persisted reports.
+- Added regressions proving TypeError propagation from version, Git initialization, first execution, and resume; success and blocker cleanup of the temporary Git repository; separation of artifacts from the temporary repository; and resume authentication precedence.
+- Tightened the real-probe assertion so it accepts exactly one known blocker or a complete Task 5 capability success. The bounded opt-in rerun again stopped at `--version`, persisted `error_code:EPERM` with `blocker:launch_failed`, and did not start an Agent session.
+
+## Review-fix verification
+
+- Targeted offline Codex tests: 15 passed; real test skipped by default.
+- `pnpm test`: probe-contract 8/8; probe-runner 68 passed plus 1 opt-in skip; fake-agent 6 passed plus the intentional Windows plain-child SIGINT skip.
+- `pnpm typecheck`: all workspace packages passed.
+- `pnpm probe:fake`: 6 passed plus the intentional Windows skip.
+- Explicit bounded real Codex test: 1/1 passed at the version-stage `EPERM` blocker.
+- `git diff --check`: passed.
+- Bounded process query: `ORPHAN_COUNT=0` for fake-agent, Codex probe, and node-pty helper patterns.

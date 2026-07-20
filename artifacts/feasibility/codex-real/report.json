@@ -2,9 +2,10 @@
   "agent": "codex",
   "version": "unknown",
   "command": "codex exec --json --sandbox read-only --cd <temp-repo> Reply with exactly AGENTTOWN_PROBE_OK",
-  "durationMs": 26,
+  "durationMs": 29,
   "rawLogPath": "raw.log",
   "notes": [
+    "error_code:EPERM",
     "blocker:launch_failed"
   ],
   "launch": false,

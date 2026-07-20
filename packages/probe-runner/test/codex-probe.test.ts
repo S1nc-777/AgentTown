@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -96,12 +96,103 @@ describe("probeCodex", () => {
     expect(events).toContain('"type":"usage"');
     expect(events).not.toContain('"type":"item.started"');
     expect(persistedReport.rawLogPath).toBe("raw.log");
+    await expect(access(calls[2]!.cwd)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("never persists a configured absolute Codex executable path", async () => {
+    const calls: PtyOptions[] = [];
+    const rootDir = await artifactRoot();
+    const executable = String.raw`C:\Users\private-user\bin\codex-private.cmd`;
+    const report = await probeCodex({
+      timeoutMs: 1_000,
+      artifactRootDir: rootDir,
+      runId: "codex-portable-command",
+      executable,
+      runProcess: successfulRunner(calls)
+    });
+
+    expect(calls[0]?.file).toBe(executable);
+    expect(report.command).toMatch(/^codex /u);
+    const persisted = await readFile(join(rootDir, "codex-portable-command", "report.json"), "utf8");
+    expect(persisted).not.toContain("private-user");
+    expect(persisted).not.toContain("codex-private.cmd");
+    expect(persisted).not.toContain("C:\\\\Users");
+  });
+
+  it.each(["version", "git", "first", "resume"] as const)(
+    "propagates programmer errors from the %s stage",
+    async (failureStage) => {
+      const calls: PtyOptions[] = [];
+      const rootDir = await artifactRoot();
+      const baseRunner = successfulRunner(calls);
+      const run: ProcessRunner = async (options) => {
+        const stage = options.args[0] === "--version"
+          ? "version"
+          : options.file === "git"
+            ? "git"
+            : options.args[1] === "resume"
+              ? "resume"
+              : "first";
+        if (stage === failureStage) throw new TypeError(`programmer error at ${stage}`);
+        return await baseRunner(options);
+      };
+
+      await expect(probeCodex({
+        timeoutMs: 1_000,
+        artifactRootDir: rootDir,
+        runId: `codex-programmer-error-${failureStage}`,
+        runProcess: run
+      })).rejects.toThrow(new TypeError(`programmer error at ${failureStage}`));
+
+      const repositoryCall = calls.find((call) => call.cwd.includes("agenttown-codex-probe-"));
+      if (repositoryCall !== undefined) {
+        await expect(access(repositoryCall.cwd)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    }
+  );
+
+  it("maps authentication output from resume before generic resume failure", async () => {
+    const calls: PtyOptions[] = [];
+    const rootDir = await artifactRoot();
+    const baseRunner = successfulRunner(calls);
+    const report = await probeCodex({
+      timeoutMs: 1_000,
+      artifactRootDir: rootDir,
+      runId: "codex-resume-authentication",
+      runProcess: async (options) => options.args[1] === "resume"
+        ? result('{"type":"error","message":"authentication required"}\n', { exitCode: 1 })
+        : await baseRunner(options)
+    });
+
+    expect(report.notes).toContain("blocker:authentication");
+    expect(report.notes).not.toContain("blocker:resume_failed");
+  });
+
+  it("removes the temporary repository after a blocker report", async () => {
+    const calls: PtyOptions[] = [];
+    const rootDir = await artifactRoot();
+    const baseRunner = successfulRunner(calls);
+    const report = await probeCodex({
+      timeoutMs: 1_000,
+      artifactRootDir: rootDir,
+      runId: "codex-cleanup-blocker",
+      runProcess: async (options) => options.args[0] === "exec"
+        ? result('{"type":"error","message":"authentication required"}\n', { exitCode: 1 })
+        : await baseRunner(options)
+    });
+
+    expect(report.notes).toContain("blocker:authentication");
+    const repositoryCall = calls.find((call) => call.cwd.includes("agenttown-codex-probe-"));
+    expect(repositoryCall).toBeDefined();
+    await expect(access(repositoryCall!.cwd)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(join(rootDir, "codex-cleanup-blocker", "report.json"))).resolves.toBeUndefined();
   });
 
   it.each([
     {
       name: "missing executable",
       expected: "blocker:executable_not_found",
+      expectedErrorCode: "ENOENT",
       run: async (_options: PtyOptions) => {
         const error = Object.assign(new Error("missing"), { code: "ENOENT" });
         throw error;
@@ -110,6 +201,7 @@ describe("probeCodex", () => {
     {
       name: "authentication failure",
       expected: "blocker:authentication",
+      expectedErrorCode: undefined,
       run: async (options: PtyOptions) => {
         if (options.file === "git") return result("");
         if (options.args[0] === "--version") return result("codex-cli 9.9.9\n");
@@ -117,8 +209,25 @@ describe("probeCodex", () => {
       }
     },
     {
+      name: "launch access denied",
+      expected: "blocker:launch_failed",
+      expectedErrorCode: "EACCES",
+      run: async (_options: PtyOptions) => {
+        throw Object.assign(new Error("sensitive absolute path must not persist"), { code: "EACCES" });
+      }
+    },
+    {
+      name: "launch operation not permitted",
+      expected: "blocker:launch_failed",
+      expectedErrorCode: "EPERM",
+      run: async (_options: PtyOptions) => {
+        throw Object.assign(new Error("sensitive absolute path must not persist"), { code: "EPERM" });
+      }
+    },
+    {
       name: "timeout",
       expected: "blocker:timeout",
+      expectedErrorCode: undefined,
       run: async (options: PtyOptions) => {
         if (options.file === "git") return result("");
         if (options.args[0] === "--version") return result("codex-cli 9.9.9\n");
@@ -128,6 +237,7 @@ describe("probeCodex", () => {
     {
       name: "parse failure",
       expected: "blocker:parse_failure",
+      expectedErrorCode: undefined,
       run: async (options: PtyOptions) => {
         if (options.file === "git") return result("");
         if (options.args[0] === "--version") return result("codex-cli 9.9.9\n");
@@ -137,6 +247,7 @@ describe("probeCodex", () => {
     {
       name: "resume failure",
       expected: "blocker:resume_failed",
+      expectedErrorCode: undefined,
       run: async (options: PtyOptions) => {
         if (options.file === "git") return result("");
         if (options.args[0] === "--version") return result("codex-cli 9.9.9\n");
@@ -148,7 +259,7 @@ describe("probeCodex", () => {
         ].join("\n") + "\n");
       }
     }
-  ])("returns a complete report and sanitized evidence for $name", async ({ run, expected }) => {
+  ])("returns a complete report and sanitized evidence for $name", async ({ run, expected, expectedErrorCode }) => {
     const rootDir = await artifactRoot();
     const report = await probeCodex({
       timeoutMs: 1_000,
@@ -158,6 +269,9 @@ describe("probeCodex", () => {
     });
 
     expect(report.notes).toContain(expected);
+    if (expectedErrorCode !== undefined) {
+      expect(report.notes).toContain(`error_code:${expectedErrorCode}`);
+    }
     expect(report.resume).toBe(false);
     expect(report.rawLogPath).toMatch(/raw\.log$/u);
     await expect(readFile(report.rawLogPath, "utf8")).resolves.toBeTypeOf("string");
