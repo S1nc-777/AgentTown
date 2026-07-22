@@ -1,0 +1,36 @@
+{
+  "executionEvidence": {
+    "outerWatchdogExitCode": 124,
+    "classification": "shell_wrapper_timeout",
+    "powerShellExitCodeObserved": false,
+    "notes": [
+      "The capabilities summary and per-Agent reports were written before the outer shell watchdog returned 124.",
+      "Exit 124 belongs to the outer shell timeout; it is not reported as a PowerShell script exit code."
+    ]
+  },
+  "outcomes": [
+    {
+      "agent": "codex",
+      "attempted": false,
+      "interrupt": false,
+      "parallelThree": false,
+      "blockers": [
+        "capability_prerequisite_launch_failed"
+      ],
+      "orphanPids": []
+    },
+    {
+      "agent": "claude",
+      "attempted": true,
+      "interrupt": false,
+      "parallelThree": false,
+      "blockers": [
+        "interrupt_session_not_observed",
+        "parallel_partial_failure:one:exit_1",
+        "parallel_partial_failure:two:exit_1",
+        "parallel_partial_failure:three:exit_1"
+      ],
+      "orphanPids": []
+    }
+  ]
+}

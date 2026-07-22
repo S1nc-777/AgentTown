@@ -2,9 +2,14 @@
   "agent": "claude",
   "version": "2.1.214 (Claude Code)",
   "command": "claude -p Reply with exactly AGENTTOWN_PROBE_OK --output-format stream-json --verbose --permission-mode plan",
-  "durationMs": 21569,
+  "durationMs": 20948,
   "rawLogPath": "raw.log",
-  "notes": [],
+  "notes": [
+    "blocker:interrupt_session_not_observed",
+    "blocker:parallel_partial_failure:one:exit_1",
+    "blocker:parallel_partial_failure:two:exit_1",
+    "blocker:parallel_partial_failure:three:exit_1"
+  ],
   "launch": true,
   "streamOutput": true,
   "sessionId": true,

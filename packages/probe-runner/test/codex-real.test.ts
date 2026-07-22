@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { probeCodex } from "../src/adapters/codex.js";
 
 const artifactRootDir = fileURLToPath(new URL("../../../artifacts/feasibility", import.meta.url));
+const configuredTimeoutMs = Number.parseInt(process.env.AGENTTOWN_REAL_TIMEOUT_MS ?? "180000", 10);
+const timeoutMs = Number.isInteger(configuredTimeoutMs) && configuredTimeoutMs > 0 ? configuredTimeoutMs : 180_000;
 const knownBlockers = new Set([
   "blocker:authentication",
   "blocker:executable_not_found",
@@ -19,7 +21,7 @@ const knownBlockers = new Set([
 describe.runIf(process.env.AGENTTOWN_REAL_CODEX === "1")("Codex real probe", () => {
   it("records either verified capabilities or an explicit blocker", async () => {
     const report = await probeCodex({
-      timeoutMs: 180_000,
+      timeoutMs,
       artifactRootDir,
       runId: "codex-real"
     });
@@ -39,5 +41,5 @@ describe.runIf(process.env.AGENTTOWN_REAL_CODEX === "1")("Codex real probe", () 
     expect(report.resume).toBe(true);
     expect(report.tokenUsage).toBe(true);
     expect(report.nonInteractive).toBe(true);
-  }, 240_000);
+  }, timeoutMs + 60_000);
 });

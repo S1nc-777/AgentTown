@@ -1,0 +1,106 @@
+{
+    "generatedBy":  "run-framework-benchmark.ps1",
+    "frameworks":  [
+                       {
+                           "name":  "electron",
+                           "eligible":  false,
+                           "measurementEligible":  false,
+                           "installSize":  "N/A",
+                           "coldStart":  "N/A",
+                           "weightedScore":  "N/A",
+                           "rank":  null,
+                           "blockers":  [
+                                            "core_survival",
+                                            "packaged_window_exit_timeout"
+                                        ],
+                           "benchmarkRuns":  0
+                       },
+                       {
+                           "name":  "tauri",
+                           "eligible":  false,
+                           "measurementEligible":  false,
+                           "installSize":  "N/A",
+                           "coldStart":  "N/A",
+                           "weightedScore":  "N/A",
+                           "rank":  null,
+                           "blockers":  [
+                                            "pty_stability",
+                                            "core_survival",
+                                            "packaging",
+                                            "terminal_embedding",
+                                            "rust_toolchain_download_stalled"
+                                        ],
+                           "benchmarkRuns":  0
+                       }
+                   ],
+    "agents":  [
+                   {
+                       "agent":  "codex",
+                       "version":  "unknown",
+                       "notes":  [
+                                     "error_code:EPERM",
+                                     "blocker:launch_failed",
+                                     "blocker:capability_prerequisite_launch_failed"
+                                 ],
+                       "launch":  false,
+                       "streamOutput":  false,
+                       "sessionId":  false,
+                       "resume":  false,
+                       "interrupt":  false,
+                       "tokenUsage":  false,
+                       "nonInteractive":  false,
+                       "interactivePty":  false,
+                       "parallelThree":  false,
+                       "steps":  {
+                                     "firstTurn":  false,
+                                     "resume":  false,
+                                     "interrupt":  false,
+                                     "parallelThree":  false
+                                 },
+                       "blockers":  [
+                                        "launch_failed",
+                                        "capability_prerequisite_launch_failed",
+                                        "stream_output_not_verified",
+                                        "session_id_not_verified",
+                                        "resume_not_verified",
+                                        "interrupt_not_verified",
+                                        "token_usage_not_verified",
+                                        "non_interactive_not_verified",
+                                        "parallel_three_not_verified"
+                                    ]
+                   },
+                   {
+                       "agent":  "claude",
+                       "version":  "2.1.214 (Claude Code)",
+                       "notes":  [
+                                     "blocker:interrupt_session_not_observed",
+                                     "blocker:parallel_partial_failure:one:exit_1",
+                                     "blocker:parallel_partial_failure:two:exit_1",
+                                     "blocker:parallel_partial_failure:three:exit_1"
+                                 ],
+                       "launch":  true,
+                       "streamOutput":  true,
+                       "sessionId":  true,
+                       "resume":  true,
+                       "interrupt":  false,
+                       "tokenUsage":  true,
+                       "nonInteractive":  true,
+                       "interactivePty":  false,
+                       "parallelThree":  false,
+                       "steps":  {
+                                     "firstTurn":  true,
+                                     "resume":  true,
+                                     "interrupt":  false,
+                                     "parallelThree":  false
+                                 },
+                       "blockers":  [
+                                        "interrupt_session_not_observed",
+                                        "parallel_partial_failure:one:exit_1",
+                                        "parallel_partial_failure:two:exit_1",
+                                        "parallel_partial_failure:three:exit_1",
+                                        "interrupt_not_verified",
+                                        "parallel_three_not_verified"
+                                    ]
+                   }
+               ]
+}

@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "probe:fake": "pnpm --filter @agenttown/fake-agent test"
+    "probe:fake": "vitest run test/benchmark.test.ts && pnpm --filter @agenttown/fake-agent test",
+    "score-frameworks": "tsx src/score-frameworks.ts"
   },
   "dependencies": {
     "@agenttown/probe-contract": "workspace:*",

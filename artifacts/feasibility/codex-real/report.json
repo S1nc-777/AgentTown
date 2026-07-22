@@ -2,11 +2,12 @@
   "agent": "codex",
   "version": "unknown",
   "command": "codex exec --json --sandbox read-only --cd <temp-repo> Reply with exactly AGENTTOWN_PROBE_OK",
-  "durationMs": 29,
+  "durationMs": 35,
   "rawLogPath": "raw.log",
   "notes": [
     "error_code:EPERM",
-    "blocker:launch_failed"
+    "blocker:launch_failed",
+    "blocker:capability_prerequisite_launch_failed"
   ],
   "launch": false,
   "streamOutput": false,

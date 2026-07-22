@@ -137,13 +137,13 @@ function knownLaunchFailure(error: unknown): KnownLaunchFailure | undefined {
   return undefined;
 }
 
-function claudeInvocation(executable: string, args: string[]): Pick<PtyOptions, "file" | "args"> {
+export function claudeInvocation(executable: string, args: string[]): Pick<PtyOptions, "file" | "args"> {
   return process.platform === "win32" && /\.ps1$/iu.test(executable)
     ? { file: "powershell.exe", args: ["-NoProfile", "-File", executable, ...args] }
     : { file: executable, args };
 }
 
-function resolveClaudeExecutable(configuredExecutable?: string): string {
+export function resolveClaudeExecutable(configuredExecutable?: string): string {
   if (configuredExecutable !== undefined || process.platform !== "win32") {
     return configuredExecutable ?? "claude";
   }
