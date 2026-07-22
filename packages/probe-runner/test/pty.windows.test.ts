@@ -20,12 +20,14 @@ async function cleanup(handle: ProbeHandle | undefined): Promise<void> {
 describe.runIf(process.platform === "win32")("runPty", () => {
   it("streams output, accepts resize, and delivers a real Ctrl+C", async () => {
     let handle: ProbeHandle | undefined;
+    const chunks: string[] = [];
     try {
       handle = runPty({
         file: process.execPath,
         args: ["--import", "tsx", "../fake-agent/src/cli.ts", "--mode", "slow"],
         cwd: process.cwd(),
-        timeoutMs: 10_000
+        timeoutMs: 10_000,
+        onData: (text) => chunks.push(text)
       });
 
       await bounded(
@@ -38,6 +40,7 @@ describe.runIf(process.platform === "win32")("runPty", () => {
 
       const result = await bounded(handle.completed, COMPLETION_TIMEOUT_MS, "fake Agent ignored Ctrl+C");
       expect(result.rawOutput).toContain('"type":"interrupted"');
+      expect(chunks.join("")).toContain('"type":"ready"');
       expect(Number.isInteger(result.exitCode)).toBe(true);
       expect(result.timedOut).toBe(false);
     } finally {

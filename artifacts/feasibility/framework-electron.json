@@ -1,0 +1,28 @@
+{
+  "name": "electron",
+  "ptyStable": true,
+  "coreSurvivesUiExit": false,
+  "packageBuilds": true,
+  "embeddedTerminalWorks": true,
+  "installSizeMb": 497.03,
+  "coldStartMs": 798,
+  "implementationMinutes": 60,
+  "evidence": {
+    "electronVersion": "43.2.0",
+    "nodeVersion": "24.14.0",
+    "packagerVersion": "20.0.3",
+    "packageKind": "unpacked-win32-x64",
+    "packageBytes": 521177511,
+    "coldStartSamplesMs": [798],
+    "developmentCoreSurvival": true,
+    "packagedPtyOutput": true,
+    "packagedEmbeddedTerminal": true,
+    "packagedCoreRuntimeBundled": true,
+    "blockers": ["packaged_window_exit_timeout"],
+    "notes": [
+      "The default GitHub Electron binary download returned HTTP 403/ECONNRESET; packaging succeeded with a one-command ELECTRON_MIRROR override to the verified npmmirror CDN.",
+      "The packaged UI reached its first fake-Agent PTY output, but did not exit within the bounded 10 second close window, so packaged core survival after UI exit was not claimed.",
+      "The reported cold start is the single preserved packaged observation before the bounded exit failure, not a three-run median."
+    ]
+  }
+}

@@ -6,6 +6,7 @@ export interface PtyOptions {
   cwd: string;
   env?: Record<string, string>;
   timeoutMs: number;
+  onData?(text: string): void;
 }
 
 export interface RunResult {
@@ -65,6 +66,7 @@ export function runPty(options: PtyOptions): ProbeHandle {
   const completed = new Promise<RunResult>((resolve) => {
     const dataDisposable = terminal.onData((text) => {
       rawOutput += text;
+      options.onData?.(text);
       for (const waiter of [...waiters]) {
         try {
           if (waiter.predicate(rawOutput)) {

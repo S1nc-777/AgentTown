@@ -5,6 +5,8 @@ packages:
 allowBuilds:
   esbuild: true
   node-pty: true
+minimumReleaseAgeExclude:
+  - electron@43.2.0
 onlyBuiltDependencies:
   - esbuild
   - node-pty

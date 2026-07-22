@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AgentTown Electron Spike</title>
+    <style>
+      body { margin: 0; padding: 16px; background: #111827; color: #d1fae5; font: 14px Consolas, monospace; }
+      #terminal { box-sizing: border-box; height: calc(100vh - 72px); overflow: auto; white-space: pre-wrap; border: 1px solid #34d399; padding: 12px; }
+      #controls { display: flex; gap: 8px; margin-top: 8px; }
+      #input { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <pre id="terminal" aria-live="polite"></pre>
+    <div id="controls"><input id="input" /><button id="send">Send</button></div>
+    <script src="renderer.js"></script>
+  </body>
+</html>
