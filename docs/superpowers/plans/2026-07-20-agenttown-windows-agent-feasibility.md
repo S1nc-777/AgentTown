@@ -926,6 +926,8 @@ git commit -m "spike: evaluate Tauri runtime"
 - Consumes: fake, Codex and Claude probe adapters plus both framework metric files.
 - Produces: `runParallelProbe(specs, concurrency)`, `feasibility-summary.json`, and a nonzero exit code when a hard gate fails.
 
+Framework evidence suppression rule: calculate the hard-gate result with `scoreFramework`, then inspect the artifact evidence. If `eligible === false`, `measurementEligible === false`, `installSizeMeasured === false`, or `coldStartMeasured === false`, the feasibility summary and Task 10 ADR table must show install size, cold start, and weighted score as `N/A`. That candidate must not be ranked and must not display the scoreFramework numeric result as a candidate score. Its hard-gate blockers must still be displayed. Numeric schema placeholders are never benchmark observations.
+
 - [ ] **Step 1: Write the failing three-session benchmark test**
 
 ```ts
@@ -962,7 +964,7 @@ Implement a queue with explicit concurrency, per-session log paths and a `finall
 5. Remove the temporary directory only after resolving and verifying it is below `[System.IO.Path]::GetTempPath()`.
 6. Exit nonzero if a required capability is false.
 
-`run-framework-benchmark.ps1` runs both packaged candidates three times and writes median cold-start and stable install size to their metric files.
+`run-framework-benchmark.ps1` runs each implemented, packaged candidate three times and writes median cold-start and stable install size to its metric file. It must not attempt or synthesize measurements for a candidate whose evidence says the runtime/package is unimplemented or measurement-ineligible; it preserves that candidate's blockers and emits `N/A` according to the evidence suppression rule above.
 
 Add these root scripts only after both PowerShell files exist:
 
@@ -995,7 +997,7 @@ powershell -NoProfile -File scripts/run-real-probes.ps1
 powershell -NoProfile -File scripts/run-framework-benchmark.ps1
 ```
 
-Expected: fake benchmark always PASS. Real runs either satisfy every required capability or identify the exact failed capability and preserve logs; no generic `unknown failure` result is allowed.
+Expected: fake benchmark always PASS. Real runs either satisfy every required capability or identify the exact failed capability and preserve logs; no generic `unknown failure` result is allowed. The summary applies the evidence suppression rule, preserves hard-gate blockers, and never ranks an ineligible or unmeasured candidate.
 
 - [ ] **Step 6: Commit benchmark tooling and sanitized summary**
 
@@ -1020,17 +1022,18 @@ git commit -m "test: benchmark parallel agent sessions"
 
 Run: `pnpm --filter @agenttown/probe-runner score-frameworks`
 
-Expected: Markdown table containing hard-gate status, weighted score, install size, cold start, implementation time and observed failures for both candidates.
+Expected: Markdown table containing hard-gate status, weighted score, install size, cold start, implementation time and observed failures for both candidates. Apply Task 9's evidence suppression rule before rendering: ineligible or unmeasured candidates show `N/A` for size, cold start, and weighted score; retain their exact hard-gate blockers.
 
 - [ ] **Step 2: Write the ADR with a mechanically checkable decision rule**
 
 Use this exact decision order:
 
 1. Reject any candidate failing PTY stability, core survival, packaging or embedded terminal.
-2. If one candidate remains, select it.
-3. If both remain and weighted scores differ by at least 10 points, select the higher score.
-4. If both remain within 10 points, select the candidate with fewer implementation minutes because AgentTown prioritizes practical delivery.
-5. If neither remains, stop P1 and evaluate OpenCode only if the failure belongs to an Agent adapter; framework failures require a revised P0 plan.
+2. Exclude any candidate whose evidence has `measurementEligible === false`, `installSizeMeasured === false`, or `coldStartMeasured === false` from weighted comparison. Show its size, cold start, and score as `N/A`; never substitute numeric schema placeholders or the raw `scoreFramework` result.
+3. If one candidate remains, select it.
+4. If both remain and weighted scores differ by at least 10 points, select the higher score.
+5. If both remain within 10 points, select the candidate with fewer implementation minutes because AgentTown prioritizes practical delivery.
+6. If neither remains, stop P1 and evaluate OpenCode only if the failure belongs to an Agent adapter; framework failures require a revised P0 plan.
 
 The ADR includes Context, Evidence, Decision, Consequences, Rejected Alternative and P1 Constraints. It references artifact paths and exact command versions.
 

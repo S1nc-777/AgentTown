@@ -16,7 +16,7 @@ Task 8 is blocked before the required survival-test RED because the official Rus
 
 1. Downloaded `rustup-init.exe` from `https://win.rustup.rs/x86_64`.
 2. The Windows Authenticode status was `NotSigned`, so the executable was not trusted on signature alone.
-3. Downloaded the official checksum from `https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe.sha256`. The downloaded executable matched the published SHA-256 exactly. Its size was 12,814,336 bytes.
+3. Downloaded the official checksum from `https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe.sha256`. A later read-only recheck of the preserved local installer and checksum cache found expected SHA-256 `86478e53f769379d7f0ebfa7c9aa97cb76ca92233f79aa2cc0dbee2efaac73c7` and observed the same digest. The match is recorded in `environment.json`; the installer was 12,814,336 bytes and its Authenticode status was `NotSigned`.
 4. Running the verified executable under a renamed filename failed with `unknown proxy name`; rustup dispatches from its executable name.
 5. Running the same verified bytes as `rustup-init.exe -y --profile minimal --default-toolchain stable` made partial progress but exceeded a bounded 184-second attempt. Its exact process identity was checked before termination.
 6. A final explicitly authorized retry used rustup 1.29.0 with only the official endpoints `https://static.rust-lang.org` and `https://static.rust-lang.org/rustup`: `rustup toolchain install stable --profile minimal --force`.
@@ -41,6 +41,14 @@ The toolchain cannot compile even a failing Rust test. Writing the planned `Test
 - Cold start: not measured; no executable exists. The schema-required numeric placeholder is `0`, and all runtime gates are false.
 - Locked Rust/crate/Tauri versions: unavailable because dependency resolution could not begin.
 - Final blocker: `rust_toolchain_download_stalled`.
+
+## Evidence integrity
+
+`framework-tauri.json` retains the eight required top-level `FrameworkMetrics` fields for schema compatibility and adds an `evidence` object. It explicitly marks install size and cold start as unmeasured, implementation time as prerequisite-audit-only, measurement eligibility as false, and the runtime, package, and core as unimplemented. The numeric zeros are schema placeholders and are not comparable measurements.
+
+The tracked feasibility plan now requires Task 9 summaries and Task 10 ADR tables to render size, cold start, and weighted score as `N/A` whenever hard gates fail or measurement flags are false. Such candidates keep their blockers visible but are not ranked, and the raw numeric output of `scoreFramework` is not presented as a candidate score. The Task 2 score contract itself remains unchanged.
+
+`scripts/verify-feasibility-evidence.ps1` checks the required top-level metric fields, blocker and measurement flags, installer checksum evidence, and the tracked plan's suppression language. Its initial RED failed on the missing Tauri blocker evidence; after the evidence and plan changes it prints `FEASIBILITY_EVIDENCE_VALID`.
 
 ## Boundary
 

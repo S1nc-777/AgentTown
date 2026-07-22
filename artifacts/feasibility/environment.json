@@ -20,6 +20,15 @@
     "node": "24.14.0",
     "pnpm": "11.9.0"
   },
+  "rustupInstallerEvidence": {
+    "installerUrl": "https://win.rustup.rs/x86_64",
+    "checksumUrl": "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe.sha256",
+    "installerBytes": 12814336,
+    "authenticodeStatus": "NotSigned",
+    "expectedSha256": "86478e53f769379d7f0ebfa7c9aa97cb76ca92233f79aa2cc0dbee2efaac73c7",
+    "observedSha256": "86478e53f769379d7f0ebfa7c9aa97cb76ca92233f79aa2cc0dbee2efaac73c7",
+    "checksumMatched": true
+  },
   "blockers": [
     "rust_toolchain_download_stalled"
   ]

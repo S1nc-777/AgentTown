@@ -6,5 +6,18 @@
   "embeddedTerminalWorks": false,
   "installSizeMb": 0,
   "coldStartMs": 0,
-  "implementationMinutes": 15
+  "implementationMinutes": 15,
+  "evidence": {
+    "blockers": [
+      "rust_toolchain_download_stalled"
+    ],
+    "installSizeMeasured": false,
+    "coldStartMeasured": false,
+    "measurementEligible": false,
+    "implementationMeasurement": "prerequisite_audit_only",
+    "runtimeImplemented": false,
+    "packageImplemented": false,
+    "coreImplemented": false,
+    "numericZeroSemantics": "schema_placeholders_not_comparable"
+  }
 }
