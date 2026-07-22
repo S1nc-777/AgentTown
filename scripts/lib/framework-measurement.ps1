@@ -63,3 +63,20 @@ function Invoke-FrameworkMeasurement {
   $Row.rank = 1
   return $Row
 }
+
+function Remove-FrameworkMeasurementLogs {
+  param([string]$LogRoot)
+  if ([string]::IsNullOrWhiteSpace($LogRoot) -or -not (Test-Path -LiteralPath $LogRoot)) { return $null }
+  try {
+    $resolved = [IO.Path]::GetFullPath($LogRoot)
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or $resolved -eq $tempRoot) {
+      return "framework_temp_cleanup_unverified"
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $resolved) { return "framework_temp_cleanup_unverified" }
+    return $null
+  } catch {
+    return "framework_temp_cleanup_unverified"
+  }
+}

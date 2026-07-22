@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("taskkill-nonzero", "process-survives", "identity-mismatch")]
+  [ValidateSet("taskkill-nonzero", "process-survives", "identity-mismatch", "identity-query-error")]
   [string]$Scenario,
   [string]$SummaryPath
 )
@@ -12,11 +12,13 @@ $script:taskkillCalled = $false
 $identityReader = {
   param([int]$ProcessId)
   $script:identityReads += 1
-  if ($Scenario -eq "identity-mismatch") {
-    return [pscustomobject]@{ ProcessId = $ProcessId; StartTimeUtcTicks = 101 }
+  if ($Scenario -eq "identity-query-error") {
+    return [pscustomobject]@{ Status = "query_error"; Identity = $null }
   }
-  if ($Scenario -eq "process-survives") { return $expected }
-  return $expected
+  if ($Scenario -eq "identity-mismatch") {
+    return [pscustomobject]@{ Status = "present"; Identity = [pscustomobject]@{ ProcessId = $ProcessId; StartTimeUtcTicks = 101 } }
+  }
+  return [pscustomobject]@{ Status = "present"; Identity = $expected }
 }
 $taskkill = {
   param([int]$ProcessId)

@@ -3,11 +3,17 @@ function Get-ProcessIdentity {
   try {
     $fresh = Get-Process -Id $ProcessId -ErrorAction Stop
     [pscustomobject]@{
-      ProcessId = $fresh.Id
-      StartTimeUtcTicks = $fresh.StartTime.ToUniversalTime().Ticks
+      Status = "present"
+      Identity = [pscustomobject]@{
+        ProcessId = $fresh.Id
+        StartTimeUtcTicks = $fresh.StartTime.ToUniversalTime().Ticks
+      }
     }
   } catch {
-    $null
+    if ($_.FullyQualifiedErrorId -like "NoProcessFoundForGivenId*") {
+      return [pscustomobject]@{ Status = "absent"; Identity = $null }
+    }
+    return [pscustomobject]@{ Status = "query_error"; Identity = $null }
   }
 }
 
@@ -32,16 +38,18 @@ function Stop-VerifiedProcessTree {
     [scriptblock]$SecondWait = { param($Target, [int]$Milliseconds) $Target.WaitForExit($Milliseconds) }
   )
   $beforeKill = & $IdentityReader $ExpectedIdentity.ProcessId
-  if ($null -eq $beforeKill) { return $null }
-  if (-not (Test-SameProcessIdentity $ExpectedIdentity $beforeKill)) { return "termination_unverified" }
+  if ($null -eq $beforeKill -or $beforeKill.Status -eq "query_error") { return "termination_unverified" }
+  if ($beforeKill.Status -eq "absent") { return $null }
+  if ($beforeKill.Status -ne "present" -or -not (Test-SameProcessIdentity $ExpectedIdentity $beforeKill.Identity)) { return "termination_unverified" }
 
   $taskkillExit = & $TaskkillRunner $ExpectedIdentity.ProcessId
   if ($taskkillExit -ne 0) { return "termination_unverified" }
   if (-not (& $SecondWait $Process $WaitMs)) { return "termination_unverified" }
 
   $afterKill = & $IdentityReader $ExpectedIdentity.ProcessId
-  if ($null -eq $afterKill) { return $null }
-  if (Test-SameProcessIdentity $ExpectedIdentity $afterKill) { return "orphan_process" }
+  if ($null -eq $afterKill -or $afterKill.Status -eq "query_error") { return "termination_unverified" }
+  if ($afterKill.Status -eq "absent") { return $null }
+  if ($afterKill.Status -eq "present" -and (Test-SameProcessIdentity $ExpectedIdentity $afterKill.Identity)) { return "orphan_process" }
   return "termination_unverified"
 }
 

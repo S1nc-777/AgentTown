@@ -132,15 +132,8 @@ try {
 } catch {
   $summaryBlockers += "framework_benchmark_exception:" + $_.Exception.GetType().Name
 } finally {
-  if ($null -ne $measurementLogRoot -and (Test-Path -LiteralPath $measurementLogRoot)) {
-    $resolvedMeasurementLogRoot = [IO.Path]::GetFullPath($measurementLogRoot)
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    if ($resolvedMeasurementLogRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and $resolvedMeasurementLogRoot -ne $tempRoot) {
-      Remove-Item -LiteralPath $resolvedMeasurementLogRoot -Recurse -Force
-    } else {
-      $summaryBlockers += "framework_temp_cleanup_unverified"
-    }
-  }
+  $cleanupBlocker = Remove-FrameworkMeasurementLogs $measurementLogRoot
+  if ($null -ne $cleanupBlocker) { $summaryBlockers += $cleanupBlocker }
   $summary = [ordered]@{
     generatedBy = "run-framework-benchmark.ps1"; blockers = @($summaryBlockers | Select-Object -Unique)
     frameworks = $rows; agents = $agents

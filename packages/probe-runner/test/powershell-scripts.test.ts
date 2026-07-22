@@ -158,7 +158,8 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
   it.each([
     { scenario: "taskkill-nonzero", blocker: "termination_unverified" },
     { scenario: "process-survives", blocker: "orphan_process" },
-    { scenario: "identity-mismatch", blocker: "termination_unverified" }
+    { scenario: "identity-mismatch", blocker: "termination_unverified" },
+    { scenario: "identity-query-error", blocker: "termination_unverified" }
   ])("reports $blocker when bounded termination hits $scenario", async ({ scenario, blocker }) => {
     const parent = await temporaryDirectory(`agenttown-termination-${scenario}-test-`);
     const summaryPath = join(parent, "summary.json");
@@ -175,8 +176,25 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
       taskkillCalled: boolean;
     };
     expect(summary.blocker).toBe(blocker);
-    expect(summary.taskkillCalled).toBe(scenario !== "identity-mismatch");
+    expect(summary.taskkillCalled).toBe(!["identity-mismatch", "identity-query-error"].includes(scenario));
     expect((await readdir(parent)).sort()).toEqual(["summary.json"]);
+  }, 20_000);
+
+  it("writes the framework summary even when a locked log prevents temporary cleanup", async () => {
+    const parent = await temporaryDirectory("agenttown-framework-locked-cleanup-test-");
+    const summaryPath = join(parent, "summary.json");
+    const failure = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-File", join(scriptsRoot, "test-harness", "framework-cleanup-harness.ps1"),
+      "-SummaryPath", summaryPath
+    ], { timeout: 20_000, env: { ...process.env, AGENTTOWN_FORBID_REAL_PROBES: "1" } })
+      .catch((error: NodeJS.ErrnoException & { code?: number }) => error);
+
+    expect(failure.code).toBe(1);
+    const summary = JSON.parse(await readFile(summaryPath, "utf8")) as { blockers: string[] };
+    expect(summary.blockers).toEqual(["framework_temp_cleanup_unverified"]);
+    expect((await readdir(parent)).sort()).toEqual(["summary.json"]);
+    const source = await readFile(join(scriptsRoot, "run-framework-benchmark.ps1"), "utf8");
+    expect(source).toContain("Remove-FrameworkMeasurementLogs");
   }, 20_000);
 
   it("turns malformed and missing Agent reports into exact blockers and still writes a summary", async () => {
