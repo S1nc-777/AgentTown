@@ -42,3 +42,13 @@ Task 9 implemented the bounded parallel fake queue, offline framework scoring/su
 - Final audit found one Git-only temp directory left by the earlier outer-timeout run. Its exact resolved path was verified below the OS temp root with no associated process, then moved to the Recycle Bin; the cleanup is recoverable.
 - Committed summaries contain no temporary path, credential data, raw prompt output, or numeric placeholder presented as a measurement.
 - Task 10 ADR/roadmap work was not implemented.
+
+## Offline review hardening
+
+- A queue-race regression now proves that the first worker error atomically stops further dequeue, waits for worker/handle settlement, applies interrupt-grace-kill to a stable active snapshot, and audits every started PID before returning the error.
+- Capability evidence now strips terminal controls, extracts only balanced parseable JSON objects, and trusts only adapter-produced session/output events. Plain stderr or model prose containing marker-like strings is rejected; ANSI-prefixed and chunk-wrapped valid JSON remains accepted.
+- Interrupt verification captures the original PTY stream and writes a redacted local log plus lifecycle metadata on success, timeout, early exit, and error. Timeout and apparent-early-exit survivor tests both require an orphan PID judgment after bounded cleanup.
+- Launch is the only prerequisite for remaining-capability probes. Offline fixtures verify Claude is attempted despite failed resume/session flags and Codex uses `exec --json --sandbox read-only --cd` with `parseCodexLine`.
+- The PowerShell real-probe wrapper now applies one total deadline to child processes, terminates an exact timed-out PID tree with `taskkill /T /F`, converts nonzero/timeout/exception/forbidden outcomes into summary blockers, verifies cleanup, and always writes the summary before exit.
+- An explicit framework measurement hook exercises eligible candidates exactly three times, records samples and the median cold start, requires stable install size, calculates score/rank, and leaves source artifacts unchanged. Current source candidates remain ineligible and were not run.
+- All review changes and tests were executed with `AGENTTOWN_FORBID_REAL_PROBES=1`, `AGENTTOWN_REAL_CODEX=0`, and `AGENTTOWN_REAL_CLAUDE=0`. Recorded real `false` results were not upgraded and no real Agent was rerun.

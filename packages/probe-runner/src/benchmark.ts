@@ -124,6 +124,10 @@ async function cleanupHandles(
       errors.push(error);
     }
   }
+  await Promise.race([
+    Promise.allSettled(unfinished.map(({ completed }) => completed)),
+    new Promise<void>((resolve) => setTimeout(resolve, graceMs))
+  ]);
   return errors;
 }
 
@@ -188,10 +192,15 @@ export async function runParallelProbe(
   const orphanPollIntervalMs = options.orphanPollIntervalMs ?? DEFAULT_ORPHAN_POLL_INTERVAL_MS;
   const activeHandles = new Set<ParallelProbeHandle>();
   const startedPids: number[] = [];
+  let aborted = false;
+  let firstError: unknown;
+  let signalFirstError!: () => void;
+  const firstErrorObserved = new Promise<void>((resolve) => { signalFirstError = resolve; });
   await mkdir(logRootDir, { recursive: true });
 
   const worker = async () => {
     while (true) {
+      if (aborted) return;
       const index = nextIndex++;
       const spec = specs[index];
       if (spec === undefined) return;
@@ -209,38 +218,54 @@ export async function runParallelProbe(
       activeHandles.add(handle);
       startedPids.push(handle.pid);
       peakCoreMemoryBytes = Math.max(peakCoreMemoryBytes, process.memoryUsage.rss());
-      const result = await handle.completed;
-      activeHandles.delete(handle);
-      const logFile = `${spec.id}.log`;
-      await writeFile(join(logRootDir, logFile), result.rawOutput, "utf8");
-      logFiles[index] = logFile;
-      outcomes[index] = handle.classify?.(result) ?? classify(spec, result);
-      peakCoreMemoryBytes = Math.max(peakCoreMemoryBytes, process.memoryUsage.rss());
+      try {
+        const result = await handle.completed;
+        activeHandles.delete(handle);
+        const logFile = `${spec.id}.log`;
+        await writeFile(join(logRootDir, logFile), result.rawOutput, "utf8");
+        logFiles[index] = logFile;
+        outcomes[index] = handle.classify?.(result) ?? classify(spec, result);
+        peakCoreMemoryBytes = Math.max(peakCoreMemoryBytes, process.memoryUsage.rss());
+      } catch (error) {
+        if (firstError === undefined) {
+          firstError = error;
+          aborted = true;
+          signalFirstError();
+        }
+        return;
+      }
     }
   };
 
-  let workerError: unknown;
-  try {
-    await Promise.all(Array.from({ length: Math.min(concurrency, specs.length) }, worker));
-  } catch (error) {
-    workerError = error;
+  const workers = Array.from({ length: Math.min(concurrency, specs.length) }, worker);
+  const allWorkersStopped = Promise.allSettled(workers);
+  await Promise.race([allWorkersStopped, firstErrorObserved]);
+  let cleanupErrors: unknown[] = [];
+  if (firstError !== undefined) {
+    const cleanupSnapshot = [...activeHandles];
+    cleanupErrors = await cleanupHandles(cleanupSnapshot, cleanupGraceMs);
+    cleanupSnapshot.forEach((handle) => activeHandles.delete(handle));
   }
-  const cleanupErrors = await cleanupHandles(activeHandles, cleanupGraceMs);
-  if (workerError !== undefined) {
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError([workerError, ...cleanupErrors], "Parallel probe failed and cleanup reported errors");
-    }
-    throw workerError;
-  }
-  if (cleanupErrors.length > 0) {
-    throw new AggregateError(cleanupErrors, "Parallel probe cleanup reported errors");
-  }
+  await Promise.race([
+    allWorkersStopped,
+    new Promise<void>((resolve) => setTimeout(resolve, cleanupGraceMs))
+  ]);
+  cleanupErrors.push(...await cleanupHandles([...activeHandles], cleanupGraceMs));
   const orphanPids = await findOrphanPids(
     startedPids,
     isAlive,
     orphanCheckTimeoutMs,
     orphanPollIntervalMs
   );
+  if (firstError !== undefined) {
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([firstError, ...cleanupErrors], "Parallel probe failed and cleanup reported errors");
+    }
+    throw firstError;
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Parallel probe cleanup reported errors");
+  }
   const completed: string[] = [];
   const failed: ParallelProbeFailure[] = [];
   const sessionIds: string[] = [];

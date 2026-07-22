@@ -44,8 +44,11 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
     expect(source).toContain("AGENTTOWN_REAL_CLAUDE");
     expect(source).toContain("AGENTTOWN_REAL_TIMEOUT_MS");
     expect(source).toContain("CapabilitiesOnly");
+    expect(source).toContain("Start-Process");
+    expect(source).toContain("WaitForExit");
+    expect(source).toContain("taskkill.exe");
     expect(source).toContain("[System.IO.Path]::GetTempPath()");
-    expect(source).toContain("git init");
+    expect(source).toContain('@("init", "--quiet"');
     expect(source).not.toMatch(/Remove-Item\s+\$env:/iu);
 
     const parent = await temporaryDirectory("agenttown-real-script-test-");
@@ -123,7 +126,7 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
     const claudeBefore = await readFile(join(artifactRoot, "claude-real", "report.json"), "utf8");
     const failure = await execFileAsync("powershell.exe", [
       "-NoProfile", "-File", join(scriptsRoot, "run-real-probes.ps1"),
-      "-CapabilitiesOnly", "-TempParent", parent, "-SummaryPath", join(parent, "must-not-exist.json")
+      "-CapabilitiesOnly", "-TempParent", parent, "-SummaryPath", join(parent, "summary.json")
     ], {
       timeout: 20_000,
       env: {
@@ -136,9 +139,47 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
 
     expect(failure.code).not.toBe(0);
     expect(`${failure.stdout ?? ""}${failure.stderr ?? ""}`).toContain("real_probe_execution_disabled");
+    const summary = JSON.parse(await readFile(join(parent, "summary.json"), "utf8")) as {
+      observedExitKind: string;
+      executionBlockers: string[];
+    };
+    expect(summary.observedExitKind).toBe("forbidden");
+    expect(summary.executionBlockers).toEqual(["real_probe_execution_disabled"]);
     expect(await readFile(join(artifactRoot, "codex-real", "report.json"), "utf8")).toBe(codexBefore);
     expect(await readFile(join(artifactRoot, "claude-real", "report.json"), "utf8")).toBe(claudeBefore);
-    expect(await readdir(parent)).toEqual([]);
+    expect(await readdir(parent)).toEqual(["summary.json"]);
+  }, 20_000);
+
+  it.each([
+    { mode: "Failure", expectedKind: "nonzero", blocker: "execution_exit_7" },
+    { mode: "Timeout", expectedKind: "timeout", blocker: "execution_timeout" }
+  ])("summarizes bounded validation-child $mode and always cleans its temp tree", async ({ mode, expectedKind, blocker }) => {
+    const parent = await temporaryDirectory(`agenttown-real-${mode.toLowerCase()}-test-`);
+    const summaryPath = join(parent, "summary.json");
+    const failure = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-File", join(scriptsRoot, "run-real-probes.ps1"),
+      "-ValidateOnly", "-ValidationChildMode", mode, "-TimeoutMs", "3000",
+      "-TempParent", parent, "-SummaryPath", summaryPath
+    ], {
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        AGENTTOWN_REAL_CODEX: "0",
+        AGENTTOWN_REAL_CLAUDE: "0",
+        AGENTTOWN_FORBID_REAL_PROBES: "1"
+      }
+    }).catch((error: NodeJS.ErrnoException & { code?: number }) => error);
+
+    expect(failure.code).toBe(1);
+    const summary = JSON.parse(await readFile(summaryPath, "utf8")) as {
+      observedExitKind: string;
+      executionBlockers: string[];
+      validation: { tempCleanupVerified: boolean };
+    };
+    expect(summary.observedExitKind).toBe(expectedKind);
+    expect(summary.executionBlockers).toContain(blocker);
+    expect(summary.validation.tempCleanupVerified).toBe(true);
+    expect((await readdir(parent)).sort()).toEqual(["summary.json"]);
   }, 20_000);
 
   it("suppresses blocked framework measurements and never mutates source artifacts", async () => {
@@ -215,6 +256,77 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
       weightedScore: "N/A",
       rank: null,
       benchmarkRuns: 0
+    });
+  }, 20_000);
+
+  it("measures an eligible framework three times and ranks the median without rewriting source artifacts", async () => {
+    const root = await temporaryDirectory("agenttown-framework-measured-test-");
+    const electron = JSON.parse(await readFile(join(artifactRoot, "framework-electron.json"), "utf8")) as Record<string, unknown> & {
+      evidence: Record<string, unknown>;
+    };
+    Object.assign(electron, { ptyStable: true, coreSurvivesUiExit: true, packageBuilds: true, embeddedTerminalWorks: true });
+    Object.assign(electron.evidence, {
+      blockers: [], measurementEligible: true, installSizeMeasured: true, coldStartMeasured: true
+    });
+    await writeFile(join(root, "framework-electron.json"), `${JSON.stringify(electron, null, 2)}\n`, "utf8");
+    await cp(join(artifactRoot, "framework-tauri.json"), join(root, "framework-tauri.json"));
+    const electronBefore = await readFile(join(root, "framework-electron.json"), "utf8");
+    const tauriBefore = await readFile(join(root, "framework-tauri.json"), "utf8");
+    const counterPath = join(root, "runs.txt");
+    const fixturePath = join(root, "measurement.ps1");
+    await writeFile(fixturePath, [
+      "param([string]$Framework, [int]$Run)",
+      `Add-Content -LiteralPath '${counterPath.replaceAll("'", "''")}' -Value \"$($Framework):$Run\"`,
+      "$samples = @(30, 10, 20)",
+      "[ordered]@{ coldStartMs = $samples[$Run - 1]; installSizeMb = 42 } | ConvertTo-Json -Compress"
+    ].join("\n"), "utf8");
+    const summaryPath = join(root, "framework-summary.json");
+
+    const failure = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-File", join(scriptsRoot, "run-framework-benchmark.ps1"),
+      "-ArtifactRoot", root, "-SummaryPath", summaryPath, "-MeasurementCommand", fixturePath
+    ], { timeout: 20_000 }).catch((error: NodeJS.ErrnoException & { code?: number }) => error);
+
+    expect(failure.code).toBe(1);
+    expect((await readFile(counterPath, "utf8")).trim().split(/\r?\n/u)).toEqual(["electron:1", "electron:2", "electron:3"]);
+    const summary = JSON.parse(await readFile(summaryPath, "utf8")) as { frameworks: Array<Record<string, unknown>> };
+    expect(summary.frameworks[0]).toMatchObject({
+      name: "electron", installSize: 42, coldStart: 20, coldStartSamples: [30, 10, 20],
+      weightedScore: 83.6, rank: 1, benchmarkRuns: 3, blockers: []
+    });
+    expect(await readFile(join(root, "framework-electron.json"), "utf8")).toBe(electronBefore);
+    expect(await readFile(join(root, "framework-tauri.json"), "utf8")).toBe(tauriBefore);
+  }, 20_000);
+
+  it("writes an exact blocker and summary when an eligible measurement run fails", async () => {
+    const root = await temporaryDirectory("agenttown-framework-failed-measurement-test-");
+    const electron = JSON.parse(await readFile(join(artifactRoot, "framework-electron.json"), "utf8")) as Record<string, unknown> & {
+      evidence: Record<string, unknown>;
+    };
+    Object.assign(electron, { ptyStable: true, coreSurvivesUiExit: true, packageBuilds: true, embeddedTerminalWorks: true });
+    Object.assign(electron.evidence, {
+      blockers: [], measurementEligible: true, installSizeMeasured: true, coldStartMeasured: true
+    });
+    await writeFile(join(root, "framework-electron.json"), `${JSON.stringify(electron, null, 2)}\n`, "utf8");
+    await cp(join(artifactRoot, "framework-tauri.json"), join(root, "framework-tauri.json"));
+    const fixturePath = join(root, "measurement-failure.ps1");
+    await writeFile(fixturePath, [
+      "param([string]$Framework, [int]$Run)",
+      "if ($Run -eq 2) { exit 7 }",
+      "[ordered]@{ coldStartMs = 10; installSizeMb = 42 } | ConvertTo-Json -Compress"
+    ].join("\n"), "utf8");
+    const summaryPath = join(root, "framework-summary.json");
+
+    const failure = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-File", join(scriptsRoot, "run-framework-benchmark.ps1"),
+      "-ArtifactRoot", root, "-SummaryPath", summaryPath, "-MeasurementCommand", fixturePath
+    ], { timeout: 20_000 }).catch((error: NodeJS.ErrnoException & { code?: number }) => error);
+
+    expect(failure.code).toBe(1);
+    const summary = JSON.parse(await readFile(summaryPath, "utf8")) as { frameworks: Array<Record<string, unknown>> };
+    expect(summary.frameworks[0]).toMatchObject({
+      name: "electron", installSize: "N/A", coldStart: "N/A", weightedScore: "N/A",
+      rank: null, benchmarkRuns: 1, blockers: ["measurement_run_2_exit_7"]
     });
   }, 20_000);
 });

@@ -4,10 +4,13 @@ import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { CapabilityReport } from "@agenttown/probe-contract";
+import type { CapabilityReport, ProbeEvent } from "@agenttown/probe-contract";
+import { redactJsonlOutput } from "./artifacts.js";
 import { runParallelProbe, type ParallelProbeHandle } from "./benchmark.js";
+import { parseCodexLine } from "./adapters/codex.js";
 import {
   claudeInvocation,
+  parseClaudeLine,
   resolveClaudeExecutable
 } from "./adapters/claude.js";
 import { runPty, type ProbeHandle, type PtyOptions, type RunResult } from "./pty.js";
@@ -74,24 +77,70 @@ function bounded<T>(promise: Promise<T>, timeoutMs: number, blocker: string): Pr
   });
 }
 
-function compactTerminalOutput(rawOutput: string): string {
+function stripTerminalControls(rawOutput: string): string {
   return rawOutput
     .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/gu, "")
-    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "")
-    .replace(/\s+/gu, "");
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "");
 }
 
-function terminalEvidence(rawOutput: string, marker?: string): { sessionId?: string; markerSeen: boolean } {
-  const compact = compactTerminalOutput(rawOutput);
-  const match = /"session_id":"([^"\\]+)"/u.exec(compact);
+function balancedJsonObjects(rawOutput: string): unknown[] {
+  const text = stripTerminalControls(rawOutput);
+  const values: unknown[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (start < 0) {
+      if (character === "{") {
+        start = index;
+        depth = 1;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          values.push(JSON.parse(text.slice(start, index + 1)) as unknown);
+        } catch {
+          // Terminal text can contain brace-shaped stderr. Only valid balanced JSON is evidence.
+        }
+        start = -1;
+      }
+    }
+  }
+  return values;
+}
+
+type StructuredLineParser = (line: string) => ProbeEvent[];
+
+function terminalEvidence(
+  rawOutput: string,
+  parser: StructuredLineParser,
+  marker?: string
+): { sessionId?: string; markerSeen: boolean } {
+  const events = balancedJsonObjects(rawOutput).flatMap((value) => parser(JSON.stringify(value)));
+  const session = events.find((event) => event.type === "session");
   return {
-    ...(match?.[1] === undefined ? {} : { sessionId: match[1] }),
-    markerSeen: marker === undefined || compact.includes(marker)
+    ...(session?.type !== "session" ? {} : { sessionId: session.sessionId }),
+    markerSeen: marker === undefined || events.some(
+      (event) => event.type === "output" && event.text.includes(marker)
+    )
   };
 }
 
-function sessionObserved(rawOutput: string): boolean {
-  return terminalEvidence(rawOutput).sessionId !== undefined;
+function sessionObserved(rawOutput: string, parser: StructuredLineParser): boolean {
+  return terminalEvidence(rawOutput, parser).sessionId !== undefined;
 }
 
 function safeTemporaryDirectory(directory: string): string {
@@ -132,10 +181,7 @@ async function waitUntilDead(
 }
 
 function prerequisiteBlocker(report: CapabilityReport): string | undefined {
-  if (!report.launch) return "capability_prerequisite_launch_failed";
-  if (!report.sessionId) return "capability_prerequisite_session_id_missing";
-  if (!report.resume) return "capability_prerequisite_resume_failed";
-  return undefined;
+  return report.launch ? undefined : "capability_prerequisite_launch_failed";
 }
 
 function capabilityNotes(notes: string[], blockers: string[]): string[] {
@@ -175,28 +221,96 @@ function claudeArgs(prompt: string): string[] {
   ];
 }
 
+interface AgentCapabilityConfig {
+  executable: string;
+  invocation(prompt: string, cwd: string): Pick<PtyOptions, "file" | "args">;
+  parseLine: StructuredLineParser;
+}
+
+function capabilityConfig(
+  agent: "codex" | "claude",
+  configuredExecutable?: string
+): AgentCapabilityConfig {
+  if (agent === "codex") {
+    const executable = configuredExecutable ?? "codex";
+    return {
+      executable,
+      invocation: (prompt, cwd) => ({
+        file: executable,
+        args: ["exec", "--json", "--sandbox", "read-only", "--cd", cwd, prompt]
+      }),
+      parseLine: parseCodexLine
+    };
+  }
+  const executable = resolveClaudeExecutable(configuredExecutable);
+  return {
+    executable,
+    invocation: (prompt) => claudeInvocation(executable, claudeArgs(prompt)),
+    parseLine: parseClaudeLine
+  };
+}
+
 async function verifyInterrupt(
-  executable: string,
+  config: AgentCapabilityConfig,
   cwd: string,
   timeoutMs: number,
   dependencies: RemainingCapabilitiesDependencies,
   logPath: string
 ): Promise<{ passed: boolean; blocker?: string; orphanPid?: number }> {
-  const command = claudeInvocation(executable, claudeArgs(`Reply with exactly ${INTERRUPT_MARKER}`));
-  const handle = dependencies.startPty({ ...command, cwd, timeoutMs });
+  const command = config.invocation(`Reply with exactly ${INTERRUPT_MARKER}`, cwd);
+  let streamedRaw = "";
+  const handle = dependencies.startPty({
+    ...command,
+    cwd,
+    timeoutMs,
+    onData: (text) => { streamedRaw += text; }
+  });
   handle.resize(240, 60);
+  const writeLog = async (
+    sessionSeen: boolean,
+    dead: boolean,
+    completed?: RunResult
+  ) => {
+    const rawOutput = completed?.rawOutput ?? streamedRaw;
+    await writeFile(logPath, [
+      `[agenttown] session_observed:${sessionSeen}`,
+      `[agenttown] process_dead:${dead}`,
+      `[agenttown] bounded_exit:${completed !== undefined}`,
+      `[agenttown] exit_code:${completed?.exitCode ?? "unobserved"}`,
+      "[agenttown] raw_output_begin",
+      redactJsonlOutput(rawOutput),
+      "[agenttown] raw_output_end"
+    ].join("\n") + "\n", "utf8");
+  };
   try {
-    await bounded(handle.waitFor(sessionObserved), timeoutMs, "interrupt_session_timeout");
+    await bounded(handle.waitFor((output) => sessionObserved(output, config.parseLine)), timeoutMs, "interrupt_session_timeout");
   } catch {
     handle.interrupt();
     handle.kill();
-    await bounded(handle.completed, Math.min(timeoutMs + 2_500, 5_000), "interrupt_cleanup_timeout").catch(() => undefined);
-    return { passed: false, blocker: "interrupt_session_not_observed" };
+    const completed = await bounded(
+      handle.completed,
+      Math.min(timeoutMs + 2_500, 5_000),
+      "interrupt_cleanup_timeout"
+    ).catch(() => undefined);
+    const dead = await waitUntilDead(handle.pid, dependencies.isAlive, timeoutMs);
+    await writeLog(false, dead, completed);
+    return dead
+      ? { passed: false, blocker: "interrupt_session_not_observed" }
+      : { passed: false, blocker: "interrupt_orphan_process", orphanPid: handle.pid };
   }
 
   if (!(await dependencies.isAlive(handle.pid))) {
-    await bounded(handle.completed, Math.min(timeoutMs, 1_000), "interrupt_early_exit_cleanup_timeout").catch(() => undefined);
-    return { passed: false, blocker: "interrupt_process_exited_before_signal" };
+    handle.kill();
+    const completed = await bounded(
+      handle.completed,
+      Math.min(timeoutMs, 1_000),
+      "interrupt_early_exit_cleanup_timeout"
+    ).catch(() => undefined);
+    const dead = await waitUntilDead(handle.pid, dependencies.isAlive, timeoutMs);
+    await writeLog(true, dead, completed);
+    return dead
+      ? { passed: false, blocker: "interrupt_process_exited_before_signal" }
+      : { passed: false, blocker: "interrupt_orphan_process", orphanPid: handle.pid };
   }
   handle.interrupt();
   let completed: RunResult;
@@ -204,18 +318,15 @@ async function verifyInterrupt(
     completed = await bounded(handle.completed, Math.min(timeoutMs + 2_500, 5_000), "interrupt_timeout");
   } catch {
     handle.kill();
-    await bounded(handle.completed, 2_500, "interrupt_kill_timeout").catch(() => undefined);
+    const killed = await bounded(handle.completed, 2_500, "interrupt_kill_timeout").catch(() => undefined);
     const dead = await waitUntilDead(handle.pid, dependencies.isAlive, timeoutMs);
+    await writeLog(true, dead, killed);
     return dead
       ? { passed: false, blocker: "interrupt_timeout" }
       : { passed: false, blocker: "interrupt_orphan_process", orphanPid: handle.pid };
   }
   const dead = await waitUntilDead(handle.pid, dependencies.isAlive, timeoutMs);
-  await writeFile(logPath, [
-    "[agenttown] session_observed:true",
-    `[agenttown] bounded_exit:true`,
-    `[agenttown] exit_code:${completed.exitCode}`
-  ].join("\n") + "\n", "utf8");
+  await writeLog(true, dead, completed);
   return dead
     ? { passed: true }
     : { passed: false, blocker: "interrupt_orphan_process", orphanPid: handle.pid };
@@ -223,7 +334,8 @@ async function verifyInterrupt(
 
 function normalizedParallelHandle(
   handle: ProbeHandle,
-  marker: string
+  marker: string,
+  parser: StructuredLineParser
 ): ParallelProbeHandle {
   return {
     pid: handle.pid,
@@ -233,7 +345,7 @@ function normalizedParallelHandle(
     classify: (run) => {
       if (run.timedOut) return { blocker: "timeout" };
       if (run.exitCode !== 0) return { blocker: `exit_${run.exitCode}` };
-      const evidence = terminalEvidence(run.rawOutput, marker);
+      const evidence = terminalEvidence(run.rawOutput, parser, marker);
       if (evidence.sessionId === undefined || !evidence.markerSeen) return { blocker: "exit_1" };
       return { sessionId: evidence.sessionId };
     }
@@ -241,7 +353,7 @@ function normalizedParallelHandle(
 }
 
 async function verifyParallelThree(
-  executable: string,
+  config: AgentCapabilityConfig,
   repositories: string[],
   timeoutMs: number,
   dependencies: RemainingCapabilitiesDependencies,
@@ -262,14 +374,14 @@ async function verifyParallelThree(
     startProbe: (spec) => {
       const index = ids.indexOf(spec.id as typeof ids[number]);
       const marker = PARALLEL_MARKERS[index]!;
-      const command = claudeInvocation(executable, claudeArgs(`Reply with exactly ${marker}`));
+      const command = config.invocation(`Reply with exactly ${marker}`, repositories[index]!);
       const handle = dependencies.startPty({
         ...command,
         cwd: repositories[index]!,
         timeoutMs
       });
       handle.resize(240, 60);
-      return normalizedParallelHandle(handle, marker);
+      return normalizedParallelHandle(handle, marker, config.parseLine);
     }
   });
   const blockers = summary.failed.map(({ id, blocker }) => `parallel_partial_failure:${id}:${blocker}`);
@@ -298,22 +410,21 @@ export async function probeRemainingAgentCapabilities(
   const reportPath = resolve(options.artifactRootDir, `${agent}-real`, "report.json");
   const report = JSON.parse(await readFile(reportPath, "utf8")) as CapabilityReport;
   const prerequisite = prerequisiteBlocker(report);
-  if (prerequisite !== undefined || agent !== "claude") {
-    const blocker = prerequisite ?? "capability_adapter_not_implemented";
+  if (prerequisite !== undefined) {
     const outcome: RemainingCapabilitiesOutcome = {
       agent,
       attempted: false,
       interrupt: false,
       parallelThree: false,
-      blockers: [blocker],
+      blockers: [prerequisite],
       orphanPids: []
     };
     await recordOutcome(reportPath, report, outcome);
     return outcome;
   }
 
-  const executable = resolveClaudeExecutable(options.executable);
-  const capabilityRoot = resolve(options.artifactRootDir, "claude-capabilities");
+  const config = capabilityConfig(agent, options.executable);
+  const capabilityRoot = resolve(options.artifactRootDir, `${agent}-capabilities`);
   await mkdir(capabilityRoot, { recursive: true });
   const repositories: string[] = [];
   const blockers: string[] = [];
@@ -325,7 +436,7 @@ export async function probeRemainingAgentCapabilities(
       repositories.push(await createRepository(dependencies, options.timeoutMs));
     }
     const interruptResult = await verifyInterrupt(
-      executable,
+      config,
       repositories[0]!,
       options.timeoutMs,
       dependencies,
@@ -336,7 +447,7 @@ export async function probeRemainingAgentCapabilities(
     if (interruptResult.orphanPid !== undefined) orphanPids.push(interruptResult.orphanPid);
 
     const parallelResult = await verifyParallelThree(
-      executable,
+      config,
       repositories.slice(1),
       options.timeoutMs,
       dependencies,

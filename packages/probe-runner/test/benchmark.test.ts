@@ -162,4 +162,46 @@ describe("runParallelProbe", () => {
 
     expect(result.orphanPids).toEqual([777]);
   });
+
+  it("stops dequeuing after the first worker error and audits every started PID", async () => {
+    let rejectFirst!: (error: Error) => void;
+    let resolveSecond!: (result: RunResult) => void;
+    const first = new Promise<RunResult>((_resolve, reject) => { rejectFirst = reject; });
+    const second = new Promise<RunResult>((resolve) => { resolveSecond = resolve; });
+    const started: string[] = [];
+    const cleanup: string[] = [];
+    const audited: number[] = [];
+    const run = runParallelProbe([
+      { id: "reject", adapter: "fake", prompt: "1" },
+      { id: "racing", adapter: "fake", prompt: "2" },
+      { id: "must-not-start", adapter: "fake", prompt: "3" }
+    ], 2, {
+      startProbe: (spec) => {
+        started.push(spec.id);
+        const pid = spec.id === "reject" ? 801 : 802;
+        return {
+          pid,
+          completed: spec.id === "reject" ? first : second,
+          interrupt: () => cleanup.push(`interrupt:${pid}`),
+          kill: () => cleanup.push(`kill:${pid}`)
+        };
+      },
+      isAlive: async (pid) => { audited.push(pid); return false; },
+      cleanupGraceMs: 1,
+      orphanCheckTimeoutMs: 1,
+      orphanPollIntervalMs: 1,
+      logRootDir: await temporaryLogRoot()
+    });
+
+    while (started.length < 2) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const rejected = expect(run).rejects.toThrow("first worker failed");
+    rejectFirst(new Error("first worker failed"));
+    resolveSecond(successfulResult("racing"));
+    await rejected;
+
+    expect(started).toEqual(["reject", "racing"]);
+    expect(cleanup).toContain("interrupt:801");
+    expect(cleanup).toContain("kill:801");
+    expect([...new Set(audited)].sort()).toEqual([801, 802]);
+  });
 });

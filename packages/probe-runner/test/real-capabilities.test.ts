@@ -7,7 +7,7 @@ import {
   probeRemainingAgentCapabilities,
   type RemainingCapabilitiesDependencies
 } from "../src/real-capabilities.js";
-import type { ProbeHandle, RunResult } from "../src/pty.js";
+import type { ProbeHandle, PtyOptions, RunResult } from "../src/pty.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -61,6 +61,14 @@ function claudeOutput(sessionId: string, marker: string): string {
     JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }),
     JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: marker }] } }),
     JSON.stringify({ type: "result", subtype: "success", usage: { input_tokens: 1, output_tokens: 1 } })
+  ].join("\n") + "\n";
+}
+
+function codexOutput(sessionId: string, marker: string): string {
+  return [
+    JSON.stringify({ type: "thread.started", thread_id: sessionId }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: marker } }),
+    JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })
   ].join("\n") + "\n";
 }
 
@@ -161,6 +169,64 @@ describe("probeRemainingAgentCapabilities", () => {
     expect((await readdir(join(root, "claude-real"))).filter((name) => name.includes(".tmp"))).toEqual([]);
   });
 
+  it("attempts the remaining Claude checks when launch passed even if resume failed", async () => {
+    const root = await artifactRoot(report("claude", { resume: false, sessionId: false }));
+    const fixture = dependencies([
+      { sessionId: "interrupt-session", marker: "AGENTTOWN_INTERRUPT_PROBE" },
+      { sessionId: "parallel-1", marker: "AGENTTOWN_PARALLEL_ONE" },
+      { sessionId: "parallel-2", marker: "AGENTTOWN_PARALLEL_TWO" },
+      { sessionId: "parallel-3", marker: "AGENTTOWN_PARALLEL_THREE" }
+    ]);
+
+    const outcome = await probeRemainingAgentCapabilities("claude", {
+      artifactRootDir: root,
+      timeoutMs: 100,
+      dependencies: fixture.value
+    });
+
+    expect(outcome).toMatchObject({ attempted: true, interrupt: true, parallelThree: true });
+    expect(fixture.calls.filter((call) => call.startsWith("resize:"))).toHaveLength(4);
+  });
+
+  it("runs Codex capability checks through read-only exec JSON and parses Codex events", async () => {
+    const root = await artifactRoot(report("codex"));
+    const outputs = [
+      codexOutput("interrupt-codex", "AGENTTOWN_INTERRUPT_PROBE"),
+      codexOutput("parallel-codex-1", "AGENTTOWN_PARALLEL_ONE"),
+      codexOutput("parallel-codex-2", "AGENTTOWN_PARALLEL_TWO"),
+      codexOutput("parallel-codex-3", "AGENTTOWN_PARALLEL_THREE")
+    ];
+    const launches: PtyOptions[] = [];
+    const checks = new Map<number, number>();
+    const dependencies: RemainingCapabilitiesDependencies = {
+      initializeGit: async () => undefined,
+      startPty: (options) => {
+        launches.push(options);
+        const index = launches.length - 1;
+        return handle(801 + index, result(outputs[index]!), []);
+      },
+      isAlive: async (pid) => {
+        const count = checks.get(pid) ?? 0;
+        checks.set(pid, count + 1);
+        return pid === 801 && count === 0;
+      }
+    };
+
+    const outcome = await probeRemainingAgentCapabilities("codex", {
+      artifactRootDir: root,
+      timeoutMs: 100,
+      executable: "codex-fixture",
+      dependencies
+    });
+
+    expect(outcome).toMatchObject({ attempted: true, interrupt: true, parallelThree: true, blockers: [] });
+    expect(launches).toHaveLength(4);
+    for (const launch of launches) {
+      expect(launch.file).toBe("codex-fixture");
+      expect(launch.args.slice(0, 6)).toEqual(["exec", "--json", "--sandbox", "read-only", "--cd", launch.cwd]);
+    }
+  });
+
   it("does not claim interrupt when the interrupted PID survives cleanup", async () => {
     const root = await artifactRoot(report("claude"));
     const fixture = dependencies([
@@ -198,6 +264,31 @@ describe("probeRemainingAgentCapabilities", () => {
 
     expect(outcome.interrupt).toBe(false);
     expect(outcome.blockers).toContain("interrupt_process_exited_before_signal");
+  });
+
+  it("reports an orphan when an apparent early exit is followed by a live PID", async () => {
+    const root = await artifactRoot(report("claude"));
+    const fixture = dependencies([
+      { sessionId: "interrupt-session", marker: "AGENTTOWN_INTERRUPT_PROBE" },
+      { sessionId: "parallel-1", marker: "AGENTTOWN_PARALLEL_ONE" },
+      { sessionId: "parallel-2", marker: "AGENTTOWN_PARALLEL_TWO" },
+      { sessionId: "parallel-3", marker: "AGENTTOWN_PARALLEL_THREE" }
+    ]);
+    let checks = 0;
+    fixture.value.isAlive = async (pid) => pid === 701 && checks++ > 0;
+
+    const outcome = await probeRemainingAgentCapabilities("claude", {
+      artifactRootDir: root,
+      timeoutMs: 5,
+      dependencies: fixture.value
+    });
+
+    expect(outcome.blockers).toContain("interrupt_orphan_process");
+    expect(outcome.orphanPids).toContain(701);
+    expect(fixture.calls).toContain("kill:701");
+    const log = await readFile(join(root, "claude-capabilities", "interrupt.log"), "utf8");
+    expect(log).toContain("session_observed:true");
+    expect(log).toContain("process_dead:false");
   });
 
   it.each([
@@ -260,11 +351,10 @@ describe("probeRemainingAgentCapabilities", () => {
   it("extracts sessions and markers from ANSI-prefixed terminal-wrapped JSON", async () => {
     const root = await artifactRoot(report("claude"));
     const wrapped = (sessionId: string, marker: string) => [
-      "\u001b[?9001h\u001b[2J",
-      `{"type":"system",\r\n"subtype":"init",\r\n"session_id":"${sessionId}"}`,
-      `{"type":"assistant","message":{"content":[{"type":"text","text":"${marker.slice(0, 12)}\r\n${marker.slice(12)}"}]}}`,
-      '{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1}}'
-    ].join("\r\n") + "\r\n";
+      `{"type":"system"\u001b[?25l,\r\n"subtype":"init",\r\n"session_id":"${sessionId}"}`,
+      `{"type":"assistant"\u001b[?25h,\r\n"message":{"content":[{"type":"text","text":"${marker}"}]}}`,
+      '{"type":"result",\r\n"subtype":"success","usage":{"input_tokens":1,"output_tokens":1}}'
+    ].join("") + "\r\n";
     const fixture = dependencies([
       { sessionId: "interrupt-wrapped", marker: "AGENTTOWN_INTERRUPT_PROBE", rawOutput: wrapped("interrupt-wrapped", "AGENTTOWN_INTERRUPT_PROBE") },
       { sessionId: "parallel-wrapped-1", marker: "AGENTTOWN_PARALLEL_ONE", rawOutput: wrapped("parallel-wrapped-1", "AGENTTOWN_PARALLEL_ONE") },
@@ -285,5 +375,52 @@ describe("probeRemainingAgentCapabilities", () => {
       "resize:703:240x60",
       "resize:704:240x60"
     ]);
+  });
+
+  it("rejects plain stderr and model text that merely contain session and marker strings", async () => {
+    const root = await artifactRoot(report("claude"));
+    const fakeEvidence = (sessionId: string, marker: string) => [
+      `stderr says {"session_id":"${sessionId}"}`,
+      marker,
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "ordinary output" }] } })
+    ].join("\n");
+    const fixture = dependencies([
+      { sessionId: "fake-interrupt", marker: "AGENTTOWN_INTERRUPT_PROBE", rawOutput: fakeEvidence("fake-interrupt", "AGENTTOWN_INTERRUPT_PROBE") },
+      { sessionId: "fake-1", marker: "AGENTTOWN_PARALLEL_ONE", rawOutput: fakeEvidence("fake-1", "AGENTTOWN_PARALLEL_ONE") },
+      { sessionId: "fake-2", marker: "AGENTTOWN_PARALLEL_TWO", rawOutput: fakeEvidence("fake-2", "AGENTTOWN_PARALLEL_TWO") },
+      { sessionId: "fake-3", marker: "AGENTTOWN_PARALLEL_THREE", rawOutput: fakeEvidence("fake-3", "AGENTTOWN_PARALLEL_THREE") }
+    ]);
+
+    const outcome = await probeRemainingAgentCapabilities("claude", {
+      artifactRootDir: root,
+      timeoutMs: 5,
+      dependencies: fixture.value
+    });
+
+    expect(outcome.interrupt).toBe(false);
+    expect(outcome.parallelThree).toBe(false);
+    expect(outcome.blockers).toContain("interrupt_session_not_observed");
+  });
+
+  it("reports an orphan when the session-timeout cleanup leaves the PID alive", async () => {
+    const root = await artifactRoot(report("claude"));
+    const fixture = dependencies([
+      { sessionId: "missing", marker: "missing", rawOutput: "no structured session\n" },
+      { sessionId: "parallel-1", marker: "AGENTTOWN_PARALLEL_ONE" },
+      { sessionId: "parallel-2", marker: "AGENTTOWN_PARALLEL_TWO" },
+      { sessionId: "parallel-3", marker: "AGENTTOWN_PARALLEL_THREE" }
+    ], [701]);
+
+    const outcome = await probeRemainingAgentCapabilities("claude", {
+      artifactRootDir: root,
+      timeoutMs: 5,
+      dependencies: fixture.value
+    });
+
+    expect(outcome.blockers).toContain("interrupt_orphan_process");
+    expect(outcome.orphanPids).toContain(701);
+    const log = await readFile(join(root, "claude-capabilities", "interrupt.log"), "utf8");
+    expect(log).toContain("no structured session");
+    expect(log).toContain("session_observed:false");
   });
 });
