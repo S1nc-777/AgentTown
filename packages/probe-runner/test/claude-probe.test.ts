@@ -38,6 +38,7 @@ const firstSuccess = [
 ].join("\n") + "\n";
 
 const resumeSuccess = [
+  '{"type":"system","subtype":"init","session_id":"session-fixture"}',
   '{"type":"assistant","message":{"content":[{"type":"text","text":"AGENTTOWN_RESUME_OK"}]}}',
   '{"type":"result","subtype":"success","usage":{"input_tokens":2,"output_tokens":2}}'
 ].join("\n") + "\n";
@@ -250,6 +251,122 @@ describe("probeClaude", () => {
 
     expect(report.notes).toContain("blocker:authentication");
     expect(report.notes).not.toContain("blocker:resume_failed");
+  });
+
+  it.each([
+    {
+      name: "missing resume session",
+      resumeOutput: resumeSuccess.split(/\r?\n/u).filter((line) => !line.includes('"type":"system"')).join("\n")
+    },
+    {
+      name: "mismatched resume session",
+      resumeOutput: resumeSuccess.replace("session-fixture", "different-session")
+    },
+    {
+      name: "resume error",
+      resumeOutput: [
+        '{"type":"system","subtype":"init","session_id":"session-fixture"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"AGENTTOWN_RESUME_OK"}]}}',
+        '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"AGENTTOWN_RESUME_OK"}'
+      ].join("\n")
+    }
+  ])("rejects $name even when the resume prompt succeeds", async ({ resumeOutput }) => {
+    const calls: PtyOptions[] = [];
+    const rootDir = await artifactRoot();
+    const baseRunner = successfulRunner(calls);
+    const report = await probeClaude({
+      timeoutMs: 1_000,
+      artifactRootDir: rootDir,
+      runId: `claude-resume-session-${calls.length}-${resumeOutput.length}`,
+      executable: "claude",
+      runProcess: async (options) => options.args.includes("--resume")
+        ? result(resumeOutput)
+        : await baseRunner(options)
+    });
+
+    expect(report.resume).toBe(false);
+    expect(report.notes).toContain("blocker:resume_failed");
+  });
+
+  it("redacts sensitive keys in unknown valid raw JSON while preserving structure and usage numbers", async () => {
+    const calls: PtyOptions[] = [];
+    const rootDir = await artifactRoot();
+    const runId = "claude-unknown-json-secrets";
+    const metadata = {
+      type: "metadata",
+      api_key: "synthetic-secret",
+      nested: { access_token: "nested-synthetic-secret" },
+      usage: { inputTokens: 10, outputTokens: 5 }
+    };
+    const baseRunner = successfulRunner(calls);
+    const report = await probeClaude({
+      timeoutMs: 1_000,
+      artifactRootDir: rootDir,
+      runId,
+      executable: "claude",
+      runProcess: async (options) => stageOf(options) === "first"
+        ? result(`${JSON.stringify(metadata)}\n${firstSuccess}`)
+        : await baseRunner(options)
+    });
+
+    expect(report.notes).toEqual([]);
+    const raw = await readFile(report.rawLogPath, "utf8");
+    const events = await readFile(join(rootDir, runId, "events.jsonl"), "utf8");
+    const persistedMetadata = raw.split(/\r?\n/u)
+      .map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return undefined; } })
+      .find((value) => value?.type === "metadata");
+    expect(persistedMetadata).toEqual({
+      type: "metadata",
+      api_key: "[REDACTED]",
+      nested: { access_token: "[REDACTED]" },
+      usage: { inputTokens: 10, outputTokens: 5 }
+    });
+    expect(`${raw}${events}`).not.toContain("synthetic-secret");
+    expect(events).not.toContain('"type":"metadata"');
+  });
+
+  it("sanitizes malformed known JSON before parse-error normalization and persistence", async () => {
+    const calls: PtyOptions[] = [];
+    const rootDir = await artifactRoot();
+    const runId = "claude-malformed-json-secrets";
+    const malformed = {
+      type: "system",
+      subtype: "init",
+      api_key: "synthetic-secret",
+      nested: { credentials: { access_token: "nested-synthetic-secret" } },
+      usage: { inputTokens: 10, outputTokens: 5 }
+    };
+    const invalidJson = '{"type":"system","api_key":"truncated-synthetic-secret"';
+    const baseRunner = successfulRunner(calls);
+    const report = await probeClaude({
+      timeoutMs: 1_000,
+      artifactRootDir: rootDir,
+      runId,
+      executable: "claude",
+      runProcess: async (options) => stageOf(options) === "first"
+        ? result(`${JSON.stringify(malformed)}\n${invalidJson}\n${firstSuccess}`)
+        : await baseRunner(options)
+    });
+
+    expect(report.notes).toContain("blocker:parse_failure");
+    const raw = await readFile(report.rawLogPath, "utf8");
+    const eventLines = (await readFile(join(rootDir, runId, "events.jsonl"), "utf8"))
+      .trim().split(/\r?\n/u).map((line) => JSON.parse(line) as Record<string, unknown>);
+    const parseErrors = eventLines.filter((event) => event.type === "parse_error") as Array<{ raw: string }>;
+    expect(parseErrors).toHaveLength(2);
+    const structuredParseError = parseErrors.find(({ raw: parseErrorRaw }) => {
+      try { return (JSON.parse(parseErrorRaw) as { subtype?: string }).subtype === "init"; } catch { return false; }
+    });
+    expect(structuredParseError).toBeDefined();
+    expect(JSON.parse(structuredParseError!.raw)).toEqual({
+      type: "system",
+      subtype: "init",
+      api_key: "[REDACTED]",
+      nested: { credentials: "[REDACTED]" },
+      usage: { inputTokens: 10, outputTokens: 5 }
+    });
+    expect(`${raw}${JSON.stringify(eventLines)}`).not.toContain("synthetic-secret");
+    expect(parseErrors.map(({ raw: parseErrorRaw }) => parseErrorRaw).join("\n")).not.toContain("truncated-synthetic-secret");
   });
 
   it("redacts Claude error messages and private paths while preserving structural raw evidence", async () => {

@@ -39,12 +39,13 @@ const SENSITIVE_JSON_KEY_SUFFIXES = new Set([
 ]);
 const PORTABLE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/iu;
+const JSON_STRING_PROPERTY = /"([^"\r\n]+)"(\s*:\s*)"[^"\r\n]*"/gu;
 
 export function redactOutput(output: string): string {
   return output.replace(SECRET_ASSIGNMENT, "$1[REDACTED]");
 }
 
-function redactJsonValue(key: string, value: unknown): unknown {
+function isSensitiveJsonKey(key: string): boolean {
   const normalizedKey = key
     .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
     .replace(/[^A-Za-z0-9]+/gu, "_")
@@ -53,11 +54,35 @@ function redactJsonValue(key: string, value: unknown): unknown {
   const sensitive = [...SENSITIVE_JSON_KEY_SUFFIXES].some(
     (suffix) => normalizedKey === suffix || normalizedKey.endsWith(`_${suffix}`)
   );
-  return sensitive ? "[REDACTED]" : value;
+  return sensitive;
+}
+
+function redactJsonValue(key: string, value: unknown): unknown {
+  return isSensitiveJsonKey(key) ? "[REDACTED]" : value;
+}
+
+function redactMalformedJsonStrings(line: string): string {
+  return line.replace(JSON_STRING_PROPERTY, (property, key: string, separator: string) =>
+    isSensitiveJsonKey(key) ? `"${key}"${separator}"[REDACTED]"` : property
+  );
 }
 
 function serializeRedactedJson(value: unknown, space?: number): string {
   return redactOutput(JSON.stringify(value, redactJsonValue, space));
+}
+
+export function redactJsonlLine(line: string): string {
+  try {
+    return serializeRedactedJson(JSON.parse(line));
+  } catch {
+    return redactOutput(redactMalformedJsonStrings(line));
+  }
+}
+
+export function redactJsonlOutput(output: string): string {
+  return output.split(/(\r?\n)/u).map((part) =>
+    /^\r?\n$/u.test(part) ? part : redactJsonlLine(part)
+  ).join("");
 }
 
 function resolveRunDirectory(rootDir: string, runId: string): string {
@@ -89,7 +114,7 @@ export async function writeProbeArtifacts(input: ProbeArtifactInput): Promise<Pr
   const events = input.events.map((event) => serializeRedactedJson(event)).join("\n");
   const eventsWithFinalNewline = events.length === 0 ? "" : `${events}\n`;
   await Promise.all([
-    writeFile(rawLogPath, redactOutput(input.run.rawOutput), "utf8"),
+    writeFile(rawLogPath, redactJsonlOutput(input.run.rawOutput), "utf8"),
     writeFile(eventsPath, eventsWithFinalNewline, "utf8"),
     writeFile(reportPath, `${serializeRedactedJson(input.report, 2)}\n`, "utf8")
   ]);

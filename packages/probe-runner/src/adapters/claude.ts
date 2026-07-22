@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import type { CapabilityReport, ProbeEvent } from "@agenttown/probe-contract";
-import { writeProbeArtifacts } from "../artifacts.js";
+import { redactJsonlLine, writeProbeArtifacts } from "../artifacts.js";
 import { runProcess as defaultRunProcess } from "../process.js";
 import type { PtyOptions, RunResult } from "../pty.js";
 
@@ -36,26 +36,27 @@ function failureMessage(value: Record<string, unknown>): string | undefined {
 }
 
 export function parseClaudeLine(line: string): ProbeEvent[] {
+  const sanitizedLine = redactJsonlLine(line);
   let value: unknown;
   try {
-    value = JSON.parse(line);
+    value = JSON.parse(sanitizedLine);
   } catch {
-    return [{ type: "parse_error", raw: line, reason: "invalid_json" }];
+    return [{ type: "parse_error", raw: sanitizedLine, reason: "invalid_json" }];
   }
 
   if (!isRecord(value) || typeof value.type !== "string") {
-    return [{ type: "parse_error", raw: line, reason: "unknown_shape" }];
+    return [{ type: "parse_error", raw: sanitizedLine, reason: "unknown_shape" }];
   }
 
   if (value.type === "system" && value.subtype === "init") {
     return typeof value.session_id === "string"
       ? [{ type: "session", sessionId: value.session_id }]
-      : [{ type: "parse_error", raw: line, reason: "unknown_shape" }];
+      : [{ type: "parse_error", raw: sanitizedLine, reason: "unknown_shape" }];
   }
 
   if (value.type === "assistant") {
     if (!isRecord(value.message) || !Array.isArray(value.message.content)) {
-      return [{ type: "parse_error", raw: line, reason: "unknown_shape" }];
+      return [{ type: "parse_error", raw: sanitizedLine, reason: "unknown_shape" }];
     }
     return value.message.content.flatMap((content): ProbeEvent[] =>
       isRecord(content) && content.type === "text" && typeof content.text === "string"
@@ -68,7 +69,7 @@ export function parseClaudeLine(line: string): ProbeEvent[] {
     if (!isRecord(value.usage)
       || typeof value.usage.input_tokens !== "number"
       || typeof value.usage.output_tokens !== "number") {
-      return [{ type: "parse_error", raw: line, reason: "unknown_shape" }];
+      return [{ type: "parse_error", raw: sanitizedLine, reason: "unknown_shape" }];
     }
     return typeof value.usage.cache_read_input_tokens === "number"
       ? [{
@@ -87,7 +88,7 @@ export function parseClaudeLine(line: string): ProbeEvent[] {
   if (value.type === "error" || (value.type === "result" && (value.is_error === true || value.subtype !== "success"))) {
     const message = failureMessage(value);
     return message === undefined
-      ? [{ type: "parse_error", raw: line, reason: "unknown_shape" }]
+      ? [{ type: "parse_error", raw: sanitizedLine, reason: "unknown_shape" }]
       : [{ type: "output", text: message }];
   }
 
@@ -107,6 +108,20 @@ function containsOutput(events: ProbeEvent[], text: string): boolean {
 
 function containsAuthenticationFailure(rawOutput: string): boolean {
   return /authentication|not logged in|unauthori[sz]ed|login required|please (?:run )?\/login|invalid (?:api )?key|\b401\b/iu.test(rawOutput);
+}
+
+function containsClaudeFailure(rawOutput: string): boolean {
+  return rawOutput.split(/\r?\n/u).some((line) => {
+    if (line.length === 0) return false;
+    try {
+      const value: unknown = JSON.parse(line);
+      return isRecord(value)
+        && (value.type === "error"
+          || (value.type === "result" && (value.is_error === true || value.subtype !== "success")));
+    } catch {
+      return false;
+    }
+  });
 }
 
 interface KnownLaunchFailure {
@@ -189,9 +204,9 @@ function sanitizeRawOutput(rawOutput: string, temporaryRepository?: string): str
   return rawOutput.split(/(\r?\n)/u).map((part) => {
     if (/^\r?\n$/u.test(part) || part.length === 0) return part;
     try {
-      return JSON.stringify(sanitizeJsonEvidence(JSON.parse(part), temporaryRepository));
+      return redactJsonlLine(JSON.stringify(sanitizeJsonEvidence(JSON.parse(part), temporaryRepository)));
     } catch {
-      return sanitizeText(part, temporaryRepository);
+      return redactJsonlLine(sanitizeText(part, temporaryRepository));
     }
   }).join("");
 }
@@ -374,8 +389,13 @@ export async function probeClaude(options: ProbeClaudeOptions): Promise<Capabili
     events.push(...resumeEvents);
     if (resumeRun.timedOut) return await finish("timeout");
     if (containsAuthenticationFailure(resumeRun.rawOutput)) return await finish("authentication");
+    const resumedSession = resumeEvents.find(
+      (event): event is Extract<ProbeEvent, { type: "session" }> => event.type === "session"
+    );
     resume = resumeRun.exitCode === 0
       && !resumeEvents.some((event) => event.type === "parse_error")
+      && !containsClaudeFailure(resumeRun.rawOutput)
+      && resumedSession?.sessionId === session.sessionId
       && containsOutput(resumeEvents, "AGENTTOWN_RESUME_OK");
     if (!resume) return await finish("resume_failed");
     if (!tokenUsage) return await finish("token_usage_missing");
