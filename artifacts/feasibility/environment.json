@@ -1,0 +1,26 @@
+{
+  "capturedAt": "2026-07-22T14:42:00Z",
+  "platform": "windows-x86_64",
+  "rust": {
+    "host": "x86_64-pc-windows-msvc",
+    "rustupVersion": "1.29.0 (28d1352db 2026-03-05)",
+    "rustcAvailable": false,
+    "cargoAvailable": false,
+    "defaultToolchainConfigured": false,
+    "partialToolchainFiles": 94,
+    "partialToolchainBytes": 159694066
+  },
+  "buildPrerequisites": {
+    "visualStudioCommunity": "17.13.35825.156",
+    "msvc": "19.43.34808",
+    "windowsSdk": "10.0.22621.0",
+    "webView2Runtime": "150.0.4078.83"
+  },
+  "javascript": {
+    "node": "24.14.0",
+    "pnpm": "11.9.0"
+  },
+  "blockers": [
+    "rust_toolchain_download_stalled"
+  ]
+}

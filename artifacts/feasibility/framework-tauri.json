@@ -1,0 +1,10 @@
+{
+  "name": "tauri",
+  "ptyStable": false,
+  "coreSurvivesUiExit": false,
+  "packageBuilds": false,
+  "embeddedTerminalWorks": false,
+  "installSizeMb": 0,
+  "coldStartMs": 0,
+  "implementationMinutes": 15
+}
