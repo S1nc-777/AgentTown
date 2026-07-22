@@ -3,7 +3,15 @@ import { spawn } from "node:child_process";
 import { connect } from "node:net";
 import { dirname, resolve } from "node:path";
 
-const executable = resolve(process.argv[2] ?? "out/AgentTownElectronSpike-win32-x64/AgentTownElectronSpike.exe");
+const argumentsList = process.argv.slice(2);
+let runCount = 3;
+const runsArgument = argumentsList.indexOf("--runs");
+if (runsArgument >= 0) {
+  runCount = Number.parseInt(argumentsList[runsArgument + 1] ?? "", 10);
+  argumentsList.splice(runsArgument, 2);
+}
+if (!Number.isInteger(runCount) || runCount < 1) throw new Error("--runs must be a positive integer");
+const executable = resolve(argumentsList[0] ?? "out/AgentTownElectronSpike-win32-x64/AgentTownElectronSpike.exe");
 
 function request(pipeName, value, timeoutMs = 5_000) {
   return new Promise((resolveRequest, reject) => {
@@ -75,6 +83,6 @@ async function measureOnce() {
 }
 
 const runsMs = [];
-for (let index = 0; index < 3; index += 1) runsMs.push(await measureOnce());
+for (let index = 0; index < runCount; index += 1) runsMs.push(await measureOnce());
 const sorted = [...runsMs].sort((left, right) => left - right);
-process.stdout.write(`${JSON.stringify({ runsMs, medianMs: sorted[1] })}\n`);
+process.stdout.write(`${JSON.stringify({ runsMs, medianMs: sorted[Math.floor(sorted.length / 2)] })}\n`);

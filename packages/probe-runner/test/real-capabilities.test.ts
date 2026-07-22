@@ -354,7 +354,7 @@ describe("probeRemainingAgentCapabilities", () => {
       `{"type":"system"\u001b[?25l,\r\n"subtype":"init",\r\n"session_id":"${sessionId}"}`,
       `{"type":"assistant"\u001b[?25h,\r\n"message":{"content":[{"type":"text","text":"${marker}"}]}}`,
       '{"type":"result",\r\n"subtype":"success","usage":{"input_tokens":1,"output_tokens":1}}'
-    ].join("") + "\r\n";
+    ].join("\r\n") + "\r\n";
     const fixture = dependencies([
       { sessionId: "interrupt-wrapped", marker: "AGENTTOWN_INTERRUPT_PROBE", rawOutput: wrapped("interrupt-wrapped", "AGENTTOWN_INTERRUPT_PROBE") },
       { sessionId: "parallel-wrapped-1", marker: "AGENTTOWN_PARALLEL_ONE", rawOutput: wrapped("parallel-wrapped-1", "AGENTTOWN_PARALLEL_ONE") },
@@ -401,6 +401,44 @@ describe("probeRemainingAgentCapabilities", () => {
     expect(outcome.parallelThree).toBe(false);
     expect(outcome.blockers).toContain("interrupt_session_not_observed");
   });
+
+  it.each(["claude", "codex"] as const)(
+    "rejects complete valid %s events embedded in prose or followed by terminal text",
+    async (agent) => {
+      const root = await artifactRoot(report(agent));
+      const encoded = agent === "claude" ? claudeOutput : codexOutput;
+      const outputs = [
+        `stderr prefix ${encoded("embedded-interrupt", "AGENTTOWN_INTERRUPT_PROBE")}`,
+        `${encoded("embedded-one", "AGENTTOWN_PARALLEL_ONE").trimEnd()} trailing text\n`,
+        `model prose ${encoded("embedded-two", "AGENTTOWN_PARALLEL_TWO")}`,
+        `${encoded("embedded-three", "AGENTTOWN_PARALLEL_THREE").trimEnd()} trailing text\n`
+      ];
+      let index = 0;
+      const checks = new Map<number, number>();
+      const fixture: RemainingCapabilitiesDependencies = {
+        initializeGit: async () => undefined,
+        startPty: () => {
+          const current = index++;
+          return handle(901 + current, result(outputs[current]!), []);
+        },
+        isAlive: async (pid) => {
+          const count = checks.get(pid) ?? 0;
+          checks.set(pid, count + 1);
+          return pid === 901 && count === 0;
+        }
+      };
+
+      const outcome = await probeRemainingAgentCapabilities(agent, {
+        artifactRootDir: root,
+        timeoutMs: 5,
+        dependencies: fixture
+      });
+
+      expect(outcome.interrupt).toBe(false);
+      expect(outcome.parallelThree).toBe(false);
+      expect(outcome.blockers).toContain("interrupt_session_not_observed");
+    }
+  );
 
   it("reports an orphan when the session-timeout cleanup leaves the PID alive", async () => {
     const root = await artifactRoot(report("claude"));

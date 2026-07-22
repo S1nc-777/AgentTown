@@ -84,39 +84,44 @@ function stripTerminalControls(rawOutput: string): string {
 }
 
 function balancedJsonObjects(rawOutput: string): unknown[] {
-  const text = stripTerminalControls(rawOutput);
+  const lines = stripTerminalControls(rawOutput).split(/\r?\n/u);
   const values: unknown[] = [];
-  let start = -1;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index]!;
-    if (start < 0) {
-      if (character === "{") {
-        start = index;
-        depth = 1;
+  const completedObjectEnd = (candidate: string): number | undefined => {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < candidate.length; index += 1) {
+      const character = candidate[index]!;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') inString = false;
+        continue;
       }
-      continue;
-    }
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (character === "\\") escaped = true;
-      else if (character === '"') inString = false;
-      continue;
-    }
-    if (character === '"') inString = true;
-    else if (character === "{") depth += 1;
-    else if (character === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        try {
-          values.push(JSON.parse(text.slice(start, index + 1)) as unknown);
-        } catch {
-          // Terminal text can contain brace-shaped stderr. Only valid balanced JSON is evidence.
-        }
-        start = -1;
+      if (character === '"') inString = true;
+      else if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) return index;
       }
+    }
+    return undefined;
+  };
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const firstLine = lines[lineIndex]!.trim();
+    if (!firstLine.startsWith("{")) continue;
+    let candidate = firstLine;
+    let end: number | undefined;
+    while ((end = completedObjectEnd(candidate)) === undefined && lineIndex + 1 < lines.length) {
+      lineIndex += 1;
+      candidate += `\n${lines[lineIndex]!}`;
+    }
+    if (end === undefined || candidate.slice(end + 1).trim().length > 0) continue;
+    try {
+      values.push(JSON.parse(candidate.slice(0, end + 1)) as unknown);
+    } catch {
+      // A standalone frame must also be valid JSON before an adapter can trust it.
     }
   }
   return values;

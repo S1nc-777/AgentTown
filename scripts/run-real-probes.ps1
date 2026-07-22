@@ -2,10 +2,6 @@ param(
   [switch]$ValidateOnly,
   [switch]$SummarizeOnly,
   [switch]$CapabilitiesOnly,
-  [ValidateSet("None", "Failure", "Timeout")]
-  [string]$ValidationChildMode = "None",
-  [ValidateSet("None", "Exit7", "Sleep")]
-  [string]$FixtureChildAction = "None",
   [string]$TempParent = [System.IO.Path]::GetTempPath(),
   [string]$ArtifactRoot = (Join-Path $PSScriptRoot "..\artifacts\feasibility"),
   [string]$SummaryPath = (Join-Path $PSScriptRoot "..\artifacts\feasibility\real-probes-summary.json"),
@@ -13,15 +9,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ($FixtureChildAction -eq "Exit7") { exit 7 }
-if ($FixtureChildAction -eq "Sleep") { Start-Sleep -Seconds 30; exit 0 }
+. (Join-Path $PSScriptRoot "lib\bounded-process.ps1")
 
 $modeCount = [int]$ValidateOnly.IsPresent + [int]$SummarizeOnly.IsPresent + [int]$CapabilitiesOnly.IsPresent
 if ($modeCount -gt 1) { throw "ValidateOnly, SummarizeOnly, and CapabilitiesOnly are mutually exclusive" }
 if ($TimeoutMs -lt 1) { throw "TimeoutMs must be positive" }
-if ($ValidationChildMode -ne "None" -and -not $ValidateOnly) {
-  throw "ValidationChildMode requires ValidateOnly"
-}
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
@@ -44,57 +36,28 @@ function Add-ExecutionBlocker([string]$Blocker) {
   if ($script:executionBlockers -notcontains $Blocker) { $script:executionBlockers += $Blocker }
 }
 
-function Start-BoundedChild([string]$FilePath, [string[]]$Arguments, [string]$Label) {
-  $remaining = [int][Math]::Floor(($script:deadline - [DateTime]::UtcNow).TotalMilliseconds)
-  if ($remaining -lt 1) {
-    return [pscustomobject]@{ ExitCode = 124; Kind = "timeout"; Blocker = "execution_timeout" }
-  }
-  $stdoutPath = Join-Path $script:probeDirectory ($Label + "-stdout.log")
-  $stderrPath = Join-Path $script:probeDirectory ($Label + "-stderr.log")
-  $process = $null
-  try {
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden `
-      -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-    # Accessing Handle before the bounded wait preserves ExitCode on Windows PowerShell 5.1.
-    $null = $process.Handle
-    if (-not $process.WaitForExit($remaining)) {
-      & taskkill.exe /PID $process.Id /T /F *> $null
-      [void]$process.WaitForExit(5000)
-      return [pscustomobject]@{ ExitCode = 124; Kind = "timeout"; Blocker = "execution_timeout" }
-    }
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) {
-      return [pscustomobject]@{ ExitCode = $process.ExitCode; Kind = "nonzero"; Blocker = ("execution_exit_" + $process.ExitCode) }
-    }
-    return [pscustomobject]@{ ExitCode = 0; Kind = "success"; Blocker = $null }
-  } catch {
-    if ($null -ne $process -and -not $process.HasExited) {
-      & taskkill.exe /PID $process.Id /T /F *> $null
-      [void]$process.WaitForExit(5000)
-    }
-    return [pscustomobject]@{ ExitCode = 1; Kind = "exception"; Blocker = ("execution_exception:" + $_.Exception.GetType().Name) }
-  }
+function Invoke-FixedChild([string]$FilePath, [string[]]$Arguments, [string]$Label) {
+  Start-BoundedProcess -FilePath $FilePath -Arguments $Arguments -Label $Label -Deadline $script:deadline -LogRoot $script:probeDirectory
+}
+
+function Record-ChildBlockers($Child) {
+  foreach ($blocker in @($Child.Blockers)) { Add-ExecutionBlocker $blocker }
 }
 
 try {
   New-Item -ItemType Directory -Path $probeDirectory | Out-Null
   $created = $true
-  $gitResult = Start-BoundedChild "git.exe" @("init", "--quiet", $probeDirectory) "git-init"
+  $gitResult = Invoke-FixedChild "git.exe" @("init", "--quiet", $probeDirectory) "git-init"
   if ($gitResult.ExitCode -eq 0) {
     $gitInitialized = $true
   } else {
     $testExitCode = $gitResult.ExitCode
     $observedExitKind = $gitResult.Kind
+    Record-ChildBlockers $gitResult
     Add-ExecutionBlocker "temporary_repo_init_failed"
   }
 
-  if ($gitInitialized -and $ValidateOnly -and $ValidationChildMode -ne "None") {
-    $action = if ($ValidationChildMode -eq "Failure") { "Exit7" } else { "Sleep" }
-    $child = Start-BoundedChild "powershell.exe" @("-NoProfile", "-File", $PSCommandPath, "-FixtureChildAction", $action) "validation-child"
-    $testExitCode = $child.ExitCode
-    $observedExitKind = $child.Kind
-    if ($null -ne $child.Blocker) { Add-ExecutionBlocker $child.Blocker }
-  } elseif ($gitInitialized -and -not $ValidateOnly -and -not $SummarizeOnly) {
+  if ($gitInitialized -and -not $ValidateOnly -and -not $SummarizeOnly) {
     if ($env:AGENTTOWN_FORBID_REAL_PROBES -eq "1") {
       $testExitCode = 1
       $observedExitKind = "forbidden"
@@ -104,13 +67,13 @@ try {
       $commandAvailability.codex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
       $commandAvailability.claude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
       if ($CapabilitiesOnly) {
-        $child = Start-BoundedChild "pnpm.cmd" @(
+        $child = Invoke-FixedChild "pnpm.cmd" @(
           "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "tsx", "src/run-real-capabilities.ts",
           "--artifact-root", [System.IO.Path]::GetFullPath($ArtifactRoot), "--timeout-ms", [string]$TimeoutMs
         ) "capabilities"
         $testExitCode = $child.ExitCode
         $observedExitKind = $child.Kind
-        if ($null -ne $child.Blocker) { Add-ExecutionBlocker $child.Blocker }
+        Record-ChildBlockers $child
       } else {
         $previousCodexGate = $env:AGENTTOWN_REAL_CODEX
         $previousClaudeGate = $env:AGENTTOWN_REAL_CLAUDE
@@ -119,7 +82,7 @@ try {
           $env:AGENTTOWN_REAL_CODEX = "1"
           $env:AGENTTOWN_REAL_CLAUDE = "1"
           $env:AGENTTOWN_REAL_TIMEOUT_MS = [string]$TimeoutMs
-          $child = Start-BoundedChild "pnpm.cmd" @(
+          $child = Invoke-FixedChild "pnpm.cmd" @(
             "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "vitest", "run",
             "test/codex-real.test.ts", "test/claude-real.test.ts"
           ) "real-tests"
@@ -130,15 +93,15 @@ try {
         }
         $testExitCode = $child.ExitCode
         $observedExitKind = $child.Kind
-        if ($null -ne $child.Blocker) { Add-ExecutionBlocker $child.Blocker }
+        Record-ChildBlockers $child
         if ($testExitCode -eq 0) {
-          $child = Start-BoundedChild "pnpm.cmd" @(
+          $child = Invoke-FixedChild "pnpm.cmd" @(
             "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "tsx", "src/run-real-capabilities.ts",
             "--artifact-root", [System.IO.Path]::GetFullPath($ArtifactRoot), "--timeout-ms", [string]$TimeoutMs
           ) "remaining-capabilities"
           $testExitCode = $child.ExitCode
           $observedExitKind = $child.Kind
-          if ($null -ne $child.Blocker) { Add-ExecutionBlocker $child.Blocker }
+          Record-ChildBlockers $child
         }
       }
     }
@@ -164,26 +127,34 @@ try {
 
 $tempCleanupVerified = -not (Test-Path -LiteralPath $probeDirectory)
 $reports = @()
+function New-FailedAgentEntry([string]$Agent, [string]$Blocker) {
+  [ordered]@{
+    agent = $Agent; version = "unknown"; notes = @("blocker:" + $Blocker)
+    launch = $false; streamOutput = $false; sessionId = $false; resume = $false
+    interrupt = $false; tokenUsage = $false; nonInteractive = $false
+    interactivePty = $false; parallelThree = $false
+  }
+}
 if (-not $ValidateOnly) {
   foreach ($agent in @("codex", "claude")) {
     $reportPath = Join-Path ([System.IO.Path]::GetFullPath($ArtifactRoot)) "$agent-real\report.json"
     if (Test-Path -LiteralPath $reportPath) {
-      $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
-      $entry = [ordered]@{
-        agent = $report.agent; version = $report.version; notes = @($report.notes)
-        launch = [bool]$report.launch; streamOutput = [bool]$report.streamOutput
-        sessionId = [bool]$report.sessionId; resume = [bool]$report.resume
-        interrupt = [bool]$report.interrupt; tokenUsage = [bool]$report.tokenUsage
-        nonInteractive = [bool]$report.nonInteractive; interactivePty = [bool]$report.interactivePty
-        parallelThree = [bool]$report.parallelThree
+      try {
+        $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+        if ($null -eq $report -or $report.agent -ne $agent) { throw "invalid report shape" }
+        $entry = [ordered]@{
+          agent = $report.agent; version = $report.version; notes = @($report.notes)
+          launch = [bool]$report.launch; streamOutput = [bool]$report.streamOutput
+          sessionId = [bool]$report.sessionId; resume = [bool]$report.resume
+          interrupt = [bool]$report.interrupt; tokenUsage = [bool]$report.tokenUsage
+          nonInteractive = [bool]$report.nonInteractive; interactivePty = [bool]$report.interactivePty
+          parallelThree = [bool]$report.parallelThree
+        }
+      } catch {
+        $entry = New-FailedAgentEntry $agent "report_malformed"
       }
     } else {
-      $entry = [ordered]@{
-        agent = $agent; version = "unknown"; notes = @("blocker:report_missing")
-        launch = $false; streamOutput = $false; sessionId = $false; resume = $false
-        interrupt = $false; tokenUsage = $false; nonInteractive = $false
-        interactivePty = $false; parallelThree = $false
-      }
+      $entry = New-FailedAgentEntry $agent "report_missing"
     }
     $blockers = @($entry.notes | Where-Object { $_ -is [string] -and $_.StartsWith("blocker:") } | ForEach-Object { $_.Substring(8) })
     if (-not $entry.launch -and $blockers -notcontains "launch_failed" -and $blockers -notcontains "executable_not_found" -and $blockers -notcontains "report_missing") { $blockers += "launch_not_verified" }
