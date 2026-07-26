@@ -125,7 +125,21 @@ export class TaskService {
   transition(taskId: string, next: TaskState, actorId: string): TaskRecord {
     const record = this.get(taskId);
     this.#assertTransition(record.status, next);
-    if (next === "running") this.#assertDependenciesComplete(record);
+    this.#assertGenericTransition(record.status, next);
+    const actor = this.company.employees.find((employee) => employee.id === actorId);
+    if (actor === undefined) throw new Error(`unknown employee: ${actorId}`);
+    if (next === "running") {
+      this.#assertDependenciesComplete(record);
+      if (record.ownerEmployeeId !== actorId) throw new Error("task owner required");
+    }
+    if (next === "completed") {
+      if (actor.workspace !== "review_package") {
+        throw new Error("review permission required");
+      }
+      if (record.artifacts.length === 0 || record.evidence.length === 0) {
+        throw new Error("submission evidence required");
+      }
+    }
 
     const changed = event(eventTypeForTransition(next), actorId, taskId, {
       previousStatus: record.status,
@@ -221,6 +235,24 @@ export class TaskService {
   #assertTransition(current: TaskState, next: TaskState): void {
     if (!legalTransitions[current].includes(next)) {
       throw new Error(`illegal task transition: ${current} -> ${next}`);
+    }
+  }
+
+  #assertGenericTransition(current: TaskState, next: TaskState): void {
+    if (current === "draft" && next === "ready") {
+      throw new Error("use assign for draft -> ready");
+    }
+    if (current === "running" && next === "review") {
+      throw new Error("use submit for running -> review");
+    }
+    if (current === "review" && (next === "ready" || next === "blocked")) {
+      throw new Error(`use reject for review -> ${next}`);
+    }
+    if (current === "failed" && (next === "ready" || next === "blocked")) {
+      throw new Error(`use retry for failed -> ${next}`);
+    }
+    if (current === "blocked" && next === "ready") {
+      throw new Error("blocked task requires user intervention");
     }
   }
 

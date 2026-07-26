@@ -135,4 +135,55 @@ describe("TaskService", () => {
     expect(() => service.submit("build", "developer", ["build.patch"], []))
       .toThrow("evidence required");
   });
+
+  it("does not let generic transitions bypass submission evidence", () => {
+    service.create(task("build", []));
+    service.assign("build", "developer");
+    service.transition("build", "running", "developer");
+
+    expect(() => service.transition("build", "review", "developer")).toThrow("use submit");
+    expect(service.get("build")).toMatchObject({
+      status: "running",
+      artifacts: [],
+      evidence: []
+    });
+  });
+
+  it("does not let generic transitions bypass the execution retry limit", () => {
+    service.create(task("build", []));
+    service.assign("build", "developer");
+    service.transition("build", "running", "developer");
+    service.transition("build", "failed", "developer");
+
+    expect(() => service.transition("build", "ready", "leader")).toThrow("use retry");
+    expect(service.get("build")).toMatchObject({ status: "failed", retryCount: 0 });
+  });
+
+  it("does not let generic transitions bypass the review rejection limit", () => {
+    advanceToReview(service, "build");
+
+    expect(() => service.transition("build", "ready", "reviewer")).toThrow("use reject");
+    expect(service.get("build")).toMatchObject({ status: "review", reviewLoopCount: 0 });
+  });
+
+  it("requires the task owner to start execution", () => {
+    service.create(task("build", []));
+    service.assign("build", "developer");
+
+    expect(() => service.transition("build", "running", "leader"))
+      .toThrow("task owner required");
+  });
+
+  it("lets only a review-package employee complete submitted work", () => {
+    advanceToReview(service, "build");
+
+    expect(() => service.transition("build", "completed", "developer"))
+      .toThrow("review permission required");
+    expect(service.transition("build", "completed", "reviewer")).toMatchObject({
+      status: "completed",
+      artifacts: ["build.patch"],
+      evidence: ["build tests pass"]
+    });
+    expect(store.listEvents(0).at(-1)?.type).toBe("task.completed");
+  });
 });
