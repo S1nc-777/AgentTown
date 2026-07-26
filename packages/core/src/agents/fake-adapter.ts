@@ -2,7 +2,15 @@ import {
   spawn,
   type ChildProcessWithoutNullStreams
 } from "node:child_process";
-import { access, appendFileSync, mkdir, realpath } from "node:fs";
+import {
+  access,
+  appendFileSync,
+  closeSync,
+  lstat,
+  mkdir,
+  openSync,
+  realpath
+} from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { promisify } from "node:util";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -18,6 +26,7 @@ import type {
 } from "@agenttown/runtime-contract";
 
 const accessAsync = promisify(access);
+const lstatAsync = promisify(lstat);
 const mkdirAsync = promisify(mkdir);
 const realpathAsync = promisify(realpath);
 const START_TIMEOUT_MS = 5_000;
@@ -36,6 +45,8 @@ interface LiveFakeSession {
   usage: UsageSnapshot;
   closed: Promise<void>;
   interruptWaiters: Array<(interrupted: boolean) => void>;
+  logFileDescriptor: number;
+  logFileClosed: boolean;
 }
 
 interface QueueWaiter<T> {
@@ -200,6 +211,9 @@ export class FakeAgentAdapter implements AgentAdapter {
 
   async interrupt(session: SessionHandle): Promise<{ interrupted: boolean }> {
     const live = this.#getLive(session);
+    if (live.child.exitCode !== null || live.child.signalCode !== null) {
+      return { interrupted: false };
+    }
     return new Promise<{ interrupted: boolean }>((resolvePromise, reject) => {
       const resolveInterrupt = (interrupted: boolean) => {
         resolvePromise({ interrupted });
@@ -282,6 +296,22 @@ export class FakeAgentAdapter implements AgentAdapter {
     if (dirname(logPath) !== canonicalLogsRoot) {
       throw new Error("Fake Agent log path escapes the logs directory");
     }
+    const existingLog = await lstatAsync(logPath).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      }
+    );
+    if (existingLog?.isSymbolicLink() === true) {
+      throw new Error("Fake Agent log file must not be a symbolic link");
+    }
+    if (existingLog !== undefined) {
+      const canonicalLogPath = await realpathAsync(logPath);
+      if (dirname(canonicalLogPath) !== canonicalLogsRoot) {
+        throw new Error("Fake Agent log file escapes the logs directory");
+      }
+    }
+    const logFileDescriptor = openSync(logPath, "a", 0o600);
 
     const args = [
       "--import",
@@ -294,10 +324,16 @@ export class FakeAgentAdapter implements AgentAdapter {
     ];
     if (resumeId !== undefined) args.push("--resume", resumeId);
 
-    const child = spawn(this.#executable, args, {
-      cwd: this.#packageRoot,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(this.#executable, args, {
+        cwd: this.#packageRoot,
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+    } catch (error) {
+      closeSync(logFileDescriptor);
+      throw error;
+    }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
 
@@ -318,7 +354,9 @@ export class FakeAgentAdapter implements AgentAdapter {
         capturedAt: new Date().toISOString()
       },
       closed: Promise.resolve(),
-      interruptWaiters: []
+      interruptWaiters: [],
+      logFileDescriptor,
+      logFileClosed: false
     };
 
     let stdoutBuffer = "";
@@ -332,7 +370,7 @@ export class FakeAgentAdapter implements AgentAdapter {
         if (line.length === 0) continue;
 
         appendFileSync(
-          logPath,
+          live.logFileDescriptor,
           `${new Date().toISOString()} ${line}\n`,
           "utf8"
         );
@@ -367,10 +405,12 @@ export class FakeAgentAdapter implements AgentAdapter {
 
     live.closed = new Promise<void>((resolvePromise, reject) => {
       child.once("error", (error) => {
+        this.#closeLogFile(live);
         lines.close(error);
         reject(error);
       });
       child.once("close", (exitCode) => {
+        this.#closeLogFile(live);
         for (const resolveInterrupt of live.interruptWaiters.splice(0)) {
           resolveInterrupt(false);
         }
@@ -409,5 +449,11 @@ export class FakeAgentAdapter implements AgentAdapter {
       throw new Error(`unknown Fake Agent session: ${session.internalSessionId}`);
     }
     return live;
+  }
+
+  #closeLogFile(live: LiveFakeSession): void {
+    if (live.logFileClosed) return;
+    live.logFileClosed = true;
+    closeSync(live.logFileDescriptor);
   }
 }

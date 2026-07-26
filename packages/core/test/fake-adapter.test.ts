@@ -2,6 +2,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink
 } from "node:fs/promises";
@@ -268,6 +269,26 @@ describe("FakeAgentAdapter", () => {
     }
   });
 
+  it("reports a retained crashed session as not interruptible", async () => {
+    const project = await createTemporaryProject();
+    const adapter = createAdapter();
+
+    try {
+      const handle = await adapter.start(startInput(
+        "developer",
+        "crash",
+        project.root
+      ));
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+
+      await expect(adapter.interrupt(handle)).resolves.toEqual({
+        interrupted: false
+      });
+    } finally {
+      await project.cleanup();
+    }
+  });
+
   it("rejects an invalid employee ID before constructing a log path", async () => {
     const project = await createTemporaryProject();
     const adapter = createAdapter();
@@ -316,6 +337,52 @@ describe("FakeAgentAdapter", () => {
           project.root
         ))).rejects.toThrow("escapes the project state directory");
       } finally {
+        await project.cleanup();
+        await rm(outside, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "keeps logging to the validated file after a junction swap",
+    async () => {
+      const project = await createTemporaryProject();
+      const outside = await mkdtemp(join(tmpdir(), "agenttown-swap-"));
+      const adapter = createAdapter();
+      let handle: SessionHandle | undefined;
+
+      try {
+        handle = await adapter.start(startInput(
+          "developer",
+          "complete",
+          project.root
+        ));
+        const logsRoot = join(project.root, ".agenttown", "logs");
+        const validatedLogsRoot = join(project.root, ".agenttown", "validated-logs");
+        let activeLogsRoot = logsRoot;
+        let renamedLogsRoot = false;
+        try {
+          await rename(logsRoot, validatedLogsRoot);
+          renamedLogsRoot = true;
+          await symlink(outside, logsRoot, "junction");
+          activeLogsRoot = validatedLogsRoot;
+        } catch (error) {
+          if (renamedLogsRoot) throw error;
+          expect((error as NodeJS.ErrnoException).code).toMatch(/^(?:EBUSY|EPERM)$/u);
+        }
+
+        await collect(adapter.send(handle, message("task-1")));
+
+        await expect(readFile(
+          join(outside, "developer.jsonl"),
+          "utf8"
+        )).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(
+          join(activeLogsRoot, "developer.jsonl"),
+          "utf8"
+        )).resolves.toContain("\"type\":\"action.proposed\"");
+      } finally {
+        if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
         await project.cleanup();
         await rm(outside, { recursive: true, force: true });
       }
