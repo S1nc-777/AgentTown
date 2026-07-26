@@ -32,6 +32,9 @@ importers:
       '@agenttown/probe-contract':
         specifier: workspace:*
         version: link:../probe-contract
+      '@agenttown/runtime-contract':
+        specifier: workspace:*
+        version: link:../runtime-contract
 
   packages/probe-contract: {}
 

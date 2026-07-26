@@ -4,11 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "pretypecheck": "pnpm --filter @agenttown/probe-contract build",
+    "company": "tsx src/company-cli.ts",
+    "pretypecheck": "pnpm --filter @agenttown/probe-contract --filter @agenttown/runtime-contract build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@agenttown/probe-contract": "workspace:*"
+    "@agenttown/probe-contract": "workspace:*",
+    "@agenttown/runtime-contract": "workspace:*"
   }
 }
