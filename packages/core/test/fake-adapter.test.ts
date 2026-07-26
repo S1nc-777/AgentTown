@@ -1,4 +1,11 @@
-import { readFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -45,13 +52,35 @@ async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
   return collected;
 }
 
+async function bounded<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), 2_000);
+      })
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function createAdapter(
+  allowedEmployeeIds: readonly string[] = ["developer"]
+): FakeAgentAdapter {
+  const options = {
+    executable: process.execPath,
+    packageRoot: fakeRoot,
+    allowedEmployeeIds: new Set(allowedEmployeeIds)
+  };
+  return new FakeAgentAdapter(options);
+}
+
 describe("FakeAgentAdapter", () => {
   it("starts, sends, reports usage, interrupts and resumes", async () => {
     const project = await createTemporaryProject();
-    const adapter = new FakeAgentAdapter({
-      executable: process.execPath,
-      packageRoot: fakeRoot
-    });
+    const adapter = createAdapter();
     const handles: SessionHandle[] = [];
 
     expect(await adapter.detect()).toMatchObject({ available: true });
@@ -102,10 +131,7 @@ describe("FakeAgentAdapter", () => {
 
   it("preserves malformed output and recovers on the next send", async () => {
     const project = await createTemporaryProject();
-    const adapter = new FakeAgentAdapter({
-      executable: process.execPath,
-      packageRoot: fakeRoot
-    });
+    const adapter = createAdapter();
     let handle: SessionHandle | undefined;
 
     try {
@@ -141,12 +167,110 @@ describe("FakeAgentAdapter", () => {
     }
   });
 
+  it("consumes usage before starting the next send", async () => {
+    const project = await createTemporaryProject();
+    const adapter = createAdapter();
+    let handle: SessionHandle | undefined;
+
+    try {
+      handle = await adapter.start(startInput("developer", "complete", project.root));
+      const first = await collect(adapter.send(
+        handle,
+        message("task-1", "message-1")
+      ));
+      const second = await collect(adapter.send(
+        handle,
+        message("task-2", "message-2")
+      ));
+
+      expect(first.map((event) => event.type)).toEqual([
+        "output.completed",
+        "action.proposed",
+        "usage.updated"
+      ]);
+      expect(second.map((event) => event.type)).toEqual([
+        "output.completed",
+        "action.proposed",
+        "usage.updated"
+      ]);
+    } finally {
+      if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
+      await project.cleanup();
+    }
+  });
+
+  it("finishes an idle send after its usage event", async () => {
+    const project = await createTemporaryProject();
+    const adapter = createAdapter();
+    let handle: SessionHandle | undefined;
+
+    try {
+      handle = await adapter.start(startInput("developer", "idle", project.root));
+      const events = await bounded(
+        collect(adapter.send(handle, message("task-1"))),
+        "idle send did not finish"
+      );
+      expect(events.map((event) => event.type)).toEqual([
+        "output.completed",
+        "usage.updated"
+      ]);
+    } finally {
+      if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
+      await project.cleanup();
+    }
+  });
+
+  it("confirms an interrupt while a silent send is in flight", async () => {
+    const project = await createTemporaryProject();
+    const adapter = createAdapter();
+    let handle: SessionHandle | undefined;
+    let inFlight: Promise<AgentEvent[]> | undefined;
+
+    try {
+      handle = await adapter.start(startInput("developer", "silent", project.root));
+      inFlight = collect(adapter.send(handle, message("task-1")));
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 50));
+
+      await expect(bounded(
+        adapter.interrupt(handle),
+        "interrupt was consumed by the in-flight send"
+      )).resolves.toEqual({ interrupted: true });
+      await adapter.stop(handle);
+      await expect(inFlight).resolves.toContainEqual({
+        type: "session.exited",
+        exitCode: 0
+      });
+    } finally {
+      if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
+      if (inFlight !== undefined) await inFlight.catch(() => undefined);
+      await project.cleanup();
+    }
+  });
+
+  it("retains a crashed session until its exit event is consumed", async () => {
+    const project = await createTemporaryProject();
+    const adapter = createAdapter();
+
+    try {
+      const handle = await adapter.start(startInput(
+        "developer",
+        "crash",
+        project.root
+      ));
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+
+      await expect(collect(adapter.send(handle, message("task-1")))).resolves.toEqual([{
+        type: "session.exited",
+        exitCode: 23
+      }]);
+    } finally {
+      await project.cleanup();
+    }
+  });
+
   it("rejects an invalid employee ID before constructing a log path", async () => {
     const project = await createTemporaryProject();
-    const adapter = new FakeAgentAdapter({
-      executable: process.execPath,
-      packageRoot: fakeRoot
-    });
+    const adapter = createAdapter();
 
     try {
       await expect(adapter.start(startInput(
@@ -158,4 +282,43 @@ describe("FakeAgentAdapter", () => {
       await project.cleanup();
     }
   });
+
+  it("rejects a valid employee ID outside the configured roster", async () => {
+    const project = await createTemporaryProject();
+    const adapter = createAdapter(["developer"]);
+
+    try {
+      await expect(adapter.start(startInput(
+        "reviewer",
+        "complete",
+        project.root
+      ))).rejects.toThrow("employee is not configured");
+    } finally {
+      await project.cleanup();
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "rejects a junction that redirects logs outside the project",
+    async () => {
+      const project = await createTemporaryProject();
+      const outside = await mkdtemp(join(tmpdir(), "agenttown-outside-"));
+      const adapter = createAdapter();
+
+      try {
+        const stateRoot = join(project.root, ".agenttown");
+        await mkdir(stateRoot, { recursive: true });
+        await symlink(outside, join(stateRoot, "logs"), "junction");
+
+        await expect(adapter.start(startInput(
+          "developer",
+          "crash",
+          project.root
+        ))).rejects.toThrow("escapes the project state directory");
+      } finally {
+        await project.cleanup();
+        await rm(outside, { recursive: true, force: true });
+      }
+    }
+  );
 });

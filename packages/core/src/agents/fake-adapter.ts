@@ -2,7 +2,7 @@ import {
   spawn,
   type ChildProcessWithoutNullStreams
 } from "node:child_process";
-import { access, appendFileSync, mkdir } from "node:fs";
+import { access, appendFileSync, mkdir, realpath } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { promisify } from "node:util";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -19,6 +19,7 @@ import type {
 
 const accessAsync = promisify(access);
 const mkdirAsync = promisify(mkdir);
+const realpathAsync = promisify(realpath);
 const START_TIMEOUT_MS = 5_000;
 const STOP_TIMEOUT_MS = 2_000;
 const EMPLOYEE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/u;
@@ -34,6 +35,7 @@ interface LiveFakeSession {
   lines: AsyncJsonLineQueue<AgentEvent>;
   usage: UsageSnapshot;
   closed: Promise<void>;
+  interruptWaiters: Array<(interrupted: boolean) => void>;
 }
 
 interface QueueWaiter<T> {
@@ -126,16 +128,19 @@ async function nextWithTimeout<T>(
 export interface FakeAgentAdapterOptions {
   executable: string;
   packageRoot: string;
+  allowedEmployeeIds: ReadonlySet<string>;
 }
 
 export class FakeAgentAdapter implements AgentAdapter {
   readonly #executable: string;
   readonly #packageRoot: string;
+  readonly #allowedEmployeeIds: ReadonlySet<string>;
   readonly #sessions = new Map<string, LiveFakeSession>();
 
   constructor(options: FakeAgentAdapterOptions) {
     this.#executable = resolve(options.executable);
     this.#packageRoot = resolve(options.packageRoot);
+    this.#allowedEmployeeIds = new Set(options.allowedEmployeeIds);
   }
 
   async detect(): Promise<{ available: boolean; version: string }> {
@@ -169,20 +174,25 @@ export class FakeAgentAdapter implements AgentAdapter {
     message: AgentMessage
   ): AsyncIterable<AgentEvent> {
     const live = this.#getLive(session);
-    writeJsonLine(live.child, {
-      type: "message",
-      messageId: message.messageId,
-      taskId: message.taskId,
-      text: message.text
-    });
+    if (live.child.exitCode === null && live.child.signalCode === null) {
+      writeJsonLine(live.child, {
+        type: "message",
+        messageId: message.messageId,
+        taskId: message.taskId,
+        text: message.text
+      });
+    }
 
     for await (const event of live.lines) {
       yield event;
       if (
-        event.type === "action.proposed" ||
+        event.type === "usage.updated" ||
         event.type === "adapter.error" ||
         event.type === "session.exited"
       ) {
+        if (event.type === "session.exited") {
+          this.#sessions.delete(session.internalSessionId);
+        }
         return;
       }
     }
@@ -190,15 +200,19 @@ export class FakeAgentAdapter implements AgentAdapter {
 
   async interrupt(session: SessionHandle): Promise<{ interrupted: boolean }> {
     const live = this.#getLive(session);
-    writeJsonLine(live.child, { type: "interrupt" });
-    for await (const event of live.lines) {
-      if (event.type === "session.interrupted") return { interrupted: true };
-      if (event.type === "session.exited") return { interrupted: false };
-      if (event.type === "adapter.error") {
-        throw new Error(event.message);
+    return new Promise<{ interrupted: boolean }>((resolvePromise, reject) => {
+      const resolveInterrupt = (interrupted: boolean) => {
+        resolvePromise({ interrupted });
+      };
+      live.interruptWaiters.push(resolveInterrupt);
+      try {
+        writeJsonLine(live.child, { type: "interrupt" });
+      } catch (error) {
+        const waiterIndex = live.interruptWaiters.indexOf(resolveInterrupt);
+        if (waiterIndex >= 0) live.interruptWaiters.splice(waiterIndex, 1);
+        reject(error);
       }
-    }
-    return { interrupted: false };
+    });
   }
 
   async resume(input: ResumeSessionInput): Promise<SessionHandle> {
@@ -243,6 +257,9 @@ export class FakeAgentAdapter implements AgentAdapter {
     if (!EMPLOYEE_ID_PATTERN.test(input.employeeId)) {
       throw new Error(`invalid employee id: ${input.employeeId}`);
     }
+    if (!this.#allowedEmployeeIds.has(input.employeeId)) {
+      throw new Error(`employee is not configured: ${input.employeeId}`);
+    }
 
     const projectRoot = resolve(input.projectRoot);
     const stateRoot = resolve(projectRoot, ".agenttown");
@@ -250,9 +267,19 @@ export class FakeAgentAdapter implements AgentAdapter {
     if (!isWithin(projectRoot, stateRoot) || !isWithin(stateRoot, logsRoot)) {
       throw new Error("Fake Agent log path escapes the project state directory");
     }
+    await mkdirAsync(stateRoot, { recursive: true });
+    const canonicalProjectRoot = await realpathAsync(projectRoot);
+    const canonicalStateRoot = await realpathAsync(stateRoot);
+    if (!isWithin(canonicalProjectRoot, canonicalStateRoot)) {
+      throw new Error("Fake Agent log path escapes the project state directory");
+    }
     await mkdirAsync(logsRoot, { recursive: true });
-    const logPath = resolve(logsRoot, `${input.employeeId}.jsonl`);
-    if (dirname(logPath) !== logsRoot) {
+    const canonicalLogsRoot = await realpathAsync(logsRoot);
+    if (!isWithin(canonicalStateRoot, canonicalLogsRoot)) {
+      throw new Error("Fake Agent log path escapes the project state directory");
+    }
+    const logPath = resolve(canonicalLogsRoot, `${input.employeeId}.jsonl`);
+    if (dirname(logPath) !== canonicalLogsRoot) {
       throw new Error("Fake Agent log path escapes the logs directory");
     }
 
@@ -290,7 +317,8 @@ export class FakeAgentAdapter implements AgentAdapter {
         contextTokens: null,
         capturedAt: new Date().toISOString()
       },
-      closed: Promise.resolve()
+      closed: Promise.resolve(),
+      interruptWaiters: []
     };
 
     let stdoutBuffer = "";
@@ -320,6 +348,10 @@ export class FakeAgentAdapter implements AgentAdapter {
           continue;
         }
         if (event.type === "session.started") live.handle = event.handle;
+        if (event.type === "session.interrupted") {
+          live.interruptWaiters.shift()?.(true);
+          continue;
+        }
         if (event.type === "usage.updated") {
           live.usage = {
             inputTokens: event.inputTokens,
@@ -339,9 +371,11 @@ export class FakeAgentAdapter implements AgentAdapter {
         reject(error);
       });
       child.once("close", (exitCode) => {
+        for (const resolveInterrupt of live.interruptWaiters.splice(0)) {
+          resolveInterrupt(false);
+        }
         lines.push({ type: "session.exited", exitCode });
         lines.close();
-        this.#sessions.delete(live.handle.internalSessionId);
         resolvePromise();
       });
     });
