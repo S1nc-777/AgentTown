@@ -62,4 +62,31 @@ describe("CoreStore", () => {
     expect(store.listEvents(0)).toHaveLength(1);
     store.close();
   });
+
+  it("rejects status changes for a missing company without publishing an event", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    const publishedEventIds: string[] = [];
+    store.subscribeEvents((event) => {
+      publishedEventIds.push(event.id);
+    });
+
+    try {
+      expect(() => store.setCompanyStatus("missing-company", "paused", {
+        id: "event-for-missing-company",
+        type: "company.paused",
+        actorId: "owner",
+        payload: {},
+        causationEventId: null,
+        taskId: null
+      })).toThrow("company not found");
+
+      expect(store.listEvents(0)).toEqual([]);
+      expect(publishedEventIds).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
 });

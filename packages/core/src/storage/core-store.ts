@@ -184,11 +184,14 @@ export class CoreStore {
 
   setCompanyStatus(companyId: string, status: string, event: NewEvent): void {
     const insertedEvent = this.inTransaction(() => {
-      this.#database.prepare(`
+      const result = this.#database.prepare(`
         UPDATE companies
         SET status = ?, updated_at = ?
         WHERE id = ?
       `).run(status, new Date().toISOString(), companyId);
+      if (Number(result.changes) !== 1) {
+        throw new Error(`company not found: ${companyId}`);
+      }
       return this.#insertEventRow(event);
     });
     this.#publishEvents([insertedEvent]);
