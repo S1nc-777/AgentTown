@@ -281,6 +281,7 @@ async function verifyInterrupt(
       `[agenttown] session_observed:${sessionSeen}`,
       `[agenttown] process_dead:${dead}`,
       `[agenttown] bounded_exit:${completed !== undefined}`,
+      `[agenttown] timed_out:${completed?.timedOut ?? "unobserved"}`,
       `[agenttown] exit_code:${completed?.exitCode ?? "unobserved"}`,
       "[agenttown] raw_output_begin",
       redactJsonlOutput(rawOutput),
@@ -326,6 +327,14 @@ async function verifyInterrupt(
     const killed = await bounded(handle.completed, 2_500, "interrupt_kill_timeout").catch(() => undefined);
     const dead = await waitUntilDead(handle.pid, dependencies.isAlive, timeoutMs);
     await writeLog(true, dead, killed);
+    return dead
+      ? { passed: false, blocker: "interrupt_timeout" }
+      : { passed: false, blocker: "interrupt_orphan_process", orphanPid: handle.pid };
+  }
+  if (completed.timedOut) {
+    handle.kill();
+    const dead = await waitUntilDead(handle.pid, dependencies.isAlive, timeoutMs);
+    await writeLog(true, dead, completed);
     return dead
       ? { passed: false, blocker: "interrupt_timeout" }
       : { passed: false, blocker: "interrupt_orphan_process", orphanPid: handle.pid };

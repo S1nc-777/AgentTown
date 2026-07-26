@@ -1,4 +1,5 @@
 .worktrees/
+.superpowers/sdd/
 node_modules/
 dist/
 target/

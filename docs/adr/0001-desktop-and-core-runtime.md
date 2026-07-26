@@ -25,16 +25,18 @@ Recorded tool/runtime versions are Node `v24.14.0`, pnpm `11.9.0`, Electron `43.
 
 With `AGENTTOWN_FORBID_REAL_PROBES=1`, `AGENTTOWN_REAL_CODEX=0`, and `AGENTTOWN_REAL_CLAUDE=0`, `pnpm --filter @agenttown/probe-runner score-frameworks` produced the following table and exited `1`, as expected because no candidate qualifies:
 
-| Framework | Eligible | Install MiB | Cold start ms | Weighted score | Rank | Blockers |
-| --- | --- | ---: | ---: | ---: | ---: | --- |
-| electron | no | N/A | N/A | N/A | - | core_survival, packaged_window_exit_timeout |
-| tauri | no | N/A | N/A | N/A | - | pty_stability, core_survival, packaging, terminal_embedding, rust_toolchain_download_stalled |
+| Framework | Eligible | Install MiB | Cold start ms | Weighted score | Implementation minutes | Rank | Blockers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| electron | no | N/A | N/A | N/A | 60 | - | core_survival, packaged_window_exit_timeout |
+| tauri | no | N/A | N/A | N/A | 15 | - | pty_stability, core_survival, packaging, terminal_embedding, rust_toolchain_download_stalled |
 
 Both `-` rank entries mean **unranked**. Neither candidate enters the weighted comparison.
 
 `framework-electron.json` contains raw observed values of `497.03` MiB and `798` ms. Those values are not eligible benchmark measurements: the cold-start value is one preserved packaged observation, not the required three-run median, and the packaged window did not exit inside the bounded close window. Consequently, `feasibility-summary.json` correctly reports Electron `measurementEligible: false`, zero benchmark runs, and `N/A` for install size, cold start, and weighted score. Raw observations must not be presented as benchmark evidence.
 
 `framework-tauri.json` contains numeric zero schema placeholders for install size and cold start. It explicitly records `installSizeMeasured: false`, `coldStartMeasured: false`, `measurementEligible: false`, `runtimeImplemented: false`, and `numericZeroSemantics: schema_placeholders_not_comparable`. The zero values are not measurements and are suppressed as `N/A`.
+
+The implementation-time column is descriptive, not a comparable benchmark for rejected candidates. Electron records 60 minutes of spike work. Tauri's 15 minutes records only the prerequisite audit (`implementationMeasurement: prerequisite_audit_only`), not a completed runtime implementation.
 
 The Agent evidence is also incomplete: `capabilities-summary.json` records a shell-wrapper timeout after reports were written; `real-probes-summary.json` records Codex launch failure and unverified capabilities, while Claude Code lacks verified interrupt and three-session parallel operation. Those adapter failures do not alter the runtime decision below.
 

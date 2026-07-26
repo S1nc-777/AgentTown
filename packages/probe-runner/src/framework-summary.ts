@@ -58,8 +58,8 @@ export function summarizeFrameworks(artifacts: FrameworkArtifact[]): FrameworkSu
 
 export function renderFrameworkTable(rows: FrameworkSummaryRow[]): string {
   const header = [
-    "| Framework | Eligible | Install MiB | Cold start ms | Weighted score | Rank | Blockers |",
-    "| --- | --- | ---: | ---: | ---: | ---: | --- |"
+    "| Framework | Eligible | Install MiB | Cold start ms | Weighted score | Implementation minutes | Rank | Blockers |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"
   ];
   const body = rows.map((row) => [
     "|",
@@ -72,6 +72,8 @@ export function renderFrameworkTable(rows: FrameworkSummaryRow[]): string {
     row.coldStart,
     "|",
     row.weightedScore,
+    "|",
+    row.implementationMinutes,
     "|",
     row.rank ?? "-",
     "|",

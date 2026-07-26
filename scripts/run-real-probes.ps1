@@ -30,7 +30,7 @@ $gitInitialized = $false
 $testExitCode = 0
 $observedExitKind = "not_run"
 $executionBlockers = @()
-$commandAvailability = [ordered]@{ codex = $false; claude = $false }
+$commandAvailability = [ordered]@{ status = "not_checked"; codex = $null; claude = $null }
 
 function Add-ExecutionBlocker([string]$Blocker) {
   if ($script:executionBlockers -notcontains $Blocker) { $script:executionBlockers += $Blocker }
@@ -45,63 +45,66 @@ function Record-ChildBlockers($Child) {
 }
 
 try {
-  New-Item -ItemType Directory -Path $probeDirectory | Out-Null
-  $created = $true
-  $gitResult = Invoke-FixedChild "git.exe" @("init", "--quiet", $probeDirectory) "git-init"
-  if ($gitResult.ExitCode -eq 0) {
-    $gitInitialized = $true
-  } else {
-    $testExitCode = $gitResult.ExitCode
-    $observedExitKind = $gitResult.Kind
-    Record-ChildBlockers $gitResult
-    Add-ExecutionBlocker "temporary_repo_init_failed"
-  }
-
-  if ($gitInitialized -and -not $ValidateOnly -and -not $SummarizeOnly) {
-    if ($env:AGENTTOWN_FORBID_REAL_PROBES -eq "1") {
-      $testExitCode = 1
-      $observedExitKind = "forbidden"
-      Add-ExecutionBlocker "real_probe_execution_disabled"
-      Write-Output "real_probe_execution_disabled"
+  if (-not $SummarizeOnly) {
+    New-Item -ItemType Directory -Path $probeDirectory | Out-Null
+    $created = $true
+    $gitResult = Invoke-FixedChild "git.exe" @("init", "--quiet", $probeDirectory) "git-init"
+    if ($gitResult.ExitCode -eq 0) {
+      $gitInitialized = $true
     } else {
-      $commandAvailability.codex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
-      $commandAvailability.claude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
-      if ($CapabilitiesOnly) {
-        $child = Invoke-FixedChild "pnpm.cmd" @(
-          "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "tsx", "src/run-real-capabilities.ts",
-          "--artifact-root", [System.IO.Path]::GetFullPath($ArtifactRoot), "--timeout-ms", [string]$TimeoutMs
-        ) "capabilities"
-        $testExitCode = $child.ExitCode
-        $observedExitKind = $child.Kind
-        Record-ChildBlockers $child
+      $testExitCode = $gitResult.ExitCode
+      $observedExitKind = $gitResult.Kind
+      Record-ChildBlockers $gitResult
+      Add-ExecutionBlocker "temporary_repo_init_failed"
+    }
+
+    if ($gitInitialized -and -not $ValidateOnly) {
+      if ($env:AGENTTOWN_FORBID_REAL_PROBES -eq "1") {
+        $testExitCode = 1
+        $observedExitKind = "forbidden"
+        Add-ExecutionBlocker "real_probe_execution_disabled"
+        Write-Output "real_probe_execution_disabled"
       } else {
-        $previousCodexGate = $env:AGENTTOWN_REAL_CODEX
-        $previousClaudeGate = $env:AGENTTOWN_REAL_CLAUDE
-        $previousTimeout = $env:AGENTTOWN_REAL_TIMEOUT_MS
-        try {
-          $env:AGENTTOWN_REAL_CODEX = "1"
-          $env:AGENTTOWN_REAL_CLAUDE = "1"
-          $env:AGENTTOWN_REAL_TIMEOUT_MS = [string]$TimeoutMs
-          $child = Invoke-FixedChild "pnpm.cmd" @(
-            "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "vitest", "run",
-            "test/codex-real.test.ts", "test/claude-real.test.ts"
-          ) "real-tests"
-        } finally {
-          $env:AGENTTOWN_REAL_CODEX = $previousCodexGate
-          $env:AGENTTOWN_REAL_CLAUDE = $previousClaudeGate
-          $env:AGENTTOWN_REAL_TIMEOUT_MS = $previousTimeout
-        }
-        $testExitCode = $child.ExitCode
-        $observedExitKind = $child.Kind
-        Record-ChildBlockers $child
-        if ($testExitCode -eq 0) {
+        $commandAvailability.status = "checked"
+        $commandAvailability.codex = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
+        $commandAvailability.claude = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
+        if ($CapabilitiesOnly) {
           $child = Invoke-FixedChild "pnpm.cmd" @(
             "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "tsx", "src/run-real-capabilities.ts",
             "--artifact-root", [System.IO.Path]::GetFullPath($ArtifactRoot), "--timeout-ms", [string]$TimeoutMs
-          ) "remaining-capabilities"
+          ) "capabilities"
           $testExitCode = $child.ExitCode
           $observedExitKind = $child.Kind
           Record-ChildBlockers $child
+        } else {
+          $previousCodexGate = $env:AGENTTOWN_REAL_CODEX
+          $previousClaudeGate = $env:AGENTTOWN_REAL_CLAUDE
+          $previousTimeout = $env:AGENTTOWN_REAL_TIMEOUT_MS
+          try {
+            $env:AGENTTOWN_REAL_CODEX = "1"
+            $env:AGENTTOWN_REAL_CLAUDE = "1"
+            $env:AGENTTOWN_REAL_TIMEOUT_MS = [string]$TimeoutMs
+            $child = Invoke-FixedChild "pnpm.cmd" @(
+              "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "vitest", "run",
+              "test/codex-real.test.ts", "test/claude-real.test.ts"
+            ) "real-tests"
+          } finally {
+            $env:AGENTTOWN_REAL_CODEX = $previousCodexGate
+            $env:AGENTTOWN_REAL_CLAUDE = $previousClaudeGate
+            $env:AGENTTOWN_REAL_TIMEOUT_MS = $previousTimeout
+          }
+          $testExitCode = $child.ExitCode
+          $observedExitKind = $child.Kind
+          Record-ChildBlockers $child
+          if ($testExitCode -eq 0) {
+            $child = Invoke-FixedChild "pnpm.cmd" @(
+              "--dir", $repositoryRoot, "--filter", "@agenttown/probe-runner", "exec", "tsx", "src/run-real-capabilities.ts",
+              "--artifact-root", [System.IO.Path]::GetFullPath($ArtifactRoot), "--timeout-ms", [string]$TimeoutMs
+            ) "remaining-capabilities"
+            $testExitCode = $child.ExitCode
+            $observedExitKind = $child.Kind
+            Record-ChildBlockers $child
+          }
         }
       }
     }

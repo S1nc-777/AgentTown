@@ -99,8 +99,9 @@ describe("summarizeFrameworks", () => {
       await artifact("tauri")
     ]));
 
-    expect(table).toContain("| electron | no | N/A | N/A | N/A | - | core_survival, packaged_window_exit_timeout |");
-    expect(table).toContain("| tauri | no | N/A | N/A | N/A | - |");
+    expect(table).toContain("| Framework | Eligible | Install MiB | Cold start ms | Weighted score | Implementation minutes | Rank | Blockers |");
+    expect(table).toContain("| electron | no | N/A | N/A | N/A | 60 | - | core_survival, packaged_window_exit_timeout |");
+    expect(table).toContain("| tauri | no | N/A | N/A | N/A | 15 | - |");
     expect(table).not.toContain("497.03");
   });
 

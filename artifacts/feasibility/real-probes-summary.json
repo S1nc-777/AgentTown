@@ -1,13 +1,19 @@
 {
     "commandAvailability":  {
-                                "codex":  false,
-                                "claude":  false
+                                "status":  "not_checked",
+                                "codex":  null,
+                                "claude":  null
                             },
     "execution":  "summarize_only",
+    "observedExitKind":  "not_run",
+    "executionBlockers":  [
+
+                          ],
     "probeTestExitCode":  0,
     "validation":  {
                        "tempCleanupVerified":  true,
-                       "childGatesScoped":  true
+                       "childGatesScoped":  true,
+                       "gitInitialized":  false
                    },
     "agents":  [
                    {

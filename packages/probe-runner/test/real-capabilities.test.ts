@@ -45,14 +45,14 @@ function report(agent: "codex" | "claude", overrides: Partial<CapabilityReport> 
   };
 }
 
-function result(rawOutput: string, exitCode = 0): RunResult {
+function result(rawOutput: string, exitCode = 0, timedOut = false): RunResult {
   return {
     command: ["fixture"],
     startedAt: "2026-07-23T00:00:00.000Z",
     durationMs: 5,
     exitCode,
     rawOutput,
-    timedOut: false
+    timedOut
   };
 }
 
@@ -91,6 +91,7 @@ function dependencies(outputs: Array<{
   sessionId: string;
   marker: string;
   exitCode?: number;
+  timedOut?: boolean;
   rawOutput?: string;
 }>, alivePids: number[] = []) {
   const calls: string[] = [];
@@ -102,7 +103,8 @@ function dependencies(outputs: Array<{
       const output = outputs[index++]!;
       return handle(700 + index, result(
         output.rawOutput ?? claudeOutput(output.sessionId, output.marker),
-        output.exitCode
+        output.exitCode,
+        output.timedOut
       ), calls);
     },
     isAlive: async (pid) => {
@@ -244,6 +246,31 @@ describe("probeRemainingAgentCapabilities", () => {
 
     expect(outcome.interrupt).toBe(false);
     expect(outcome.blockers).toContain("interrupt_orphan_process");
+  });
+
+  it("does not claim interrupt when Ctrl+C is ignored and the PTY timeout performs the final kill", async () => {
+    const root = await artifactRoot(report("claude"));
+    const fixture = dependencies([
+      { sessionId: "interrupt-session", marker: "AGENTTOWN_INTERRUPT_PROBE", timedOut: true },
+      { sessionId: "parallel-1", marker: "AGENTTOWN_PARALLEL_ONE" },
+      { sessionId: "parallel-2", marker: "AGENTTOWN_PARALLEL_TWO" },
+      { sessionId: "parallel-3", marker: "AGENTTOWN_PARALLEL_THREE" }
+    ]);
+
+    const outcome = await probeRemainingAgentCapabilities("claude", {
+      artifactRootDir: root,
+      timeoutMs: 100,
+      dependencies: fixture.value
+    });
+
+    expect(outcome.interrupt).toBe(false);
+    expect(outcome.blockers).toContain("interrupt_timeout");
+    expect(outcome.orphanPids).toEqual([]);
+    expect(fixture.calls).toContain("interrupt:701");
+    expect(fixture.calls).toContain("kill:701");
+    const log = await readFile(join(root, "claude-capabilities", "interrupt.log"), "utf8");
+    expect(log).toContain("timed_out:true");
+    expect(log).toContain("process_dead:true");
   });
 
   it("does not claim interrupt if the process exited before Ctrl+C was delivered", async () => {

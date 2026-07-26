@@ -95,12 +95,32 @@ describe.runIf(process.platform === "win32")("PowerShell benchmark entry points"
 
     expect(failure.code).toBe(1);
     const summary = JSON.parse(await readFile(summaryPath, "utf8")) as {
+      commandAvailability: { status: string; codex: boolean | null; claude: boolean | null };
+      execution: string;
+      observedExitKind: string;
+      executionBlockers: string[];
+      probeTestExitCode: number;
+      validation: { tempCleanupVerified: boolean; childGatesScoped: boolean; gitInitialized: boolean };
       agents: Array<{
         agent: string;
         steps: { firstTurn: boolean; resume: boolean; interrupt: boolean; parallelThree: boolean };
         blockers: string[];
       }>;
     };
+    expect(summary.commandAvailability).toEqual({
+      status: "not_checked",
+      codex: null,
+      claude: null
+    });
+    expect(summary.execution).toBe("summarize_only");
+    expect(summary.observedExitKind).toBe("not_run");
+    expect(summary.executionBlockers).toEqual([]);
+    expect(summary.probeTestExitCode).toBe(0);
+    expect(summary.validation).toEqual({
+      tempCleanupVerified: true,
+      childGatesScoped: true,
+      gitInitialized: false
+    });
     expect(summary.agents).toEqual([
       expect.objectContaining({
         agent: "codex",
