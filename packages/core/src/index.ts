@@ -9,4 +9,6 @@ export {
   FakeAgentAdapter,
   type FakeAgentAdapterOptions
 } from "./agents/fake-adapter.js";
+export { SessionManager } from "./agents/session-manager.js";
+export { CompanyOrchestrator } from "./company/orchestrator.js";
 export { TaskService } from "./tasks/task-service.js";
