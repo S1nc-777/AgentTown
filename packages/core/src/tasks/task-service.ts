@@ -57,7 +57,8 @@ export class TaskService {
   constructor(
     private readonly store: CoreStore,
     private readonly companyId: string,
-    private readonly company: CompanyDefinition
+    private readonly company: CompanyDefinition,
+    private readonly leaderId: string
   ) {}
 
   create(input: NewTask): TaskRecord {
@@ -238,7 +239,7 @@ export class TaskService {
     if (actorId !== "owner") {
       const actor = this.company.employees.find((employee) => employee.id === actorId);
       if (actor === undefined) throw new Error(`unknown employee: ${actorId}`);
-      if (actor.reportsTo !== "owner" || actor.workspace !== "read_only") {
+      if (actorId !== this.leaderId) {
         throw new Error("leader permission required");
       }
     }

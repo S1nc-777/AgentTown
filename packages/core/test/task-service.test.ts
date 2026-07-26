@@ -51,6 +51,13 @@ describe("TaskService", () => {
 
   beforeEach(() => {
     const company = companyDefinitionFixture();
+    company.employees.push({
+      id: "observer",
+      role: "Observer",
+      agent: "fake",
+      reportsTo: "owner",
+      workspace: "read_only"
+    });
     store = new CoreStore(":memory:");
     store.initialize();
     store.createCompany({
@@ -65,7 +72,7 @@ describe("TaskService", () => {
         payload: {}
       }
     });
-    service = new TaskService(store, "company-1", company);
+    service = new TaskService(store, "company-1", company, "leader");
   });
 
   afterEach(() => {
@@ -235,6 +242,15 @@ describe("TaskService", () => {
     exhaustExecutionRetry(service, "build");
 
     expect(() => service.unblock("build", "developer"))
+      .toThrow("leader permission required");
+    expect(service.get("build")).toMatchObject({ status: "blocked", retryCount: 1 });
+    expect(store.listEvents(0).at(-1)?.type).toBe("task.blocked");
+  });
+
+  it("rejects blocked-task release by a top-level read-only nonleader", () => {
+    exhaustExecutionRetry(service, "build");
+
+    expect(() => service.unblock("build", "observer"))
       .toThrow("leader permission required");
     expect(service.get("build")).toMatchObject({ status: "blocked", retryCount: 1 });
     expect(store.listEvents(0).at(-1)?.type).toBe("task.blocked");
