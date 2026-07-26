@@ -232,6 +232,32 @@ export class TaskService {
     return updated;
   }
 
+  unblock(taskId: string, actorId: string): TaskRecord {
+    const record = this.get(taskId);
+    this.#assertTransition(record.status, "ready");
+    if (actorId !== "owner") {
+      const actor = this.company.employees.find((employee) => employee.id === actorId);
+      if (actor === undefined) throw new Error(`unknown employee: ${actorId}`);
+      if (actor.reportsTo !== "owner" || actor.workspace !== "read_only") {
+        throw new Error("leader permission required");
+      }
+    }
+
+    const changed = event("task.unblocked", actorId, taskId, {
+      previousStatus: record.status,
+      status: "ready",
+      retryCount: record.retryCount,
+      reviewLoopCount: record.reviewLoopCount
+    });
+    const updated: TaskRecord = {
+      ...record,
+      status: "ready",
+      updatedEventId: changed.id
+    };
+    this.store.putTask(this.companyId, updated, [changed]);
+    return updated;
+  }
+
   #assertTransition(current: TaskState, next: TaskState): void {
     if (!legalTransitions[current].includes(next)) {
       throw new Error(`illegal task transition: ${current} -> ${next}`);

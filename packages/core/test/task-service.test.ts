@@ -34,6 +34,17 @@ function advanceToReview(service: TaskService, taskId: string): TaskRecord {
   return service.submit(taskId, "developer", [`${taskId}.patch`], [`${taskId} tests pass`]);
 }
 
+function exhaustExecutionRetry(service: TaskService, taskId: string): TaskRecord {
+  service.create(task(taskId, []));
+  service.assign(taskId, "developer");
+  service.transition(taskId, "running", "developer");
+  service.transition(taskId, "failed", "developer");
+  service.retry(taskId, "leader");
+  service.transition(taskId, "running", "developer");
+  service.transition(taskId, "failed", "developer");
+  return service.retry(taskId, "leader");
+}
+
 describe("TaskService", () => {
   let store: CoreStore;
   let service: TaskService;
@@ -185,5 +196,47 @@ describe("TaskService", () => {
       evidence: ["build tests pass"]
     });
     expect(store.listEvents(0).at(-1)?.type).toBe("task.completed");
+  });
+
+  it("lets the owner release a blocked task without resetting counters", () => {
+    expect(exhaustExecutionRetry(service, "build")).toMatchObject({
+      status: "blocked",
+      retryCount: 1,
+      reviewLoopCount: 0
+    });
+
+    expect(service.unblock("build", "owner")).toMatchObject({
+      status: "ready",
+      retryCount: 1,
+      reviewLoopCount: 0
+    });
+    expect(store.listEvents(0).at(-1)).toMatchObject({
+      type: "task.unblocked",
+      actorId: "owner",
+      payload: {
+        previousStatus: "blocked",
+        status: "ready",
+        retryCount: 1,
+        reviewLoopCount: 0
+      }
+    });
+  });
+
+  it("lets the configured leader release a blocked task", () => {
+    exhaustExecutionRetry(service, "build");
+
+    expect(service.unblock("build", "leader")).toMatchObject({
+      status: "ready",
+      retryCount: 1
+    });
+  });
+
+  it("rejects blocked-task release by an unauthorized employee", () => {
+    exhaustExecutionRetry(service, "build");
+
+    expect(() => service.unblock("build", "developer"))
+      .toThrow("leader permission required");
+    expect(service.get("build")).toMatchObject({ status: "blocked", retryCount: 1 });
+    expect(store.listEvents(0).at(-1)?.type).toBe("task.blocked");
   });
 });
