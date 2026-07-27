@@ -8,7 +8,7 @@ import type {
   SessionCheckpoint,
   SessionHandle
 } from "@agenttown/runtime-contract";
-import { CoreStore } from "../storage/core-store.js";
+import { CoreStore, type NewEvent } from "../storage/core-store.js";
 
 export class SessionManager {
   readonly #sessions = new Map<string, SessionHandle>();
@@ -40,26 +40,43 @@ export class SessionManager {
     );
 
     if (failedEmployeeIds.length > 0) {
-      for (let index = results.length - 1; index >= 0; index -= 1) {
-        const result = results[index];
-        const employee = company.employees[index];
-        if (result?.status !== "fulfilled" || employee === undefined) continue;
-        await this.adapterFor(employee.agent).stop(result.value).catch(() => undefined);
-      }
+      await this.#stopStartedHandles(company, results);
       throw new Error(`failed to start employees: ${failedEmployeeIds.join(", ")}`);
     }
 
-    for (let index = 0; index < results.length; index += 1) {
-      const result = results[index];
-      const employee = company.employees[index];
-      if (result?.status !== "fulfilled" || employee === undefined) {
-        throw new Error("session start result mismatch");
+    try {
+      for (let index = 0; index < results.length; index += 1) {
+        const result = results[index];
+        const employee = company.employees[index];
+        if (result?.status !== "fulfilled" || employee === undefined) {
+          throw new Error("session start result mismatch");
+        }
+        this.store.putSession(
+          this.companyId,
+          employee.id,
+          result.value,
+          "running",
+          this.#newEvent("session.started", employee.id, null, {
+            handle: result.value
+          })
+        );
+        this.#sessions.set(employee.id, result.value);
       }
-      this.#sessions.set(employee.id, result.value);
-      this.store.putSession(this.companyId, employee.id, result.value, "running");
-      this.#recordEvent("session.started", employee.id, null, {
-        handle: result.value
-      });
+    } catch (error) {
+      await this.#stopStartedHandles(company, results);
+      for (const employee of company.employees) {
+        this.#sessions.delete(employee.id);
+        try {
+          this.store.deleteSession(
+            this.companyId,
+            employee.id,
+            this.#newEvent("session.start_rolled_back", employee.id, null, {})
+          );
+        } catch {
+          // Continue clearing the remaining session facts before surfacing the start error.
+        }
+      }
+      throw error;
     }
   }
 
@@ -76,16 +93,9 @@ export class SessionManager {
     if (message.employeeId !== employee.id) {
       throw new Error(`message employee mismatch: ${message.employeeId}`);
     }
-    const session = this.get(employee.id);
-    const previous = this.#sendTails.get(employee.id) ?? Promise.resolve();
-    let releaseTail: () => void = () => undefined;
-    const tail = new Promise<void>((resolvePromise) => {
-      releaseTail = resolvePromise;
-    });
-    this.#sendTails.set(employee.id, tail);
-
-    await previous;
+    const release = await this.#acquire(employee.id);
     try {
+      const session = this.get(employee.id);
       for await (const event of this.adapterFor(employee.agent).send(session, message)) {
         if (event.type === "usage.updated") {
           const usage = {
@@ -107,21 +117,28 @@ export class SessionManager {
             }
           });
         } else if (event.type === "session.exited") {
-          this.store.putSession(this.companyId, employee.id, session, "exited");
-          this.#persistAgentEvent(employee.id, message, event);
+          this.store.putSession(
+            this.companyId,
+            employee.id,
+            session,
+            "exited",
+            this.#agentEvent(employee.id, message, event)
+          );
         } else if (event.type === "adapter.error") {
-          this.store.putSession(this.companyId, employee.id, session, "error");
-          this.#persistAgentEvent(employee.id, message, event);
+          this.store.putSession(
+            this.companyId,
+            employee.id,
+            session,
+            "error",
+            this.#agentEvent(employee.id, message, event)
+          );
         } else {
           this.#persistAgentEvent(employee.id, message, event);
         }
         yield event;
       }
     } finally {
-      releaseTail();
-      if (this.#sendTails.get(employee.id) === tail) {
-        this.#sendTails.delete(employee.id);
-      }
+      release();
     }
   }
 
@@ -131,20 +148,47 @@ export class SessionManager {
       const employee = this.#employeeAdapterName(session);
       const result = await this.adapterFor(employee).interrupt(session);
       if (result.interrupted) {
-        this.store.putSession(this.companyId, employeeId, session, "interrupted");
-        this.#recordEvent("session.interrupted", employeeId, null, {
-          reason: "requested"
-        });
+        this.store.putSession(
+          this.companyId,
+          employeeId,
+          session,
+          "interrupted",
+          this.#newEvent("session.interrupted", employeeId, null, {
+            reason: "requested"
+          })
+        );
       }
     }));
   }
 
   async stopAll(): Promise<void> {
     const entries = [...this.#sessions.entries()].reverse();
+    const errors: Error[] = [];
     for (const [employeeId, session] of entries) {
-      await this.adapterFor(this.#employeeAdapterName(session)).stop(session);
-      this.store.putSession(this.companyId, employeeId, session, "stopped");
-      this.#sessions.delete(employeeId);
+      try {
+        await this.adapterFor(this.#employeeAdapterName(session)).stop(session);
+      } catch (error) {
+        errors.push(new Error(`${employeeId}: ${this.#errorMessage(error)}`));
+      }
+      try {
+        this.store.putSession(
+          this.companyId,
+          employeeId,
+          session,
+          "stopped",
+          this.#newEvent("session.stopped", employeeId, null, {})
+        );
+      } catch (error) {
+        errors.push(new Error(`${employeeId} persistence: ${this.#errorMessage(error)}`));
+      } finally {
+        this.#sessions.delete(employeeId);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(
+        errors,
+        `failed to stop sessions: ${errors.map((error) => error.message).join("; ")}`
+      );
     }
   }
 
@@ -155,41 +199,61 @@ export class SessionManager {
     if (checkpoint.employeeId !== employee.id) {
       throw new Error(`checkpoint employee mismatch: ${checkpoint.employeeId}`);
     }
-    const handle = await this.adapterFor(employee.agent).resume({
-      employeeId: employee.id,
-      role: employee.role,
-      projectRoot: this.projectRoot,
-      scenario: "idle",
-      previous: checkpoint.handle,
-      handoff: checkpoint.handoff
-    });
-    this.#sessions.set(employee.id, handle);
-    this.store.putSession(this.companyId, employee.id, handle, "running");
-    this.#recordEvent("session.started", employee.id, checkpoint.activeTaskId, {
-      handle,
-      resumed: true
-    });
-    return handle;
+    const release = await this.#acquire(employee.id);
+    try {
+      const handle = await this.adapterFor(employee.agent).resume({
+        employeeId: employee.id,
+        role: employee.role,
+        projectRoot: this.projectRoot,
+        scenario: "idle",
+        previous: checkpoint.handle,
+        handoff: checkpoint.handoff
+      });
+      this.store.putSession(
+        this.companyId,
+        employee.id,
+        handle,
+        "running",
+        this.#newEvent("session.started", employee.id, checkpoint.activeTaskId, {
+          handle,
+          resumed: true
+        })
+      );
+      this.#sessions.set(employee.id, handle);
+      return handle;
+    } finally {
+      release();
+    }
   }
 
   async rebuildOne(
     employee: EmployeeDefinition,
     handoff: string
   ): Promise<SessionHandle> {
-    const handle = await this.adapterFor(employee.agent).start({
-      employeeId: employee.id,
-      role: employee.role,
-      projectRoot: this.projectRoot,
-      scenario: "idle"
-    });
-    this.#sessions.set(employee.id, handle);
-    this.store.putSession(this.companyId, employee.id, handle, "running");
-    this.#recordEvent("session.started", employee.id, null, {
-      handle,
-      rebuilt: true,
-      handoff
-    });
-    return handle;
+    const release = await this.#acquire(employee.id);
+    try {
+      const handle = await this.adapterFor(employee.agent).start({
+        employeeId: employee.id,
+        role: employee.role,
+        projectRoot: this.projectRoot,
+        scenario: "idle"
+      });
+      this.store.putSession(
+        this.companyId,
+        employee.id,
+        handle,
+        "running",
+        this.#newEvent("session.started", employee.id, null, {
+          handle,
+          rebuilt: true,
+          handoff
+        })
+      );
+      this.#sessions.set(employee.id, handle);
+      return handle;
+    } finally {
+      release();
+    }
   }
 
   #persistAgentEvent(
@@ -219,23 +283,75 @@ export class SessionManager {
         payload = { code: event.code, message: event.message };
         break;
     }
-    this.#recordEvent(event.type, employeeId, message.taskId, payload);
+    this.store.insertEvent(this.#newEvent(
+      event.type,
+      employeeId,
+      message.taskId,
+      payload
+    ));
   }
 
-  #recordEvent(
+  #agentEvent(
+    employeeId: string,
+    message: AgentMessage,
+    event: Extract<AgentEvent, { type: "session.exited" | "adapter.error" }>
+  ): NewEvent {
+    const payload = event.type === "session.exited"
+      ? { exitCode: event.exitCode }
+      : { code: event.code, message: event.message };
+    return this.#newEvent(event.type, employeeId, message.taskId, payload);
+  }
+
+  #newEvent(
     type: string,
     actorId: string,
     taskId: string | null,
     payload: Record<string, unknown>
-  ): void {
-    this.store.insertEvent({
+  ): NewEvent {
+    return {
       id: randomUUID(),
       type,
       actorId,
       taskId,
       causationEventId: null,
       payload
+    };
+  }
+
+  async #acquire(employeeId: string): Promise<() => void> {
+    const previous = this.#sendTails.get(employeeId) ?? Promise.resolve();
+    let releaseTail: () => void = () => undefined;
+    const tail = new Promise<void>((resolvePromise) => {
+      releaseTail = resolvePromise;
     });
+    this.#sendTails.set(employeeId, tail);
+    await previous;
+    return () => {
+      releaseTail();
+      if (this.#sendTails.get(employeeId) === tail) {
+        this.#sendTails.delete(employeeId);
+      }
+    };
+  }
+
+  async #stopStartedHandles(
+    company: CompanyDefinition,
+    results: readonly PromiseSettledResult<SessionHandle>[]
+  ): Promise<void> {
+    for (let index = results.length - 1; index >= 0; index -= 1) {
+      const result = results[index];
+      const employee = company.employees[index];
+      if (result?.status !== "fulfilled" || employee === undefined) continue;
+      try {
+        await this.adapterFor(employee.agent).stop(result.value);
+      } catch {
+        // Rollback is best effort, but every successfully started handle is attempted.
+      }
+    }
+  }
+
+  #errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   #employeeAdapterName(session: SessionHandle): string {

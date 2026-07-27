@@ -288,9 +288,10 @@ export class CoreStore {
     companyId: string,
     employeeId: string,
     handle: SessionHandle,
-    status: string
+    status: string,
+    event: NewEvent
   ): void {
-    this.inTransaction(() => {
+    const insertedEvent = this.inTransaction(() => {
       this.#database.prepare(`
         INSERT INTO agent_sessions (
           company_id,
@@ -311,7 +312,20 @@ export class CoreStore {
         status,
         new Date().toISOString()
       );
+      return this.#insertEventRow(event);
     });
+    this.#publishEvents([insertedEvent]);
+  }
+
+  deleteSession(companyId: string, employeeId: string, event: NewEvent): void {
+    const insertedEvent = this.inTransaction(() => {
+      this.#database.prepare(`
+        DELETE FROM agent_sessions
+        WHERE company_id = ? AND employee_id = ?
+      `).run(companyId, employeeId);
+      return this.#insertEventRow(event);
+    });
+    this.#publishEvents([insertedEvent]);
   }
 
   listSessions(companyId: string): Array<{

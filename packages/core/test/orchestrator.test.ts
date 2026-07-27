@@ -17,6 +17,7 @@ import { SessionManager } from "../src/agents/session-manager.js";
 import { CompanyOrchestrator } from "../src/company/orchestrator.js";
 import { ActionPolicy } from "../src/policy/action-policy.js";
 import { CoreStore } from "../src/storage/core-store.js";
+import type { NewEvent } from "../src/storage/core-store.js";
 import { TaskService } from "../src/tasks/task-service.js";
 
 interface PendingSend {
@@ -51,6 +52,8 @@ class ScriptedAdapter implements AgentAdapter {
   readonly startedEmployees: string[] = [];
   readonly stoppedEmployees: string[] = [];
   readonly resumedEmployees: string[] = [];
+  readonly sentSessionIds: string[] = [];
+  readonly failStopEmployeeIds = new Set<string>();
   activeSends = 0;
   maximumReviewerConcurrency = 0;
   failStartEmployeeId: string | null = null;
@@ -78,6 +81,7 @@ class ScriptedAdapter implements AgentAdapter {
     session: SessionHandle,
     message: AgentMessage
   ): AsyncIterable<AgentEvent> {
+    this.sentSessionIds.push(session.internalSessionId);
     this.activeSends += 1;
     const employeeActive = (this.#activeByEmployee.get(session.employeeId) ?? 0) + 1;
     this.#activeByEmployee.set(session.employeeId, employeeActive);
@@ -113,6 +117,9 @@ class ScriptedAdapter implements AgentAdapter {
 
   async stop(session: SessionHandle): Promise<void> {
     this.stoppedEmployees.push(session.employeeId);
+    if (this.failStopEmployeeIds.has(session.employeeId)) {
+      throw new Error(`stop failed: ${session.employeeId}`);
+    }
   }
 
   async usage(_session: SessionHandle): Promise<UsageSnapshot> {
@@ -173,6 +180,22 @@ class ScriptedAdapter implements AgentAdapter {
       internalSessionId: `${employeeId}-${this.#sessionSequence}`,
       nativeSessionId: nativeSessionId ?? `${employeeId}-native`
     };
+  }
+}
+
+class FailingPersistenceStore extends CoreStore {
+  #sessionWrites = 0;
+
+  override putSession(
+    companyId: string,
+    employeeId: string,
+    handle: SessionHandle,
+    status: string,
+    event: NewEvent
+  ): void {
+    super.putSession(companyId, employeeId, handle, status, event);
+    this.#sessionWrites += 1;
+    if (this.#sessionWrites === 2) throw new Error("injected session persistence failure");
   }
 }
 
@@ -304,9 +327,8 @@ afterEach(async () => {
   }
 });
 
-function createHarness(): Harness {
+function createHarness(store: CoreStore = new CoreStore(":memory:")): Harness {
   const company = companyFixture();
-  const store = new CoreStore(":memory:");
   store.initialize();
   store.createCompany({
     id: "company-1",
@@ -451,6 +473,149 @@ describe("CompanyOrchestrator", () => {
       }
     });
   });
+
+  it("blocks a developer task after two mismatched task proposals", async () => {
+    const { adapter, orchestrator, store, tasks } = createHarness();
+    await orchestrator.start({});
+    await orchestrator.dispatch(proposeAction("task-a"));
+    await orchestrator.dispatch(proposeAction("task-b"));
+    await orchestrator.dispatch(leaderAssigns("task-a", "developer-a"));
+    await adapter.waitForPending("developer-a");
+
+    await adapter.complete("developer-a", submitAction("task-b", "developer-a"));
+    await adapter.waitForPending("developer-a");
+    await adapter.complete("developer-a", submitAction("task-b", "developer-a"));
+    await waitUntil(() => tasks.get("task-a").status === "blocked", "task-a was not blocked");
+
+    expect(tasks.get("task-b").status).toBe("draft");
+    expect(store.listEvents(0).filter(
+      (event) => event.type === "user.approval.requested"
+        && event.taskId === "task-a"
+    )).toHaveLength(1);
+  });
+
+  it("turns invalid developer proposals into the normal retry and escalation path", async () => {
+    const { adapter, orchestrator, store, tasks } = createHarness();
+    await orchestrator.start({});
+    await orchestrator.dispatch(proposeAction("task-a"));
+    await orchestrator.dispatch(leaderAssigns("task-a", "developer-a"));
+    const invalidSubmission = action({
+      type: "task.submit",
+      actorEmployeeId: "developer-a",
+      taskId: "task-a",
+      payload: { artifacts: [], evidence: [] }
+    });
+
+    await adapter.complete("developer-a", invalidSubmission);
+    await adapter.waitForPending("developer-a");
+    expect(tasks.get("task-a")).toMatchObject({ status: "running", retryCount: 1 });
+    await adapter.complete("developer-a", action({
+      type: "task.assign",
+      actorEmployeeId: "developer-a",
+      taskId: "task-a",
+      payload: { assignee: "developer-a" }
+    }));
+    await waitUntil(() => tasks.get("task-a").status === "blocked", "task-a was not blocked");
+    expect(store.listEvents(0).filter(
+      (event) => event.type === "user.approval.requested"
+        && event.taskId === "task-a"
+    )).toHaveLength(1);
+  });
+
+  it("does not let a reviewer decision mutate a different task", async () => {
+    const { adapter, orchestrator, store, tasks } = createHarness();
+    await orchestrator.start({});
+    for (const [taskId, owner] of [
+      ["task-a", "developer-a"],
+      ["task-b", "developer-b"]
+    ] as const) {
+      await orchestrator.dispatch(proposeAction(taskId));
+      tasks.assign(taskId, owner);
+      tasks.transition(taskId, "running", owner);
+      tasks.submit(taskId, owner, [`artifact:${taskId}`], [`evidence:${taskId}`]);
+    }
+
+    const review = orchestrator.requestReview("task-a");
+    await adapter.waitForPending("reviewer");
+    await adapter.complete("reviewer", approveAction("task-b"));
+    await review;
+
+    expect(tasks.get("task-a").status).toBe("review");
+    expect(tasks.get("task-b").status).toBe("review");
+    expect(store.listEvents(0).some(
+      (event) => event.type === "user.approval.requested"
+        && event.taskId === "task-a"
+    )).toBe(true);
+  });
+
+  it("enforces capacity and actor ownership for every task.start", async () => {
+    const { orchestrator, store, tasks } = createHarness();
+    await orchestrator.start({});
+    for (const [taskId, owner] of [
+      ["task-a", "developer-a"],
+      ["task-b", "developer-b"]
+    ] as const) {
+      await orchestrator.dispatch(proposeAction(taskId));
+      tasks.assign(taskId, owner);
+      tasks.transition(taskId, "running", owner);
+    }
+    await orchestrator.dispatch(proposeAction("task-c"));
+    tasks.assign("task-c", "developer-a");
+
+    await orchestrator.dispatch(action({
+      type: "task.start",
+      actorEmployeeId: "developer-a",
+      taskId: "task-c"
+    }));
+    expect(tasks.get("task-c").status).toBe("ready");
+    const capacityApproval = store.listEvents(0).filter(
+      (event) => event.type === "user.approval.requested"
+        && event.taskId === "task-c"
+    ).at(-1);
+    expect(capacityApproval?.payload).toMatchObject({
+      reason: "max_parallel_tasks",
+      operation: "start task task-c",
+      impact: expect.any(String),
+      alternatives: expect.any(Array),
+      consequenceOfNonApproval: expect.any(String),
+      question: expect.any(String),
+      options: expect.any(Array)
+    });
+
+    tasks.transition("task-a", "failed", "developer-a");
+    await expect(orchestrator.dispatch(action({
+      type: "task.start",
+      actorEmployeeId: "leader",
+      taskId: "task-c"
+    }))).rejects.toThrow("task owner required");
+    expect(tasks.get("task-c").status).toBe("ready");
+  });
+
+  it("leaves rejected review work ready when running capacity is full", async () => {
+    const { orchestrator, tasks } = createHarness();
+    await orchestrator.start({});
+    for (const [taskId, owner] of [
+      ["task-a", "developer-a"],
+      ["task-b", "developer-b"]
+    ] as const) {
+      await orchestrator.dispatch(proposeAction(taskId));
+      tasks.assign(taskId, owner);
+      tasks.transition(taskId, "running", owner);
+    }
+    await orchestrator.dispatch(proposeAction("task-c"));
+    tasks.assign("task-c", "developer-a");
+    tasks.transition("task-c", "running", "developer-a");
+    tasks.submit("task-c", "developer-a", ["artifact:c"], ["evidence:c"]);
+
+    await orchestrator.dispatch(action({
+      type: "task.reject",
+      actorEmployeeId: "reviewer",
+      taskId: "task-c",
+      payload: { findings: ["fix it"] }
+    }));
+    expect(tasks.get("task-c").status).toBe("ready");
+    expect(tasks.list().filter((task) => task.status === "running")).toHaveLength(2);
+  });
 });
 
 describe("SessionManager", () => {
@@ -471,5 +636,86 @@ describe("SessionManager", () => {
       "leader"
     ]);
     expect(store.listSessions("company-1")).toEqual([]);
+  });
+
+  it("serializes resume before a queued send and fetches the replacement handle", async () => {
+    const { adapter, company, sessions } = createHarness();
+    await sessions.startAll(company, {});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    const firstHandle = sessions.get(employee.id);
+    const message = (messageId: string): AgentMessage => ({
+      messageId,
+      employeeId: employee.id,
+      taskId: "task-a",
+      text: "work",
+      actionRequest: null
+    });
+    const collect = async (events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> => {
+      const result: AgentEvent[] = [];
+      for await (const event of events) result.push(event);
+      return result;
+    };
+
+    const first = collect(sessions.send(employee, message("message-1")));
+    await adapter.waitForPending(employee.id);
+    const resume = sessions.resumeOne(employee, {
+      employeeId: employee.id,
+      handle: firstHandle,
+      activeTaskId: "task-a",
+      handoff: "continue task-a"
+    });
+    const second = collect(sessions.send(employee, message("message-2")));
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+    expect(adapter.resumedEmployees).toEqual([]);
+
+    await adapter.complete(employee.id, submitAction("task-a", employee.id));
+    await first;
+    const resumed = await resume;
+    await adapter.waitForPending(employee.id);
+    await adapter.complete(employee.id, submitAction("task-a", employee.id));
+    await second;
+
+    expect(adapter.sentSessionIds.slice(-2)).toEqual([
+      firstHandle.internalSessionId,
+      resumed.internalSessionId
+    ]);
+  });
+
+  it("rolls back every started handle when session persistence fails", async () => {
+    const { adapter, company, sessions, store } = createHarness(
+      new FailingPersistenceStore(":memory:")
+    );
+
+    await expect(sessions.startAll(company, {}))
+      .rejects.toThrow("injected session persistence failure");
+    expect(adapter.stoppedEmployees).toEqual([
+      "reviewer",
+      "developer-b",
+      "developer-a",
+      "leader"
+    ]);
+    expect(store.listSessions("company-1")).toEqual([]);
+  });
+
+  it("attempts every reverse-order stop and aggregates failures", async () => {
+    const { adapter, company, sessions, store } = createHarness();
+    await sessions.startAll(company, {});
+    adapter.failStopEmployeeIds.add("reviewer");
+    adapter.failStopEmployeeIds.add("developer-a");
+
+    await expect(sessions.stopAll()).rejects.toThrow(/reviewer.*developer-a/u);
+    expect(adapter.stoppedEmployees).toEqual([
+      "reviewer",
+      "developer-b",
+      "developer-a",
+      "leader"
+    ]);
+    expect(store.listSessions("company-1").every(
+      (session) => session.status === "stopped"
+    )).toBe(true);
+    for (const employee of company.employees) {
+      expect(() => sessions.get(employee.id)).toThrow("session not started");
+    }
   });
 });

@@ -134,7 +134,17 @@ export class CompanyOrchestrator {
         this.#taskMessage(task, employee)
       )) {
         if (event.type === "action.proposed") {
-          await this.dispatch(event.action);
+          try {
+            this.#assertProposalTask(event.action, taskId);
+            await this.dispatch(event.action);
+          } catch (error) {
+            failed = true;
+            this.#recordEvent("action.rejected", "core", taskId, {
+              actionId: event.action.actionId,
+              reason: this.#errorMessage(error)
+            });
+            break;
+          }
         } else if (event.type === "adapter.error" || event.type === "session.exited") {
           failed = true;
           break;
@@ -163,6 +173,10 @@ export class CompanyOrchestrator {
         );
         return;
       }
+      if (!this.#hasRunningCapacity()) {
+        this.#recordCapacityApproval(taskId, employee.id);
+        return;
+      }
 
       const checkpoint = {
         employeeId: employee.id,
@@ -174,6 +188,10 @@ export class CompanyOrchestrator {
         await this.sessions.resumeOne(employee, checkpoint);
       } catch {
         await this.sessions.rebuildOne(employee, checkpoint.handoff);
+      }
+      if (!this.#hasRunningCapacity()) {
+        this.#recordCapacityApproval(taskId, employee.id);
+        return;
       }
       this.tasks.transition(taskId, "running", employee.id);
     }
@@ -190,9 +208,26 @@ export class CompanyOrchestrator {
       actionRequest: null
     })) {
       if (event.type === "action.proposed") {
-        decisionReceived = event.action.type === "task.approve"
-          || event.action.type === "task.reject";
-        await this.dispatch(event.action);
+        try {
+          if (event.action.type !== "task.approve" && event.action.type !== "task.reject") {
+            throw new Error("reviewer must propose task.approve or task.reject");
+          }
+          this.#assertProposalTask(event.action, taskId);
+          await this.dispatch(event.action);
+          decisionReceived = true;
+        } catch (error) {
+          this.#recordApprovalRequest(
+            taskId,
+            this.leaderId,
+            "reviewer_invalid_decision",
+            {
+              reviewerId: reviewer.id,
+              decisionActionId: event.action.actionId,
+              error: this.#errorMessage(error)
+            }
+          );
+          return;
+        }
       } else if (event.type === "adapter.error" || event.type === "session.exited") {
         this.#recordApprovalRequest(
           taskId,
@@ -238,23 +273,11 @@ export class CompanyOrchestrator {
     const taskId = requiredTaskId(action);
     const assignee = requiredString(action.payload.assignee, "assignee");
     const assigned = this.tasks.assign(taskId, assignee);
-    const runningCount = this.tasks.list().filter(
-      (task) => task.status === "running"
-    ).length;
-    if (runningCount >= this.company.limits.maxParallelTasks) {
-      this.#recordApprovalRequest(taskId, this.leaderId, "max_parallel_tasks", {
-        assignee,
-        maxParallelTasks: this.company.limits.maxParallelTasks
-      });
-      return;
-    }
-
-    this.tasks.transition(taskId, "running", assignee);
-    this.#startInFlight(taskId);
-    await Promise.resolve();
     if (assigned.ownerEmployeeId !== assignee) {
       throw new Error(`task owner mismatch: ${taskId}`);
     }
+    this.#startReadyTask(taskId, assignee);
+    await Promise.resolve();
   }
 
   async #recordSubmissionAndRequestReview(action: ActionProposal): Promise<void> {
@@ -285,8 +308,7 @@ export class CompanyOrchestrator {
     }
     const ownerId = rejected.ownerEmployeeId;
     if (ownerId === null) throw new Error(`task has no owner: ${taskId}`);
-    this.tasks.transition(taskId, "running", ownerId);
-    this.#startInFlight(taskId);
+    this.#startReadyTask(taskId, ownerId);
   }
 
   async #applySupportedControlAction(action: ActionProposal): Promise<void> {
@@ -294,8 +316,10 @@ export class CompanyOrchestrator {
       case "task.start": {
         const task = this.tasks.get(requiredTaskId(action));
         if (task.ownerEmployeeId === null) throw new Error(`task has no owner: ${task.id}`);
-        this.tasks.transition(task.id, "running", task.ownerEmployeeId);
-        this.#startInFlight(task.id);
+        if (task.ownerEmployeeId !== action.actorEmployeeId) {
+          throw new Error("task owner required");
+        }
+        this.#startReadyTask(task.id, action.actorEmployeeId);
         return;
       }
       case "task.request_review":
@@ -367,6 +391,35 @@ export class CompanyOrchestrator {
     this.#inFlight.set(taskId, tracked);
   }
 
+  #startReadyTask(taskId: string, actorId: string): boolean {
+    if (!this.#hasRunningCapacity()) {
+      this.#recordCapacityApproval(taskId, actorId);
+      return false;
+    }
+    this.tasks.transition(taskId, "running", actorId);
+    this.#startInFlight(taskId);
+    return true;
+  }
+
+  #hasRunningCapacity(): boolean {
+    return this.tasks.list().filter(
+      (task) => task.status === "running"
+    ).length < this.company.limits.maxParallelTasks;
+  }
+
+  #recordCapacityApproval(taskId: string, actorId: string): void {
+    this.#recordApprovalRequest(taskId, this.leaderId, "max_parallel_tasks", {
+      assignee: actorId,
+      maxParallelTasks: this.company.limits.maxParallelTasks,
+      operation: `start task ${taskId}`,
+      impact: "Starting this task would exceed the configured parallel task limit.",
+      alternatives: ["wait_for_capacity", "raise_parallel_limit"],
+      consequenceOfNonApproval: "The task remains ready until capacity becomes available.",
+      question: `How should AgentTown handle ${taskId} while all task slots are occupied?`,
+      options: ["wait_for_capacity", "raise_parallel_limit"]
+    });
+  }
+
   #taskOwner(task: TaskRecord): EmployeeDefinition {
     if (task.ownerEmployeeId === null) throw new Error(`task has no owner: ${task.id}`);
     return this.#employee(task.ownerEmployeeId);
@@ -397,10 +450,50 @@ export class CompanyOrchestrator {
     reason: string,
     payload: Record<string, unknown>
   ): void {
+    const options = this.#nonEmptyStrings(payload.options)
+      ?? ["approve_operation", "choose_alternative"];
+    const alternatives = this.#nonEmptyStrings(payload.alternatives) ?? [...options];
     this.#recordEvent("user.approval.requested", actorId, taskId, {
       ...payload,
-      reason
+      reason,
+      operation: this.#nonEmptyString(payload.operation)
+        ?? `resolve ${reason}${taskId === null ? "" : ` for ${taskId}`}`,
+      impact: this.#nonEmptyString(payload.impact)
+        ?? "AgentTown cannot safely continue this operation without a user decision.",
+      alternatives,
+      consequenceOfNonApproval: this.#nonEmptyString(payload.consequenceOfNonApproval)
+        ?? "Work remains paused or blocked at this decision point.",
+      question: this.#nonEmptyString(payload.question)
+        ?? `How should AgentTown resolve ${reason.replaceAll("_", " ")}?`,
+      options
     });
+  }
+
+  #assertProposalTask(action: ActionProposal, expectedTaskId: string): void {
+    if (action.taskId !== expectedTaskId) {
+      throw new Error(
+        `proposal task mismatch: expected ${expectedTaskId}, received ${String(action.taskId)}`
+      );
+    }
+  }
+
+  #nonEmptyString(value: unknown): string | null {
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  #nonEmptyStrings(value: unknown): string[] | null {
+    if (
+      !Array.isArray(value)
+      || value.length === 0
+      || value.some((item) => typeof item !== "string" || item.length === 0)
+    ) {
+      return null;
+    }
+    return [...value] as string[];
+  }
+
+  #errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   #recordEvent(

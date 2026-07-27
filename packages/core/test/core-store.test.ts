@@ -89,4 +89,57 @@ describe("CoreStore", () => {
       store.close();
     }
   });
+
+  it("rolls back a session fact when its event insert fails", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: {
+        id: "company-created",
+        type: "company.created",
+        actorId: "owner",
+        payload: {},
+        causationEventId: null,
+        taskId: null
+      }
+    });
+    const handle = {
+      employeeId: "developer",
+      adapter: "fake",
+      internalSessionId: "session-1",
+      nativeSessionId: "native-1"
+    };
+    const sessionEvent = {
+      id: "duplicate-session-event",
+      type: "session.started",
+      actorId: "developer",
+      payload: { handle },
+      causationEventId: null,
+      taskId: null
+    };
+
+    store.putSession("company-1", "developer", handle, "running", sessionEvent);
+    expect(() => store.putSession(
+      "company-1",
+      "developer",
+      handle,
+      "error",
+      sessionEvent
+    )).toThrow();
+
+    expect(store.listSessions("company-1")).toEqual([{
+      employeeId: "developer",
+      handle,
+      status: "running"
+    }]);
+    expect(store.listEvents(0).map((event) => event.type)).toEqual([
+      "company.created",
+      "session.started"
+    ]);
+    store.close();
+  });
 });
