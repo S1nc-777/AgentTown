@@ -7,7 +7,10 @@ import type {
   EmployeeDefinition,
   TaskRecord
 } from "@agenttown/runtime-contract";
-import { SessionManager } from "../agents/session-manager.js";
+import {
+  SessionManager,
+  SessionReplacementCleanupError
+} from "../agents/session-manager.js";
 import { ActionPolicy } from "../policy/action-policy.js";
 import { CoreStore } from "../storage/core-store.js";
 import { TaskService } from "../tasks/task-service.js";
@@ -129,26 +132,33 @@ export class CompanyOrchestrator {
       const employee = this.#taskOwner(task);
       let failed = false;
 
-      for await (const event of this.sessions.send(
-        employee,
-        this.#taskMessage(task, employee)
-      )) {
-        if (event.type === "action.proposed") {
-          try {
-            this.#assertProposalTask(event.action, taskId);
-            await this.dispatch(event.action);
-          } catch (error) {
+      try {
+        for await (const event of this.sessions.send(
+          employee,
+          this.#taskMessage(task, employee)
+        )) {
+          if (event.type === "action.proposed") {
+            try {
+              this.#assertProposalTask(event.action, taskId);
+              await this.dispatch(event.action);
+            } catch (error) {
+              failed = true;
+              this.#recordEvent("action.rejected", "core", taskId, {
+                actionId: event.action.actionId,
+                reason: this.#errorMessage(error)
+              });
+              break;
+            }
+          } else if (event.type === "adapter.error" || event.type === "session.exited") {
             failed = true;
-            this.#recordEvent("action.rejected", "core", taskId, {
-              actionId: event.action.actionId,
-              reason: this.#errorMessage(error)
-            });
             break;
           }
-        } else if (event.type === "adapter.error" || event.type === "session.exited") {
-          failed = true;
-          break;
         }
+      } catch (error) {
+        failed = true;
+        this.#recordEvent("task.execution_error", employee.id, taskId, {
+          reason: this.#errorMessage(error)
+        });
       }
 
       const current = this.tasks.get(taskId);
@@ -186,8 +196,27 @@ export class CompanyOrchestrator {
       };
       try {
         await this.sessions.resumeOne(employee, checkpoint);
-      } catch {
-        await this.sessions.rebuildOne(employee, checkpoint.handoff);
+      } catch (resumeError) {
+        if (resumeError instanceof SessionReplacementCleanupError) {
+          this.#recordApprovalRequest(
+            taskId,
+            this.leaderId,
+            "session_replacement_cleanup_failed",
+            { employeeId: employee.id, error: this.#errorMessage(resumeError) }
+          );
+          return;
+        }
+        try {
+          await this.sessions.rebuildOne(employee, checkpoint.handoff);
+        } catch (rebuildError) {
+          this.#recordApprovalRequest(
+            taskId,
+            this.leaderId,
+            "session_recovery_failed",
+            { employeeId: employee.id, error: this.#errorMessage(rebuildError) }
+          );
+          return;
+        }
       }
       if (!this.#hasRunningCapacity()) {
         this.#recordCapacityApproval(taskId, employee.id);

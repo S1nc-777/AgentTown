@@ -53,7 +53,10 @@ class ScriptedAdapter implements AgentAdapter {
   readonly stoppedEmployees: string[] = [];
   readonly resumedEmployees: string[] = [];
   readonly sentSessionIds: string[] = [];
+  readonly sentTaskIds: Array<string | null> = [];
+  readonly stoppedSessionIds: string[] = [];
   readonly failStopEmployeeIds = new Set<string>();
+  readonly #sendFailuresRemaining = new Map<string, number>();
   activeSends = 0;
   maximumReviewerConcurrency = 0;
   failStartEmployeeId: string | null = null;
@@ -82,6 +85,7 @@ class ScriptedAdapter implements AgentAdapter {
     message: AgentMessage
   ): AsyncIterable<AgentEvent> {
     this.sentSessionIds.push(session.internalSessionId);
+    this.sentTaskIds.push(message.taskId);
     this.activeSends += 1;
     const employeeActive = (this.#activeByEmployee.get(session.employeeId) ?? 0) + 1;
     this.#activeByEmployee.set(session.employeeId, employeeActive);
@@ -93,6 +97,11 @@ class ScriptedAdapter implements AgentAdapter {
     }
 
     try {
+      const failuresRemaining = this.#sendFailuresRemaining.get(session.employeeId) ?? 0;
+      if (failuresRemaining > 0) {
+        this.#sendFailuresRemaining.set(session.employeeId, failuresRemaining - 1);
+        throw new Error(`send failed: ${session.employeeId}`);
+      }
       const events = await new Promise<AgentEvent[]>((resolvePromise) => {
         const queue = this.#pending.get(session.employeeId) ?? [];
         queue.push({ message, resolve: resolvePromise });
@@ -117,6 +126,7 @@ class ScriptedAdapter implements AgentAdapter {
 
   async stop(session: SessionHandle): Promise<void> {
     this.stoppedEmployees.push(session.employeeId);
+    this.stoppedSessionIds.push(session.internalSessionId);
     if (this.failStopEmployeeIds.has(session.employeeId)) {
       throw new Error(`stop failed: ${session.employeeId}`);
     }
@@ -155,6 +165,10 @@ class ScriptedAdapter implements AgentAdapter {
       () => (this.#pending.get(employeeId)?.length ?? 0) > 0,
       `timed out waiting for ${employeeId}`
     );
+  }
+
+  failNextSends(employeeId: string, count: number): void {
+    this.#sendFailuresRemaining.set(employeeId, count);
   }
 
   nextTaskId(employeeId: string): string {
@@ -196,6 +210,35 @@ class FailingPersistenceStore extends CoreStore {
     super.putSession(companyId, employeeId, handle, status, event);
     this.#sessionWrites += 1;
     if (this.#sessionWrites === 2) throw new Error("injected session persistence failure");
+  }
+}
+
+class DuplicateLifecycleEventStore extends CoreStore {
+  #duplicateEventId: string | null = null;
+  #failNextSessionWrite = false;
+
+  armDuplicateSessionEvent(): void {
+    this.#failNextSessionWrite = true;
+  }
+
+  override putSession(
+    companyId: string,
+    employeeId: string,
+    handle: SessionHandle,
+    status: string,
+    event: NewEvent
+  ): void {
+    const duplicateEventId = this.#duplicateEventId;
+    if (this.#failNextSessionWrite && status === "running" && duplicateEventId !== null) {
+      this.#failNextSessionWrite = false;
+      super.putSession(companyId, employeeId, handle, status, {
+        ...event,
+        id: duplicateEventId
+      });
+      return;
+    }
+    super.putSession(companyId, employeeId, handle, status, event);
+    this.#duplicateEventId ??= event.id;
   }
 }
 
@@ -522,6 +565,69 @@ describe("CompanyOrchestrator", () => {
     )).toHaveLength(1);
   });
 
+  it("never sends queued work through an exited handle before recovery", async () => {
+    const { adapter, orchestrator, tasks } = createHarness();
+    await orchestrator.start({});
+    await orchestrator.dispatch(proposeAction("task-a"));
+    await orchestrator.dispatch(proposeAction("task-b"));
+    await orchestrator.dispatch(leaderAssigns("task-a", "developer-a"));
+    await adapter.waitForPending("developer-a");
+    await orchestrator.dispatch(leaderAssigns("task-b", "developer-a"));
+    const exitedSessionId = adapter.sentSessionIds[0];
+
+    await adapter.exit("developer-a");
+    await waitUntil(
+      () => adapter.sentSessionIds.length >= 2,
+      "no post-crash send reached the adapter"
+    );
+
+    expect(adapter.sentTaskIds.slice(0, 2)).toEqual(["task-a", "task-a"]);
+    expect(adapter.sentSessionIds[1]).not.toBe(exitedSessionId);
+    expect(tasks.get("task-b").retryCount).toBe(1);
+  });
+
+  it("retries async send exceptions once and then blocks with one approval", async () => {
+    const { adapter, orchestrator, store, tasks } = createHarness();
+    adapter.failNextSends("developer-a", 2);
+    await orchestrator.start({});
+    await orchestrator.dispatch(proposeAction("task-a"));
+    await orchestrator.dispatch(leaderAssigns("task-a", "developer-a"));
+
+    await waitUntil(() => tasks.get("task-a").status === "blocked", "task-a was stranded");
+    expect(tasks.get("task-a").retryCount).toBe(1);
+    expect(store.listEvents(0).filter(
+      (event) => event.type === "user.approval.requested"
+        && event.taskId === "task-a"
+    )).toHaveLength(1);
+  });
+
+  it("does not rebuild while a failed resumed replacement may still be alive", async () => {
+    const store = new DuplicateLifecycleEventStore(":memory:");
+    const { adapter, orchestrator } = createHarness(store);
+    await orchestrator.start({});
+    await orchestrator.dispatch(proposeAction("task-a"));
+    await orchestrator.dispatch(leaderAssigns("task-a", "developer-a"));
+    await adapter.waitForPending("developer-a");
+    store.armDuplicateSessionEvent();
+    adapter.failStopEmployeeIds.add("developer-a");
+
+    await adapter.exit("developer-a");
+    await waitUntil(
+      () => store.listEvents(0).some(
+        (event) => event.type === "user.approval.requested"
+          && event.payload.reason === "session_replacement_cleanup_failed"
+      ),
+      "replacement cleanup failure was not escalated"
+    );
+
+    expect(adapter.resumedEmployees).toEqual(["developer-a"]);
+    expect(adapter.stoppedSessionIds).toContain("developer-a-5");
+    expect(adapter.startedEmployees.filter(
+      (employeeId) => employeeId === "developer-a"
+    )).toHaveLength(1);
+    adapter.failStopEmployeeIds.clear();
+  });
+
   it("does not let a reviewer decision mutate a different task", async () => {
     const { adapter, orchestrator, store, tasks } = createHarness();
     await orchestrator.start({});
@@ -711,11 +817,59 @@ describe("SessionManager", () => {
       "developer-a",
       "leader"
     ]);
-    expect(store.listSessions("company-1").every(
-      (session) => session.status === "stopped"
-    )).toBe(true);
-    for (const employee of company.employees) {
-      expect(() => sessions.get(employee.id)).toThrow("session not started");
-    }
+    expect(store.listSessions("company-1")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ employeeId: "reviewer", status: "running" }),
+      expect.objectContaining({ employeeId: "developer-a", status: "running" }),
+      expect.objectContaining({ employeeId: "developer-b", status: "stopped" }),
+      expect.objectContaining({ employeeId: "leader", status: "stopped" })
+    ]));
+    expect(sessions.get("reviewer").employeeId).toBe("reviewer");
+    expect(sessions.get("developer-a").employeeId).toBe("developer-a");
+    expect(() => sessions.get("developer-b")).toThrow("session not started");
+    expect(() => sessions.get("leader")).toThrow("session not started");
+    adapter.failStopEmployeeIds.clear();
+  });
+
+  it("stops a resumed replacement when its atomic lifecycle write fails", async () => {
+    const store = new DuplicateLifecycleEventStore(":memory:");
+    const { adapter, company, sessions } = createHarness(store);
+    await sessions.startAll(company, {});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    const previous = sessions.get(employee.id);
+    store.armDuplicateSessionEvent();
+
+    await expect(sessions.resumeOne(employee, {
+      employeeId: employee.id,
+      handle: previous,
+      activeTaskId: "task-a",
+      handoff: "recover"
+    })).rejects.toThrow();
+
+    const replacementId = `${employee.id}-5`;
+    expect(adapter.stoppedSessionIds).toContain(replacementId);
+    expect(sessions.get(employee.id)).toEqual(previous);
+    expect(store.listSessions("company-1").find(
+      (session) => session.employeeId === employee.id
+    )?.handle).toEqual(previous);
+  });
+
+  it("stops a rebuilt replacement when its atomic lifecycle write fails", async () => {
+    const store = new DuplicateLifecycleEventStore(":memory:");
+    const { adapter, company, sessions } = createHarness(store);
+    await sessions.startAll(company, {});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    const previous = sessions.get(employee.id);
+    store.armDuplicateSessionEvent();
+
+    await expect(sessions.rebuildOne(employee, "recover")).rejects.toThrow();
+
+    const replacementId = `${employee.id}-5`;
+    expect(adapter.stoppedSessionIds).toContain(replacementId);
+    expect(sessions.get(employee.id)).toEqual(previous);
+    expect(store.listSessions("company-1").find(
+      (session) => session.employeeId === employee.id
+    )?.handle).toEqual(previous);
   });
 });

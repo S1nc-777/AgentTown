@@ -10,8 +10,19 @@ import type {
 } from "@agenttown/runtime-contract";
 import { CoreStore, type NewEvent } from "../storage/core-store.js";
 
+export class SessionReplacementCleanupError extends AggregateError {
+  constructor(persistenceError: unknown, stopError: unknown) {
+    super(
+      [persistenceError, stopError],
+      "replacement session persistence failed and cleanup stop also failed"
+    );
+    this.name = "SessionReplacementCleanupError";
+  }
+}
+
 export class SessionManager {
   readonly #sessions = new Map<string, SessionHandle>();
+  readonly #unavailableEmployees = new Set<string>();
   readonly #sendTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -61,11 +72,13 @@ export class SessionManager {
           })
         );
         this.#sessions.set(employee.id, result.value);
+        this.#unavailableEmployees.delete(employee.id);
       }
     } catch (error) {
       await this.#stopStartedHandles(company, results);
       for (const employee of company.employees) {
         this.#sessions.delete(employee.id);
+        this.#unavailableEmployees.delete(employee.id);
         try {
           this.store.deleteSession(
             this.companyId,
@@ -96,6 +109,9 @@ export class SessionManager {
     const release = await this.#acquire(employee.id);
     try {
       const session = this.get(employee.id);
+      if (this.#unavailableEmployees.has(employee.id)) {
+        throw new Error(`session unavailable: ${employee.id}`);
+      }
       for await (const event of this.adapterFor(employee.agent).send(session, message)) {
         if (event.type === "usage.updated") {
           const usage = {
@@ -117,6 +133,7 @@ export class SessionManager {
             }
           });
         } else if (event.type === "session.exited") {
+          this.#unavailableEmployees.add(employee.id);
           this.store.putSession(
             this.companyId,
             employee.id,
@@ -125,6 +142,7 @@ export class SessionManager {
             this.#agentEvent(employee.id, message, event)
           );
         } else if (event.type === "adapter.error") {
+          this.#unavailableEmployees.add(employee.id);
           this.store.putSession(
             this.companyId,
             employee.id,
@@ -165,11 +183,14 @@ export class SessionManager {
     const entries = [...this.#sessions.entries()].reverse();
     const errors: Error[] = [];
     for (const [employeeId, session] of entries) {
+      let adapterStopped = false;
       try {
         await this.adapterFor(this.#employeeAdapterName(session)).stop(session);
+        adapterStopped = true;
       } catch (error) {
         errors.push(new Error(`${employeeId}: ${this.#errorMessage(error)}`));
       }
+      if (!adapterStopped) continue;
       try {
         this.store.putSession(
           this.companyId,
@@ -178,10 +199,10 @@ export class SessionManager {
           "stopped",
           this.#newEvent("session.stopped", employeeId, null, {})
         );
+        this.#sessions.delete(employeeId);
+        this.#unavailableEmployees.delete(employeeId);
       } catch (error) {
         errors.push(new Error(`${employeeId} persistence: ${this.#errorMessage(error)}`));
-      } finally {
-        this.#sessions.delete(employeeId);
       }
     }
     if (errors.length > 0) {
@@ -209,17 +230,14 @@ export class SessionManager {
         previous: checkpoint.handle,
         handoff: checkpoint.handoff
       });
-      this.store.putSession(
-        this.companyId,
-        employee.id,
+      await this.#persistReplacement(
+        employee,
         handle,
-        "running",
         this.#newEvent("session.started", employee.id, checkpoint.activeTaskId, {
           handle,
           resumed: true
         })
       );
-      this.#sessions.set(employee.id, handle);
       return handle;
     } finally {
       release();
@@ -238,18 +256,15 @@ export class SessionManager {
         projectRoot: this.projectRoot,
         scenario: "idle"
       });
-      this.store.putSession(
-        this.companyId,
-        employee.id,
+      await this.#persistReplacement(
+        employee,
         handle,
-        "running",
         this.#newEvent("session.started", employee.id, null, {
           handle,
           rebuilt: true,
           handoff
         })
       );
-      this.#sessions.set(employee.id, handle);
       return handle;
     } finally {
       release();
@@ -348,6 +363,31 @@ export class SessionManager {
         // Rollback is best effort, but every successfully started handle is attempted.
       }
     }
+  }
+
+  async #persistReplacement(
+    employee: EmployeeDefinition,
+    handle: SessionHandle,
+    event: NewEvent
+  ): Promise<void> {
+    try {
+      this.store.putSession(
+        this.companyId,
+        employee.id,
+        handle,
+        "running",
+        event
+      );
+    } catch (persistenceError) {
+      try {
+        await this.adapterFor(employee.agent).stop(handle);
+      } catch (stopError) {
+        throw new SessionReplacementCleanupError(persistenceError, stopError);
+      }
+      throw persistenceError;
+    }
+    this.#sessions.set(employee.id, handle);
+    this.#unavailableEmployees.delete(employee.id);
   }
 
   #errorMessage(error: unknown): string {
