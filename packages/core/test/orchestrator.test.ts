@@ -603,7 +603,7 @@ describe("CompanyOrchestrator", () => {
 
   it("does not rebuild while a failed resumed replacement may still be alive", async () => {
     const store = new DuplicateLifecycleEventStore(":memory:");
-    const { adapter, orchestrator } = createHarness(store);
+    const { adapter, orchestrator, sessions } = createHarness(store);
     await orchestrator.start({});
     await orchestrator.dispatch(proposeAction("task-a"));
     await orchestrator.dispatch(leaderAssigns("task-a", "developer-a"));
@@ -626,6 +626,13 @@ describe("CompanyOrchestrator", () => {
       (employeeId) => employeeId === "developer-a"
     )).toHaveLength(1);
     adapter.failStopEmployeeIds.clear();
+    await sessions.stopAll();
+    expect(adapter.stoppedSessionIds.filter(
+      (sessionId) => sessionId === "developer-a-5"
+    )).toHaveLength(2);
+    expect(store.listSessions("company-1").some(
+      (session) => session.handle.internalSessionId === "developer-a-5"
+    )).toBe(false);
   });
 
   it("does not let a reviewer decision mutate a different task", async () => {
@@ -741,6 +748,46 @@ describe("SessionManager", () => {
       "developer-a",
       "leader"
     ]);
+    expect(store.listSessions("company-1")).toEqual([]);
+  });
+
+  it("retains a failed partial-start cleanup handle for a later stopAll retry", async () => {
+    const { adapter, company, sessions, store } = createHarness();
+    adapter.failStartEmployeeId = "reviewer";
+    adapter.failStopEmployeeIds.add("developer-b");
+
+    await expect(sessions.startAll(company, {})).rejects.toThrow("reviewer");
+    expect(store.listSessions("company-1")).toEqual([]);
+    expect(adapter.stoppedSessionIds.filter(
+      (sessionId) => sessionId === "developer-b-3"
+    )).toHaveLength(1);
+
+    adapter.failStopEmployeeIds.clear();
+    await sessions.stopAll();
+    expect(adapter.stoppedSessionIds.filter(
+      (sessionId) => sessionId === "developer-b-3"
+    )).toHaveLength(2);
+    expect(store.listSessions("company-1")).toEqual([]);
+  });
+
+  it("retains a failed persistence-rollback handle for a later stopAll retry", async () => {
+    const { adapter, company, sessions, store } = createHarness(
+      new FailingPersistenceStore(":memory:")
+    );
+    adapter.failStopEmployeeIds.add("reviewer");
+
+    await expect(sessions.startAll(company, {}))
+      .rejects.toThrow("injected session persistence failure");
+    expect(store.listSessions("company-1")).toEqual([]);
+    expect(adapter.stoppedSessionIds.filter(
+      (sessionId) => sessionId === "reviewer-4"
+    )).toHaveLength(1);
+
+    adapter.failStopEmployeeIds.clear();
+    await sessions.stopAll();
+    expect(adapter.stoppedSessionIds.filter(
+      (sessionId) => sessionId === "reviewer-4"
+    )).toHaveLength(2);
     expect(store.listSessions("company-1")).toEqual([]);
   });
 
@@ -871,5 +918,41 @@ describe("SessionManager", () => {
     expect(store.listSessions("company-1").find(
       (session) => session.employeeId === employee.id
     )?.handle).toEqual(previous);
+  });
+
+  it("retains multiple cleanup-only handles and retries them in reverse start order", async () => {
+    const store = new DuplicateLifecycleEventStore(":memory:");
+    const { adapter, company, sessions } = createHarness(store);
+    await sessions.startAll(company, {});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    const previous = sessions.get(employee.id);
+    adapter.failStopEmployeeIds.add(employee.id);
+
+    for (const suffix of ["first", "second"]) {
+      store.armDuplicateSessionEvent();
+      await expect(sessions.resumeOne(employee, {
+        employeeId: employee.id,
+        handle: previous,
+        activeTaskId: "task-a",
+        handoff: suffix
+      })).rejects.toThrow("cleanup stop also failed");
+    }
+
+    adapter.failStopEmployeeIds.clear();
+    await sessions.stopAll();
+    expect(adapter.stoppedSessionIds.slice(-6)).toEqual([
+      "developer-a-6",
+      "developer-a-5",
+      "reviewer-4",
+      "developer-b-3",
+      "developer-a-2",
+      "leader-1"
+    ]);
+    expect(store.listSessions("company-1").some(
+      (session) => ["developer-a-5", "developer-a-6"].includes(
+        session.handle.internalSessionId
+      )
+    )).toBe(false);
   });
 });

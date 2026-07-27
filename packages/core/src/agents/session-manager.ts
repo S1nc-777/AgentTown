@@ -24,6 +24,12 @@ export class SessionManager {
   readonly #sessions = new Map<string, SessionHandle>();
   readonly #unavailableEmployees = new Set<string>();
   readonly #sendTails = new Map<string, Promise<void>>();
+  readonly #cleanupHandles = new Map<string, {
+    handle: SessionHandle;
+    order: number;
+  }>();
+  readonly #handleOrders = new Map<string, number>();
+  #nextHandleOrder = 0;
 
   constructor(
     private readonly adapterFor: (agentName: string) => AgentAdapter,
@@ -46,6 +52,9 @@ export class SessionManager {
       })
     );
     const results = await Promise.allSettled(starts);
+    for (const result of results) {
+      if (result.status === "fulfilled") this.#registerHandle(result.value);
+    }
     const failedEmployeeIds = results.flatMap((result, index) =>
       result.status === "rejected" ? [company.employees[index]?.id ?? `index-${index}`] : []
     );
@@ -180,27 +189,67 @@ export class SessionManager {
   }
 
   async stopAll(): Promise<void> {
-    const entries = [...this.#sessions.entries()].reverse();
+    const candidates = new Map<string, {
+      employeeId: string;
+      handle: SessionHandle;
+      active: boolean;
+      order: number;
+    }>();
+    for (const [employeeId, handle] of this.#sessions) {
+      const key = this.#handleKey(handle);
+      candidates.set(key, {
+        employeeId,
+        handle,
+        active: true,
+        order: this.#registerHandle(handle)
+      });
+    }
+    for (const [key, cleanup] of this.#cleanupHandles) {
+      if (candidates.has(key)) continue;
+      candidates.set(key, {
+        employeeId: cleanup.handle.employeeId,
+        handle: cleanup.handle,
+        active: false,
+        order: cleanup.order
+      });
+    }
+    const entries = [...candidates.entries()].sort(
+      ([, left], [, right]) => right.order - left.order
+    );
     const errors: Error[] = [];
-    for (const [employeeId, session] of entries) {
+    for (const [key, candidate] of entries) {
+      const { employeeId, handle, active } = candidate;
       let adapterStopped = false;
       try {
-        await this.adapterFor(this.#employeeAdapterName(session)).stop(session);
+        await this.adapterFor(this.#employeeAdapterName(handle)).stop(handle);
         adapterStopped = true;
       } catch (error) {
         errors.push(new Error(`${employeeId}: ${this.#errorMessage(error)}`));
       }
       if (!adapterStopped) continue;
+      if (!active) {
+        this.#cleanupHandles.delete(key);
+        this.#handleOrders.delete(key);
+        continue;
+      }
       try {
         this.store.putSession(
           this.companyId,
           employeeId,
-          session,
+          handle,
           "stopped",
           this.#newEvent("session.stopped", employeeId, null, {})
         );
-        this.#sessions.delete(employeeId);
+        const activeHandle = this.#sessions.get(employeeId);
+        if (
+          activeHandle !== undefined
+          && this.#handleKey(activeHandle) === key
+        ) {
+          this.#sessions.delete(employeeId);
+        }
         this.#unavailableEmployees.delete(employeeId);
+        this.#cleanupHandles.delete(key);
+        this.#handleOrders.delete(key);
       } catch (error) {
         errors.push(new Error(`${employeeId} persistence: ${this.#errorMessage(error)}`));
       }
@@ -230,6 +279,7 @@ export class SessionManager {
         previous: checkpoint.handle,
         handoff: checkpoint.handoff
       });
+      this.#registerHandle(handle);
       await this.#persistReplacement(
         employee,
         handle,
@@ -256,6 +306,7 @@ export class SessionManager {
         projectRoot: this.projectRoot,
         scenario: "idle"
       });
+      this.#registerHandle(handle);
       await this.#persistReplacement(
         employee,
         handle,
@@ -359,8 +410,9 @@ export class SessionManager {
       if (result?.status !== "fulfilled" || employee === undefined) continue;
       try {
         await this.adapterFor(employee.agent).stop(result.value);
+        this.#forgetHandle(result.value);
       } catch {
-        // Rollback is best effort, but every successfully started handle is attempted.
+        this.#retainForCleanup(result.value);
       }
     }
   }
@@ -381,13 +433,50 @@ export class SessionManager {
     } catch (persistenceError) {
       try {
         await this.adapterFor(employee.agent).stop(handle);
+        this.#forgetHandle(handle);
       } catch (stopError) {
+        this.#retainForCleanup(handle);
         throw new SessionReplacementCleanupError(persistenceError, stopError);
       }
       throw persistenceError;
     }
+    const previous = this.#sessions.get(employee.id);
     this.#sessions.set(employee.id, handle);
     this.#unavailableEmployees.delete(employee.id);
+    if (previous !== undefined && this.#handleKey(previous) !== this.#handleKey(handle)) {
+      this.#forgetHandle(previous);
+    }
+  }
+
+  #registerHandle(handle: SessionHandle): number {
+    const key = this.#handleKey(handle);
+    const existing = this.#handleOrders.get(key);
+    if (existing !== undefined) return existing;
+    this.#nextHandleOrder += 1;
+    this.#handleOrders.set(key, this.#nextHandleOrder);
+    return this.#nextHandleOrder;
+  }
+
+  #retainForCleanup(handle: SessionHandle): void {
+    const key = this.#handleKey(handle);
+    this.#cleanupHandles.set(key, {
+      handle,
+      order: this.#registerHandle(handle)
+    });
+  }
+
+  #forgetHandle(handle: SessionHandle): void {
+    const key = this.#handleKey(handle);
+    this.#cleanupHandles.delete(key);
+    this.#handleOrders.delete(key);
+  }
+
+  #handleKey(handle: SessionHandle): string {
+    return JSON.stringify([
+      handle.adapter,
+      handle.employeeId,
+      handle.internalSessionId
+    ]);
   }
 
   #errorMessage(error: unknown): string {
