@@ -12,3 +12,11 @@ export {
 export { SessionManager } from "./agents/session-manager.js";
 export { CompanyOrchestrator } from "./company/orchestrator.js";
 export { TaskService } from "./tasks/task-service.js";
+export {
+  LeaseRegistry,
+  type LeaseRegistryOptions
+} from "./ipc/lease-registry.js";
+export {
+  CoreServer,
+  type CoreServerOptions
+} from "./ipc/core-server.js";
