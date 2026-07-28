@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { CoreStore } from "../storage/core-store.js";
 
 export interface LeaseRegistryOptions {
@@ -10,6 +11,7 @@ export class LeaseRegistry {
   #hadLease = false;
   #pauseTriggered = false;
   #triggerInFlight: Promise<void> | null = null;
+  readonly #callbackContext = new AsyncLocalStorage<boolean>();
 
   constructor(
     private readonly store: CoreStore,
@@ -18,6 +20,10 @@ export class LeaseRegistry {
 
   initialize(): void {
     this.store.clearLeases();
+  }
+
+  get isInsideLastClientCallback(): boolean {
+    return this.#callbackContext.getStore() === true;
   }
 
   heartbeat(clientId: string): void {
@@ -52,7 +58,10 @@ export class LeaseRegistry {
     }
     this.#pauseTriggered = true;
     const trigger = Promise.resolve()
-      .then(() => this.options.onLastClientExpired())
+      .then(() => this.#callbackContext.run(
+        true,
+        () => this.options.onLastClientExpired()
+      ))
       .catch((error: unknown) => {
         this.#pauseTriggered = false;
         throw error;

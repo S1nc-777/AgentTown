@@ -232,6 +232,15 @@ class RecordingOrchestrator {
   }
 }
 
+class CountingCoreStore extends CoreStore {
+  getCompanyCalls = 0;
+
+  override getCompany(id: string): ReturnType<CoreStore["getCompany"]> {
+    this.getCompanyCalls += 1;
+    return super.getCompany(id);
+  }
+}
+
 class BlockingOrchestrator extends RecordingOrchestrator {
   readonly started: Promise<void>;
   #resolveStarted: (() => void) | undefined;
@@ -749,6 +758,59 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(store.countLeases()).toBe(2);
   });
 
+  it("returns invalid_params for a cached heartbeat invalid on this socket", async () => {
+    const { pipeName } = await createServer();
+    const first = await connectClient(pipeName);
+    const second = await connectClient(pipeName);
+    await first.handshake("cached-heartbeat-a");
+    await second.handshake("cached-heartbeat-b");
+    await expect(first.requestWithId(
+      "cached-local-heartbeat",
+      "client.heartbeat",
+      { clientId: "cached-heartbeat-a" }
+    )).resolves.toMatchObject({ ok: true });
+
+    await expect(second.requestWithId(
+      "cached-local-heartbeat",
+      "client.heartbeat",
+      { clientId: "cached-heartbeat-a" }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalid_params" }
+    });
+    await expect(second.request("company.status", {})).resolves.toMatchObject({
+      ok: true
+    });
+  });
+
+  it("returns invalid_params for a coalesced heartbeat invalid on this socket", async () => {
+    const { pipeName } = await createServer();
+    const first = await connectClient(pipeName);
+    const second = await connectClient(pipeName);
+    await first.handshake("pending-heartbeat-a");
+    await second.handshake("pending-heartbeat-b");
+
+    const accepted = first.requestWithId(
+      "pending-local-heartbeat",
+      "client.heartbeat",
+      { clientId: "pending-heartbeat-a" }
+    );
+    const rejected = second.requestWithId(
+      "pending-local-heartbeat",
+      "client.heartbeat",
+      { clientId: "pending-heartbeat-a" }
+    );
+
+    await expect(accepted).resolves.toMatchObject({ ok: true });
+    await expect(rejected).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalid_params" }
+    });
+    await expect(second.request("company.status", {})).resolves.toMatchObject({
+      ok: true
+    });
+  });
+
   it("rejects unsafe pipe names before binding and closes live sockets", async () => {
     const store = createStore();
     const unsafe = new CoreServer({
@@ -845,7 +907,7 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     orchestrator.release();
   });
 
-  it("closes a client when one outbound message exceeds its byte budget", async () => {
+  it("reports and closes when one streamed event exceeds its byte budget", async () => {
     const { pipeName, store } = await createServer({
       serverOptions: { maxOutboundQueuedBytes: 512 }
     });
@@ -862,7 +924,60 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
       payload: { padding: "x".repeat(1_024) }
     });
 
+    await expect(client.nextEvent()).resolves.toMatchObject({
+      type: "ipc.stream_error",
+      payload: { code: "event_too_large" }
+    });
     await expect(closed).resolves.toBeUndefined();
+  });
+
+  it("replays a bounded error when a request result is too large", async () => {
+    const store = new CountingCoreStore(":memory:");
+    store.initialize();
+    stores.push(store);
+    const definition = companyDefinitionFixture();
+    store.createCompany({
+      id: "large-company",
+      definition: {
+        ...definition,
+        company: {
+          ...definition.company,
+          mission: "x".repeat(1_024)
+        }
+      },
+      event: {
+        id: randomUUID(),
+        type: "company.created",
+        actorId: "owner",
+        taskId: null,
+        causationEventId: null,
+        payload: {}
+      }
+    });
+    const { pipeName } = await createServer({
+      store,
+      serverOptions: { maxOutboundQueuedBytes: 512 }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-large-response");
+
+    await expect(client.requestWithId(
+      "large-company-status",
+      "company.status",
+      { companyId: "large-company" }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "response_too_large" }
+    });
+    await expect(client.requestWithId(
+      "large-company-status",
+      "company.status",
+      { companyId: "large-company" }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "response_too_large" }
+    });
+    expect(store.getCompanyCalls).toBe(1);
   });
 
   it("rejects a request line above the configured limit", async () => {
@@ -888,7 +1003,7 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(orchestrator.starts).toHaveLength(0);
   });
 
-  it("does not retain completed responses above the cache byte budget", async () => {
+  it("does not repeat a mutation whose response exceeded the cache budget", async () => {
     const orchestrator = new RecordingOrchestrator();
     const { pipeName } = await createServer({
       orchestrator,
@@ -897,14 +1012,23 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     const client = await connectClient(pipeName);
     await client.handshake("client-cache-budget");
 
-    await client.requestWithId("evicted-start", "company.start", {
+    await expect(client.requestWithId("evicted-start", "company.start", {
       scenarios: { first: "scenario" }
+    })).resolves.toMatchObject({ ok: true });
+    await expect(client.requestWithId("evicted-start", "company.start", {
+      scenarios: { first: "scenario" }
+    })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "replay_unavailable" }
     });
-    await client.requestWithId("evicted-start", "company.start", {
-      scenarios: { first: "scenario" }
+    await expect(client.requestWithId("evicted-start", "company.start", {
+      scenarios: { conflicting: "scenario" }
+    })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "request_id_conflict" }
     });
 
-    expect(orchestrator.starts).toHaveLength(2);
+    expect(orchestrator.starts).toHaveLength(1);
   });
 
   it("awaits final lease cleanup before server close resolves", async () => {
@@ -935,6 +1059,69 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(closeSettled).toBe(false);
     release();
     await closing;
+  });
+
+  it("awaits final lease cleanup for an external graceful close", async () => {
+    const store = createStore();
+    let resolveStarted: () => void = () => undefined;
+    const callbackStarted = new Promise<void>((resolvePromise) => {
+      resolveStarted = resolvePromise;
+    });
+    let release: () => void = () => undefined;
+    const callbackGate = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    const leases = createLeases(store, async () => {
+      resolveStarted();
+      await callbackGate;
+    });
+    const { pipeName, server } = await createServer({ store, leases });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-graceful-cleanup");
+
+    let closeSettled = false;
+    const closing = server.closeAfterResponses().then(() => {
+      closeSettled = true;
+    });
+    await callbackStarted;
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    const settledBeforeCleanup = closeSettled;
+    release();
+    await closing;
+    expect(settledBeforeCleanup).toBe(false);
+  });
+
+  it("does not deadlock when final lease cleanup gracefully closes Core", async () => {
+    const store = createStore();
+    let server: CoreServer;
+    let callbackCalls = 0;
+    let resolveCallbackCompleted: () => void = () => undefined;
+    const callbackCompleted = new Promise<void>((resolvePromise) => {
+      resolveCallbackCompleted = resolvePromise;
+    });
+    const leases = createLeases(store, async () => {
+      callbackCalls += 1;
+      await server.closeAfterResponses();
+      resolveCallbackCompleted();
+    });
+    const created = await createServer({ store, leases });
+    server = created.server;
+    const client = await connectClient(created.pipeName);
+    await client.handshake("client-reentrant-close");
+
+    await client.close();
+    const completed = await Promise.race([
+      callbackCompleted.then(() => true),
+      new Promise<false>((resolvePromise) => {
+        setTimeout(() => resolvePromise(false), 250);
+      })
+    ]);
+
+    if (!completed) servers.splice(servers.indexOf(server), 1);
+    expect(completed).toBe(true);
+    expect(store.countLeases()).toBe(0);
+    expect(callbackCalls).toBe(1);
+    await server.close();
   });
 
   it("captures and reports periodic lease sweep failures", async () => {
