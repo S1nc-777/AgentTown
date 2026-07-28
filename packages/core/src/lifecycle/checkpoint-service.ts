@@ -350,10 +350,18 @@ export class CheckpointService {
       const gracefulSignal = this.#signalUntil(
         Math.max(Date.now(), cleanupDeadline.at - Math.floor(this.#pauseTimeoutMs * 0.5))
       );
-      const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
+      const graceful = await this.#sessions.stopAllBounded(
+        gracefulSignal.signal,
+        false,
+        cleanupDeadline.at
+      );
       gracefulSignal.dispose();
       const cleanupOutcomes = graceful.some(({ status }) => status !== "stopped")
-        ? await this.#sessions.stopAllBounded(cleanupDeadline.controller.signal, true)
+        ? await this.#sessions.stopAllBounded(
+            cleanupDeadline.controller.signal,
+            true,
+            cleanupDeadline.at
+          )
         : graceful;
       clearTimeout(cleanupDeadline.timer);
       cleanupDeadline.controller.abort();
@@ -670,7 +678,11 @@ export class CheckpointService {
       const gracefulSignal = this.#signalUntil(
         Math.max(Date.now(), deadline.at - forceTailMs)
       );
-      const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
+      const graceful = await this.#sessions.stopAllBounded(
+        gracefulSignal.signal,
+        false,
+        deadline.at
+      );
       gracefulSignal.dispose();
       if (this.#remaining(deadline) === 0) {
         return this.#lateCleanupOutcomes(graceful);
@@ -697,7 +709,11 @@ export class CheckpointService {
         return graceful.filter(({ status }) => status !== "stopped");
       }
       const forceSignal = this.#signalUntil(deadline.at);
-      const forced = await this.#sessions.stopAllBounded(forceSignal.signal, true);
+      const forced = await this.#sessions.stopAllBounded(
+        forceSignal.signal,
+        true,
+        deadline.at
+      );
       forceSignal.dispose();
       if (this.#remaining(deadline) === 0) {
         return this.#lateCleanupOutcomes(forced);

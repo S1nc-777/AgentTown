@@ -12,7 +12,7 @@ import type {
   TaskRecord,
   UsageSnapshot
 } from "@agenttown/runtime-contract";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../src/agents/session-manager.js";
 import { CompanyOrchestrator } from "../src/company/orchestrator.js";
 import { CheckpointService } from "../src/lifecycle/checkpoint-service.js";
@@ -733,6 +733,34 @@ describe("CompanyOrchestrator", () => {
 });
 
 describe("SessionManager", () => {
+  it("does not invoke forceStop after the absolute cleanup deadline", async () => {
+    const { adapter, company, sessions } = createHarness();
+    await sessions.startAll(company, {});
+    let forceCalls = 0;
+    Object.assign(adapter, {
+      forceStop: async () => {
+        forceCalls += 1;
+      }
+    });
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_101);
+
+    let outcomes: Awaited<ReturnType<SessionManager["stopAllBounded"]>> = [];
+    try {
+      outcomes = await sessions.stopAllBounded(
+        new AbortController().signal,
+        true,
+        1_100
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(forceCalls).toBe(0);
+    expect(outcomes).toHaveLength(company.employees.length);
+    expect(outcomes.every(({ status }) => status === "aborted")).toBe(true);
+    expect(() => sessions.get("leader")).not.toThrow();
+  });
+
   it("rolls back successful starts in reverse order when one employee fails", async () => {
     const { adapter, company, sessions, store } = createHarness();
     adapter.failStartEmployeeId = "reviewer";
@@ -1031,7 +1059,11 @@ describe("SessionManager", () => {
     )?.handle).toEqual(previous);
 
     adapter.failStopEmployeeIds.clear();
-    const cleanup = await sessions.stopAllBounded(new AbortController().signal);
+    const cleanup = await sessions.stopAllBounded(
+      new AbortController().signal,
+      false,
+      Number.POSITIVE_INFINITY
+    );
     expect(cleanup.every(({ status }) => status === "stopped")).toBe(true);
     expect(adapter.stoppedSessionIds.filter((id) => id === "developer-a-5"))
       .toHaveLength(2);
@@ -1088,7 +1120,11 @@ describe("SessionManager", () => {
     )?.handle).toEqual(previous);
 
     adapter.failStopEmployeeIds.clear();
-    const cleanup = await sessions.stopAllBounded(new AbortController().signal);
+    const cleanup = await sessions.stopAllBounded(
+      new AbortController().signal,
+      false,
+      Number.POSITIVE_INFINITY
+    );
     expect(cleanup.every(({ status }) => status === "stopped")).toBe(true);
     expect(adapter.stoppedSessionIds.filter((id) => id === "developer-a-5"))
       .toHaveLength(2);

@@ -238,7 +238,8 @@ export class SessionManager {
 
   async stopAllBounded(
     signal: AbortSignal,
-    force = false
+    force: boolean,
+    deadlineAt: number
   ): Promise<StopOutcome[]> {
     const pending = [...this.#pendingReplacements.values()].map((replacement) => {
       replacement.cancelled = true;
@@ -253,7 +254,7 @@ export class SessionManager {
       [key, candidate]
     ): Promise<StopOutcome> => {
       const { employeeId, handle, active } = candidate;
-      if (signal.aborted) {
+      if (signal.aborted || Date.now() >= deadlineAt) {
         return { employeeId, status: "aborted", error: "stop aborted" };
       }
       const adapter = this.adapterFor(this.#employeeAdapterName(handle));
@@ -261,6 +262,9 @@ export class SessionManager {
         ? adapter.forceStop.bind(adapter)
         : adapter.stop.bind(adapter);
       try {
+        if (signal.aborted || Date.now() >= deadlineAt) {
+          return { employeeId, status: "aborted", error: "stop aborted" };
+        }
         const result = await this.#raceAbort(stop(handle), signal);
         if (result === null || signal.aborted) {
           return { employeeId, status: "aborted", error: "stop aborted" };

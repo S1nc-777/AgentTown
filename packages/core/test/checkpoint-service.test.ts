@@ -326,12 +326,16 @@ describe("CheckpointService", () => {
     const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
       if (ownershipSnapshots < 2) return now;
       cleanupClockReads += 1;
-      return cleanupClockReads === 1 ? 1_099 : 1_101;
+      return cleanupClockReads <= 2 ? 1_099 : 1_101;
     });
     const lifecycleSessions: CheckpointServiceOptions["sessions"] = {
       interruptAll: (signal) => sessions.interruptAll(signal),
       stopAll: () => sessions.stopAll(),
-      stopAllBounded: (signal, force) => sessions.stopAllBounded(signal, force),
+      stopAllBounded: (_signal, force, deadlineAt) => sessions.stopAllBounded(
+        new AbortController().signal,
+        force,
+        deadlineAt
+      ),
       cleanupOwnershipSnapshot: () => {
         ownershipSnapshots += 1;
         return sessions.cleanupOwnershipSnapshot();
