@@ -5,10 +5,11 @@ import {
   rm,
   writeFile
 } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { startCore } from "../src/core-process.js";
+import { startCore, terminateChild } from "../src/core-process.js";
 import {
   pipeNameForProject,
   resolveAgentTownPaths
@@ -24,6 +25,28 @@ afterEach(async () => {
 });
 
 describe("Core process launcher", () => {
+  it("waits boundedly after SIGKILL and surfaces a child that remains live", async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+      kill(signal?: NodeJS.Signals): boolean;
+    };
+    child.exitCode = null;
+    child.signalCode = null;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    child.kill = (signal?: NodeJS.Signals) => {
+      signals.push(signal);
+      return true;
+    };
+    const startedAt = Date.now();
+
+    await expect(terminateChild(child, 20))
+      .rejects.toThrow("remained live after SIGKILL");
+
+    expect(signals).toEqual([undefined, "SIGKILL"]);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
   it("fails boundedly and includes Core stderr when readiness cannot succeed", async () => {
     const root = await mkdtemp(join(tmpdir(), "agenttown-launch-fail-"));
     roots.push(root);

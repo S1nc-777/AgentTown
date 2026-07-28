@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
+  lstat,
   mkdir,
   readFile,
   writeFile
@@ -71,6 +72,13 @@ export interface CliRuntime {
     startIfMissing: boolean
   ): Promise<CliClient>;
   stdout: BackpressureWritable;
+  initializationHooks?: InitializationHooks;
+}
+
+export interface InitializationHooks {
+  afterStateDirectoryReady?(paths: ReturnType<typeof resolveAgentTownPaths>): Promise<void>;
+  afterLogsDirectoryReady?(paths: ReturnType<typeof resolveAgentTownPaths>): Promise<void>;
+  beforeCompanyWrite?(paths: ReturnType<typeof resolveAgentTownPaths>): Promise<void>;
 }
 
 export async function writeWithBackpressure(
@@ -197,12 +205,37 @@ async function initialize(
 ): Promise<void> {
   const paths = resolveAgentTownPaths(projectRoot);
   await validateAgentTownWriteLayout(paths);
-  await mkdir(paths.logsDir, { recursive: true });
+  await ensureExactDirectory(paths.stateDir);
+  await runtime.initializationHooks?.afterStateDirectoryReady?.(paths);
+  await validateAgentTownWriteLayout(paths);
+  await ensureExactDirectory(paths.logsDir);
+  await runtime.initializationHooks?.afterLogsDirectoryReady?.(paths);
   await validateAgentTownWriteLayout(paths);
   const yaml = templateYaml(template);
   parseCompanyYaml(yaml);
+  await runtime.initializationHooks?.beforeCompanyWrite?.(paths);
+  await validateAgentTownWriteLayout(paths);
   await writeFile(paths.companyPath, yaml, { encoding: "utf8", flag: "wx" });
+  await validateAgentTownWriteLayout(paths);
   await writeWithBackpressure(runtime.stdout, `initialized ${paths.companyPath}\n`);
+}
+
+async function ensureExactDirectory(path: string): Promise<void> {
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if (
+      !(error instanceof Error)
+      || !("code" in error)
+      || (error as NodeJS.ErrnoException).code !== "EEXIST"
+    ) {
+      throw error;
+    }
+  }
+  const stat = await lstat(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`AgentTown directory is not a real directory: ${path}`);
+  }
 }
 
 async function start(projectRoot: string, runtime: CliRuntime): Promise<void> {

@@ -43,6 +43,11 @@ export interface ShutdownCoordinator {
   handleSignal(signal: NodeJS.Signals): void;
 }
 
+export interface CoreRunHooks {
+  afterInitialValidation?(): Promise<void>;
+  beforeStoreOpen?(): Promise<void>;
+}
+
 export function createShutdownCoordinator(options: {
   timeoutMs: number;
   pause: () => Promise<void>;
@@ -264,15 +269,22 @@ function employeeIds(company: CompanyDefinition): {
   return { leaderId: leader.id, reviewerId: reviewer.id };
 }
 
-export async function runCore(argv: readonly string[]): Promise<void> {
+export async function runCore(
+  argv: readonly string[],
+  hooks: CoreRunHooks = {}
+): Promise<void> {
   // Parsing and lexical boundary validation intentionally happen before SQLite opens.
   const args = parseCoreArguments(argv);
+  await validateCoreStateLayout(args);
+  await hooks.afterInitialValidation?.();
   await validateCoreStateLayout(args);
   const company = parseCompanyYaml(await readFile(args.companyPath, "utf8"));
   if (company.employees.some(({ agent }) => agent !== "fake")) {
     throw new Error("P1A Core accepts only the fake adapter");
   }
   const { leaderId, reviewerId } = employeeIds(company);
+  await hooks.beforeStoreOpen?.();
+  await validateCoreStateLayout(args);
   const store = new CoreStore(args.databasePath);
   let server: CoreServer | undefined;
   try {

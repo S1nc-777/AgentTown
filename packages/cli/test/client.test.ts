@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentTownClient } from "../src/client.js";
+import { AgentTownClient, EventQueue } from "../src/client.js";
 
 const servers: Server[] = [];
 
@@ -20,6 +20,27 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
 }
 
 describe("AgentTownClient", () => {
+  it("accounts queued event bytes and releases retained events on drain and close", async () => {
+    const queue = new EventQueue(() => undefined);
+    const first = {
+      protocolVersion: 1,
+      kind: "event",
+      sequence: 1,
+      type: "task.progress",
+      payload: {}
+    } as const;
+    expect(queue.push(first, 3 * 1024 * 1024)).toBe(true);
+    expect(queue.queuedBytes).toBe(3 * 1024 * 1024);
+    expect(queue.push({ ...first, sequence: 2 }, 2 * 1024 * 1024)).toBe(false);
+    await expect(queue[Symbol.asyncIterator]().next())
+      .resolves.toMatchObject({ value: { sequence: 1 } });
+    expect(queue.queuedBytes).toBe(0);
+    expect(queue.push({ ...first, sequence: 3 }, 1024)).toBe(true);
+    queue.close();
+    expect(queue.size).toBe(0);
+    expect(queue.queuedBytes).toBe(0);
+  });
+
   it("handshakes, requests, receives events, heartbeats and clears the lease on close", async () => {
     const pipeName = `agenttown-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
     const methods: string[] = [];
@@ -114,7 +135,7 @@ describe("AgentTownClient", () => {
     await client.close();
   });
 
-  it("keeps at most one heartbeat in flight against a stalled Core", async () => {
+  it("keeps at most one heartbeat write in flight while drain is stalled", async () => {
     const pipeName = `agenttown-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
     let heartbeatCount = 0;
     const server = createServer((socket) => {
@@ -149,10 +170,27 @@ describe("AgentTownClient", () => {
       server.listen(`\\\\.\\pipe\\${pipeName}`, resolvePromise);
     });
     const client = await AgentTownClient.connect(pipeName, "stalled", 0);
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
-
-    expect(heartbeatCount).toBe(1);
-    await client.close();
+    const clientSocket = (client as unknown as {
+      socket: Socket;
+    }).socket;
+    const originalWrite = clientSocket.write.bind(clientSocket);
+    let stalledWriteAttempts = 0;
+    clientSocket.write = ((chunk: string) => {
+      if (chunk.includes("client.heartbeat")) {
+        stalledWriteAttempts += 1;
+        return false;
+      }
+      return originalWrite(chunk);
+    }) as typeof clientSocket.write;
+    try {
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+      expect(stalledWriteAttempts).toBe(1);
+      expect(heartbeatCount).toBe(0);
+    } finally {
+      clientSocket.write = originalWrite as typeof clientSocket.write;
+      clientSocket.emit("drain");
+      await client.close();
+    }
   });
 
   it("pauses input and delivers a high-volume event stream without drops", async () => {
@@ -196,6 +234,71 @@ describe("AgentTownClient", () => {
     expect(received).toEqual(
       Array.from({ length: eventCount }, (_, index) => index + 1)
     );
+    await client.close();
+  });
+
+  it("continues bounded response-free heartbeats while event input is paused", async () => {
+    const pipeName = `agenttown-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+    let heartbeatCount = 0;
+    const eventCount = 600;
+    const server = createServer((socket) => {
+      socket.setEncoding("utf8");
+      let buffer = "";
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        while (buffer.includes("\n")) {
+          const newline = buffer.indexOf("\n");
+          const request = JSON.parse(buffer.slice(0, newline)) as {
+            requestId: string;
+            method: string;
+          };
+          buffer = buffer.slice(newline + 1);
+          if (request.method === "client.heartbeat") {
+            heartbeatCount += 1;
+            continue;
+          }
+          socket.write(`${JSON.stringify({
+            protocolVersion: 1,
+            kind: "response",
+            requestId: request.requestId,
+            ok: true,
+            result: request.method === "handshake"
+              ? { leaseTtlMs: 30 }
+              : { ok: true },
+            error: null
+          })}\n`);
+          if (request.method === "handshake") {
+            const events = Array.from({ length: eventCount }, (_, index) =>
+              JSON.stringify({
+                protocolVersion: 1,
+                kind: "event",
+                sequence: index + 1,
+                type: "task.progress",
+                payload: { index }
+              })
+            );
+            socket.write(`${events.join("\n")}\n`);
+          }
+        }
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((resolvePromise) => {
+      server.listen(`\\\\.\\pipe\\${pipeName}`, resolvePromise);
+    });
+    const client = await AgentTownClient.connect(pipeName, "paused-heartbeat", 0);
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 120));
+    expect(heartbeatCount).toBeGreaterThanOrEqual(3);
+
+    let consumed = 0;
+    for await (const _event of client.events()) {
+      consumed += 1;
+      if (consumed === eventCount) break;
+    }
+    const requests = Array.from({ length: 256 }, (_, index) =>
+      client.request("status", { index })
+    );
+    await expect(Promise.all(requests)).resolves.toHaveLength(256);
     await client.close();
   });
 

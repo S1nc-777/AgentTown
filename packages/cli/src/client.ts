@@ -11,6 +11,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const CLOSE_TIMEOUT_MS = 1_000;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_EVENT_QUEUE = 256;
+const MAX_EVENT_QUEUE_BYTES = 4 * 1024 * 1024;
 const EVENT_RESUME_WATERMARK = 128;
 const MAX_PENDING_REQUESTS = 256;
 const MAX_QUEUED_WRITE_BYTES = 4 * 1024 * 1024;
@@ -20,11 +21,17 @@ interface QueueWaiter {
   reject: (error: Error) => void;
 }
 
-class EventQueue implements AsyncIterable<IpcEvent> {
-  readonly #events: IpcEvent[] = [];
+interface QueuedEvent {
+  event: IpcEvent;
+  bytes: number;
+}
+
+export class EventQueue implements AsyncIterable<IpcEvent> {
+  readonly #events: QueuedEvent[] = [];
   readonly #waiters: QueueWaiter[] = [];
   #closed = false;
   #error: Error | null = null;
+  #queuedBytes = 0;
 
   constructor(private readonly onSpace: () => void) {}
 
@@ -32,15 +39,28 @@ class EventQueue implements AsyncIterable<IpcEvent> {
     return this.#events.length;
   }
 
-  push(event: IpcEvent): boolean {
+  get queuedBytes(): number {
+    return this.#queuedBytes;
+  }
+
+  push(event: IpcEvent, bytes: number): boolean {
     if (this.#closed) return false;
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new Error("event byte size must be a nonnegative integer");
+    }
     const waiter = this.#waiters.shift();
     if (waiter !== undefined) {
       waiter.resolve({ done: false, value: event });
       return true;
     }
-    if (this.#events.length >= MAX_EVENT_QUEUE) return false;
-    this.#events.push(event);
+    if (
+      this.#events.length >= MAX_EVENT_QUEUE
+      || this.#queuedBytes + bytes > MAX_EVENT_QUEUE_BYTES
+    ) {
+      return false;
+    }
+    this.#events.push({ event, bytes });
+    this.#queuedBytes += bytes;
     return true;
   }
 
@@ -48,6 +68,8 @@ class EventQueue implements AsyncIterable<IpcEvent> {
     if (this.#closed) return;
     this.#closed = true;
     this.#error = error ?? null;
+    this.#events.length = 0;
+    this.#queuedBytes = 0;
     for (const waiter of this.#waiters.splice(0)) {
       if (error === undefined) waiter.resolve({ done: true, value: undefined });
       else waiter.reject(error);
@@ -57,10 +79,11 @@ class EventQueue implements AsyncIterable<IpcEvent> {
   [Symbol.asyncIterator](): AsyncIterator<IpcEvent> {
     return {
       next: () => {
-        const event = this.#events.shift();
-        if (event !== undefined) {
+        const queued = this.#events.shift();
+        if (queued !== undefined) {
+          this.#queuedBytes -= queued.bytes;
           this.onSpace();
-          return Promise.resolve({ done: false, value: event });
+          return Promise.resolve({ done: false, value: queued.event });
         }
         if (this.#error !== null) return Promise.reject(this.#error);
         if (this.#closed) return Promise.resolve({ done: true, value: undefined });
@@ -211,20 +234,9 @@ export class AgentTownClient {
       params
     };
     const line = `${JSON.stringify(request)}\n`;
-    const lineBytes = Buffer.byteLength(line, "utf8");
-    if (lineBytes > MAX_LINE_BYTES) {
-      return Promise.reject(new Error("Core request line exceeds maximum size"));
-    }
-    if (this.#queuedWriteBytes + lineBytes > MAX_QUEUED_WRITE_BYTES) {
-      return Promise.reject(new Error(
-        `queued Core request bytes exceed limit ${MAX_QUEUED_WRITE_BYTES}`
-      ));
-    }
     return new Promise<unknown>((resolvePromise, reject) => {
       this.#pending.set(requestId, { resolve: resolvePromise, reject });
-      this.#queuedWriteBytes += lineBytes;
-      this.#writeTail = this.#writeTail
-        .then(() => this.#writeLine(line))
+      void this.#enqueueLine(line)
         .catch((error: unknown) => {
           const failure = error instanceof Error ? error : new Error(String(error));
           const pending = this.#pending.get(requestId);
@@ -232,9 +244,6 @@ export class AgentTownClient {
             this.#pending.delete(requestId);
             pending.reject(failure);
           }
-        })
-        .finally(() => {
-          this.#queuedWriteBytes -= lineBytes;
         });
     });
   }
@@ -298,11 +307,37 @@ export class AgentTownClient {
     });
   }
 
+  #enqueueLine(line: string): Promise<void> {
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (lineBytes > MAX_LINE_BYTES) {
+      return Promise.reject(new Error("Core request line exceeds maximum size"));
+    }
+    if (this.#queuedWriteBytes + lineBytes > MAX_QUEUED_WRITE_BYTES) {
+      return Promise.reject(new Error(
+        `queued Core request bytes exceed limit ${MAX_QUEUED_WRITE_BYTES}`
+      ));
+    }
+    this.#queuedWriteBytes += lineBytes;
+    const writing = this.#writeTail.then(() => this.#writeLine(line));
+    const accounted = writing.finally(() => {
+      this.#queuedWriteBytes -= lineBytes;
+    });
+    this.#writeTail = accounted.catch(() => undefined);
+    return accounted;
+  }
+
   #startHeartbeat(ttlMs: number): void {
     this.#heartbeat = setInterval(() => {
       if (this.#heartbeatInFlight || this.#closed) return;
       this.#heartbeatInFlight = true;
-      void this.request("client.heartbeat", { clientId: this.clientId })
+      const heartbeat: IpcRequest = {
+        protocolVersion: IPC_PROTOCOL_VERSION,
+        kind: "request",
+        requestId: randomUUID(),
+        method: "client.heartbeat",
+        params: { clientId: this.clientId }
+      };
+      void this.#enqueueLine(`${JSON.stringify(heartbeat)}\n`)
         .catch(() => undefined)
         .finally(() => {
           this.#heartbeatInFlight = false;
@@ -339,7 +374,7 @@ export class AgentTownClient {
       try {
         const message = parseIpcMessage(JSON.parse(line) as unknown);
         if (message.kind === "event") {
-          if (!this.#events.push(message)) {
+          if (!this.#events.push(message, Buffer.byteLength(line, "utf8"))) {
             // Put the event back and stop reading until the consumer creates space.
             this.#buffer = `${line}\n${this.#buffer}`;
             this.#inputPaused = true;

@@ -45,14 +45,42 @@ function appendTail(
     : combined.subarray(combined.length - STDERR_LIMIT_BYTES);
 }
 
-async function terminate(child: ChildProcess): Promise<void> {
+export interface TerminableChild {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+  kill(signal?: NodeJS.Signals | number): boolean;
+  once(event: "close", listener: () => void): unknown;
+  off(event: "close", listener: () => void): unknown;
+}
+
+async function waitForChildClose(
+  child: TerminableChild,
+  timeoutMs: number
+): Promise<void> {
+  await new Promise<void>((resolvePromise) => {
+    const finish = () => {
+      clearTimeout(timer);
+      child.off("close", finish);
+      resolvePromise();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.once("close", finish);
+  });
+}
+
+export async function terminateChild(
+  child: TerminableChild,
+  waitMs = 500
+): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill();
-  await Promise.race([
-    new Promise<void>((resolvePromise) => child.once("close", () => resolvePromise())),
-    new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 500))
-  ]);
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  await waitForChildClose(child, waitMs);
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGKILL");
+  await waitForChildClose(child, waitMs);
+  if (child.exitCode === null && child.signalCode === null) {
+    throw new Error("Core child remained live after SIGKILL");
+  }
 }
 
 export async function startCore(input: {
@@ -160,7 +188,7 @@ export async function startCore(input: {
     (child.stderr as unknown as { unref?: () => void } | null)?.unref?.();
     return { child, client };
   } catch (error) {
-    await terminate(child);
+    await terminateChild(child);
     const stderr = stderrTail.toString("utf8").trim();
     const detail = stderr.length === 0 ? "" : `\nCore stderr (tail):\n${stderr}`;
     throw new Error(

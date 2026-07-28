@@ -1,4 +1,12 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -6,8 +14,32 @@ import {
   assertCorePathWithinProject,
   createShutdownCoordinator,
   parseCoreArguments,
+  runCore,
   validateCoreStateLayout
 } from "../src/main.js";
+
+const fakeCompany = `schema_version: 1
+company:
+  name: race-test
+  mission: test
+  success_criteria: [safe]
+  operating_rules: [safe]
+employees:
+  - id: leader
+    role: product_lead
+    agent: fake
+    reports_to: owner
+    workspace: read_only
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: read_only
+limits:
+  max_task_retry: 1
+  max_review_loops: 1
+  max_parallel_tasks: 1
+`;
 
 describe("Core entrypoint arguments", () => {
   const valid = [
@@ -116,6 +148,52 @@ describe("Core entrypoint arguments", () => {
         leaseTtlMs: 15_000
       })).rejects.toThrow(/symbolic|junction/u);
     } finally {
+      await rm(project, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("revalidates after an injected pre-open state swap and never writes outside", async () => {
+    const project = await mkdtemp(join(tmpdir(), "agenttown-core-race-project-"));
+    const outside = await mkdtemp(join(tmpdir(), "agenttown-core-race-outside-"));
+    const stateDir = join(project, ".agenttown");
+    const backup = join(project, ".agenttown-original");
+    await mkdir(stateDir);
+    await writeFile(join(stateDir, "company.yaml"), fakeCompany);
+    await writeFile(join(outside, "company.yaml"), fakeCompany);
+    await writeFile(join(outside, "sentinel"), "unchanged");
+    try {
+      await expect(runCore([
+        "--project-root", project,
+        "--database", join(stateDir, "agenttown.sqlite"),
+        "--company", join(stateDir, "company.yaml"),
+        "--pipe-name", "agenttown-0123456789abcdef01234567",
+        "--lease-ttl-ms", "15000"
+      ], {
+        async beforeStoreOpen() {
+          await rename(stateDir, backup);
+          await symlink(
+            outside,
+            stateDir,
+            process.platform === "win32" ? "junction" : "dir"
+          );
+        }
+      })).rejects.toThrow(/symbolic|junction/u);
+      await expect(readFile(join(outside, "sentinel"), "utf8"))
+        .resolves.toBe("unchanged");
+      await expect(readFile(join(outside, "agenttown.sqlite"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } catch (error) {
+      if (
+        error instanceof Error
+        && "code" in error
+        && (error as NodeJS.ErrnoException).code === "EPERM"
+      ) {
+        return;
+      }
+      throw error;
+    } finally {
+      await rm(stateDir, { force: true });
       await rm(project, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
     }

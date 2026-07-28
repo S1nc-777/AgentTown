@@ -1,4 +1,12 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  lstat,
+  readFile,
+  rm,
+  rmdir,
+  symlink,
+  unlink
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IpcEvent, TaskRecord } from "@agenttown/runtime-contract";
@@ -114,6 +122,54 @@ describe("thin CLI commands", () => {
     await expect(runCli(["init"], root)).rejects.toMatchObject({ code: "EEXIST" });
     expect(await readFile(join(root, ".agenttown", "company.yaml"), "utf8"))
       .toBe(first);
+  });
+
+  it("detects a state-directory swap after creation before any outside write", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttown-cli-race-"));
+    const outside = await mkdtemp(join(tmpdir(), "agenttown-cli-race-outside-"));
+    roots.push(root, outside);
+    const fake = fakeRuntime(() => undefined);
+    try {
+      await expect(runCli(["init"], root, {
+        ...fake.runtime,
+        initializationHooks: {
+          async afterStateDirectoryReady(paths) {
+            await rmdir(paths.stateDir);
+            await symlink(
+              outside,
+              paths.stateDir,
+              process.platform === "win32" ? "junction" : "dir"
+            );
+          }
+        }
+      })).rejects.toThrow(/symbolic|junction/u);
+      await expect(readFile(join(outside, "company.yaml"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } catch (error) {
+      if (
+        error instanceof Error
+        && "code" in error
+        && (error as NodeJS.ErrnoException).code === "EPERM"
+      ) {
+        return;
+      }
+      throw error;
+    } finally {
+      const stateDir = join(root, ".agenttown");
+      try {
+        const stat = await lstat(stateDir);
+        if (stat.isSymbolicLink()) await unlink(stateDir);
+        else await rm(stateDir, { recursive: true, force: true });
+      } catch (error) {
+        if (
+          !(error instanceof Error)
+          || !("code" in error)
+          || (error as NodeJS.ErrnoException).code !== "ENOENT"
+        ) {
+          throw error;
+        }
+      }
+    }
   });
 
   it("requires --yes for noninteractive stop before attempting IPC", async () => {
