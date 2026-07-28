@@ -248,7 +248,11 @@ export class CoreServer {
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
   #listenStarted = false;
   #draining = false;
-  #transportClosePromise: Promise<void> | null = null;
+  #transportClosedPromise: Promise<void> | null = null;
+  #transportClosingConnections: ClientConnection[] = [];
+  #gracefulRunnerPromise: Promise<void> | null = null;
+  #hardCloseRequested = false;
+  readonly #hardCloseWaiters: Array<() => void> = [];
   #closePromise: Promise<void> | null = null;
   #gracefulClosePromise: Promise<void> | null = null;
 
@@ -351,10 +355,15 @@ export class CoreServer {
   }
 
   closeTransportAfterResponses(): Promise<void> {
-    if (this.#transportClosePromise === null) {
-      this.#transportClosePromise = this.#closeGracefully();
+    const transportClosed = this.#ensureTransportClosing();
+    if (this.#gracefulRunnerPromise === null) {
+      this.#gracefulRunnerPromise = this.#runGracefulClose()
+        .catch((error: unknown) => {
+          this.#recordBackgroundError(error);
+          this.#forceTransportClose();
+        });
     }
-    return this.#transportClosePromise;
+    return transportClosed;
   }
 
   get backgroundErrors(): readonly Error[] {
@@ -363,52 +372,79 @@ export class CoreServer {
 
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
-    if (this.#transportClosePromise === null) {
-      this.#transportClosePromise = this.#closeImmediately();
-    }
-    this.#closePromise = this.#transportClosePromise
+    const transportClosed = this.#ensureTransportClosing();
+    this.#forceTransportClose();
+    this.#closePromise = transportClosed
       .then(() => this.#waitForLeaseCleanup());
     return this.#closePromise;
   }
 
-  #closeImmediately(): Promise<void> {
+  #ensureTransportClosing(): Promise<void> {
+    if (this.#transportClosedPromise !== null) {
+      return this.#transportClosedPromise;
+    }
     this.#draining = true;
     this.#clearSweepTimer();
-    const connections = [...this.#connections];
-    const closed = this.#stopAccepting();
-    for (const connection of connections) {
+    this.#transportClosingConnections = [...this.#connections];
+    for (const connection of this.#transportClosingConnections) {
       this.#stopReading(connection);
-      connection.socket.destroy();
     }
-    return Promise.all([
+    const closed = this.#stopAccepting();
+    this.#transportClosedPromise = Promise.all([
       closed,
-      ...connections.map((connection) => connection.closed)
+      ...this.#transportClosingConnections.map((connection) =>
+        connection.closed
+      )
     ]).then(() => undefined);
+    return this.#transportClosedPromise;
   }
 
-  async #closeGracefully(): Promise<void> {
-    this.#draining = true;
-    this.#clearSweepTimer();
-    const connections = [...this.#connections];
-    for (const connection of connections) this.#stopReading(connection);
-    const closed = this.#stopAccepting();
-    await Promise.all(
-      connections.map((connection) =>
+  async #runGracefulClose(): Promise<void> {
+    const processingDrained = Promise.all(
+      this.#transportClosingConnections.map((connection) =>
         connection.processing.catch(() => undefined)
       )
-    );
-    await Promise.all(
-      connections.map((connection) => this.#waitForOutbound(connection))
-    );
-    for (const connection of connections) {
+    ).then(() => true);
+    const shouldFinish = await Promise.race([
+      processingDrained,
+      this.#waitForHardClose().then(() => false)
+    ]);
+    if (!shouldFinish) return;
+    const outboundDrained = Promise.all(
+      this.#transportClosingConnections.map((connection) =>
+        this.#waitForOutbound(connection)
+      )
+    ).then(() => true);
+    const shouldEnd = await Promise.race([
+      outboundDrained,
+      this.#waitForHardClose().then(() => false)
+    ]);
+    if (!shouldEnd) return;
+    for (const connection of this.#transportClosingConnections) {
       if (!connection.socket.destroyed) {
         connection.socket.end(() => connection.socket.destroy());
       }
     }
-    await Promise.all([
-      closed,
-      ...connections.map((connection) => connection.closed)
-    ]);
+  }
+
+  #waitForHardClose(): Promise<void> {
+    if (this.#hardCloseRequested) return Promise.resolve();
+    return new Promise<void>((resolvePromise) => {
+      this.#hardCloseWaiters.push(resolvePromise);
+    });
+  }
+
+  #forceTransportClose(): void {
+    if (!this.#hardCloseRequested) {
+      this.#hardCloseRequested = true;
+      for (const resolvePromise of this.#hardCloseWaiters.splice(0)) {
+        resolvePromise();
+      }
+    }
+    for (const connection of [...this.#connections]) {
+      this.#stopReading(connection);
+      connection.socket.destroy();
+    }
   }
 
   #stopAccepting(): Promise<void> {

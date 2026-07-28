@@ -929,6 +929,47 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(orchestrator.starts).toEqual([{ first: "scenario" }]);
   });
 
+  it("hard close escalates a graceful drain blocked by a request", async () => {
+    const orchestrator = new BlockingOrchestrator();
+    const { pipeName, server } = await createServer({ orchestrator });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-hard-escalation");
+    const request = client.request("company.start", {
+      scenarios: { blocked: "scenario" }
+    }).catch(() => undefined);
+    await orchestrator.started;
+    const socketClosed = client.waitForClose();
+
+    const gracefulTransport = server.closeTransportAfterResponses();
+    const hardClose = server.close();
+    const repeatedHardClose = server.close();
+    const settledBeforeRelease = await Promise.race([
+      Promise.all([
+        gracefulTransport,
+        hardClose,
+        repeatedHardClose,
+        socketClosed,
+        request
+      ]).then(() => true),
+      new Promise<false>((resolvePromise) => {
+        setTimeout(() => resolvePromise(false), 250);
+      })
+    ]);
+
+    if (!settledBeforeRelease) {
+      orchestrator.release();
+      await Promise.all([
+        gracefulTransport,
+        hardClose,
+        repeatedHardClose,
+        socketClosed,
+        request
+      ]);
+    }
+    expect(repeatedHardClose).toBe(hardClose);
+    expect(settledBeforeRelease).toBe(true);
+  });
+
   it("closes a client whose queued inbound work exceeds its byte budget", async () => {
     const orchestrator = new BlockingOrchestrator();
     const { pipeName } = await createServer({
