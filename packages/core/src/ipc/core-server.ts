@@ -18,6 +18,7 @@ import {
   type EventRecord
 } from "../storage/core-store.js";
 import { LeaseRegistry } from "./lease-registry.js";
+import type { CheckpointService } from "../lifecycle/checkpoint-service.js";
 
 const DEFAULT_LEASE_SWEEP_INTERVAL_MS = 1_000;
 const DEFAULT_REQUEST_CACHE_SIZE = 1_024;
@@ -32,12 +33,14 @@ type CoreServerOrchestrator = Pick<
   CompanyOrchestrator,
   "dispatch" | "start" | "stopDispatching"
 >;
+type CoreServerLifecycle = Pick<CheckpointService, "pause" | "recoverLatest">;
 
 export interface CoreServerOptions {
   pipeName: string;
   store: CoreStore;
   orchestrator: CoreServerOrchestrator;
   leases: LeaseRegistry;
+  lifecycle?: CoreServerLifecycle;
   leaseSweepIntervalMs?: number;
   requestCacheSize?: number;
   maxInboundQueuedBytes?: number;
@@ -235,6 +238,7 @@ export class CoreServer {
   readonly #pipeName: string;
   readonly #store: CoreStore;
   readonly #orchestrator: CoreServerOrchestrator;
+  readonly #lifecycle: CoreServerLifecycle | undefined;
   readonly #leases: LeaseRegistry;
   readonly #leaseSweepIntervalMs: number;
   readonly #requestCacheSize: number;
@@ -260,6 +264,7 @@ export class CoreServer {
     this.#pipeName = options.pipeName;
     this.#store = options.store;
     this.#orchestrator = options.orchestrator;
+    this.#lifecycle = options.lifecycle;
     this.#leases = options.leases;
     this.#leaseSweepIntervalMs = options.leaseSweepIntervalMs
       ?? DEFAULT_LEASE_SWEEP_INTERVAL_MS;
@@ -818,13 +823,29 @@ export class CoreServer {
         );
         return { status: "running" };
       case "company.pause":
-        await this.#orchestrator.stopDispatching();
-        return { status: "pausing" };
+        if (this.#lifecycle === undefined) {
+          await this.#orchestrator.stopDispatching();
+          return { status: "pausing" };
+        }
+        await this.#lifecycle.pause("user_requested");
+        setImmediate(() => {
+          void this.closeTransportAfterResponses().catch((error: unknown) => {
+            this.#recordBackgroundError(error);
+          });
+        });
+        return { status: "paused" };
       case "company.resume":
-        await this.#orchestrator.start(
-          stringRecord(request.params.scenarios ?? {}, "scenarios")
-        );
-        return { status: "running" };
+        if (this.#lifecycle === undefined) {
+          await this.#orchestrator.start(
+            stringRecord(request.params.scenarios ?? {}, "scenarios")
+          );
+          return { status: "running" };
+        }
+        const recovery = await this.#lifecycle.recoverLatest();
+        return {
+          status: "running",
+          decisions: recovery.decisions
+        };
       case "company.stop":
         await this.#orchestrator.stopDispatching();
         return { status: "stopping" };

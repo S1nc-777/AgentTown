@@ -238,6 +238,28 @@ class RecordingOrchestrator {
   }
 }
 
+class RecordingLifecycle {
+  readonly pauses: string[] = [];
+  recoverLatestCalls = 0;
+
+  async pause(reason: "user_requested" | "last_client_exited" | "shutdown") {
+    this.pauses.push(reason);
+    return {
+      companyId: "company-1",
+      reason,
+      lastEventSequence: 0,
+      sessions: []
+    };
+  }
+
+  async recoverLatest() {
+    this.recoverLatestCalls += 1;
+    return {
+      decisions: [{ employeeId: "leader", mode: "native" as const }]
+    };
+  }
+}
+
 class CountingCoreStore extends CoreStore {
   getCompanyCalls = 0;
 
@@ -329,6 +351,7 @@ async function createServer(input?: {
   store?: CoreStore;
   orchestrator?: RecordingOrchestrator;
   leases?: LeaseRegistry;
+  lifecycle?: RecordingLifecycle;
   serverOptions?: Partial<Pick<
     CoreServerOptions,
     | "maxInboundQueuedBytes"
@@ -354,6 +377,7 @@ async function createServer(input?: {
     store,
     orchestrator,
     leases,
+    ...(input?.lifecycle === undefined ? {} : { lifecycle: input.lifecycle }),
     leaseSweepIntervalMs: 10_000,
     requestCacheSize: 16,
     ...input?.serverOptions
@@ -785,6 +809,34 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
       "server did not release the final shared-client lease"
     );
     expect(pauses).toBe(1);
+  });
+
+  it("routes pause and resume through lifecycle and drains after the pause response", async () => {
+    const pauseLifecycle = new RecordingLifecycle();
+    const paused = await createServer({ lifecycle: pauseLifecycle });
+    const pauseClient = await connectClient(paused.pipeName);
+    await pauseClient.handshake("client-lifecycle-pause");
+    const closed = pauseClient.waitForClose();
+
+    await expect(pauseClient.request("company.pause", {})).resolves.toMatchObject({
+      ok: true,
+      result: { status: "paused" }
+    });
+    await expect(closed).resolves.toBeUndefined();
+    expect(pauseLifecycle.pauses).toEqual(["user_requested"]);
+
+    const resumeLifecycle = new RecordingLifecycle();
+    const resumed = await createServer({ lifecycle: resumeLifecycle });
+    const resumeClient = await connectClient(resumed.pipeName);
+    await resumeClient.handshake("client-lifecycle-resume");
+    await expect(resumeClient.request("company.resume", {})).resolves.toMatchObject({
+      ok: true,
+      result: {
+        status: "running",
+        decisions: [{ employeeId: "leader", mode: "native" }]
+      }
+    });
+    expect(resumeLifecycle.recoverLatestCalls).toBe(1);
   });
 
   it("renews each client lease when a heartbeat response is replayed", async () => {
@@ -1243,12 +1295,14 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     const store = createStore();
     let server: CoreServer;
     let callbackCalls = 0;
+    const lifecycle = new RecordingLifecycle();
     let resolveCallbackCompleted: () => void = () => undefined;
     const callbackCompleted = new Promise<void>((resolvePromise) => {
       resolveCallbackCompleted = resolvePromise;
     });
     const leases = createLeases(store, async () => {
       callbackCalls += 1;
+      await lifecycle.pause("last_client_exited");
       await server.closeTransportAfterResponses();
       resolveCallbackCompleted();
     });
@@ -1269,6 +1323,7 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(completed).toBe(true);
     expect(store.countLeases()).toBe(0);
     expect(callbackCalls).toBe(1);
+    expect(lifecycle.pauses).toEqual(["last_client_exited"]);
     await server.close();
   });
 

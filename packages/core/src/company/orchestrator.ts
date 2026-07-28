@@ -281,6 +281,10 @@ export class CompanyOrchestrator {
     this.#acceptingActions = false;
   }
 
+  resumeDispatching(): void {
+    this.#acceptingActions = true;
+  }
+
   #createProposedTask(action: ActionProposal): TaskRecord {
     const taskId = requiredTaskId(action);
     return this.tasks.create({

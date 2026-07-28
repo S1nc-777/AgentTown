@@ -20,3 +20,11 @@ export {
   CoreServer,
   type CoreServerOptions
 } from "./ipc/core-server.js";
+export {
+  CheckpointService,
+  RecoveryBlockedError,
+  parseCompanyCheckpoint,
+  type CheckpointServiceOptions,
+  type PauseReason,
+  type RecoveryResult
+} from "./lifecycle/checkpoint-service.js";
