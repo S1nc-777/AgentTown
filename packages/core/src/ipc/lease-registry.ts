@@ -16,6 +16,10 @@ export class LeaseRegistry {
     private readonly options: LeaseRegistryOptions
   ) {}
 
+  get ttlMs(): number {
+    return this.options.ttlMs;
+  }
+
   initialize(): void {
     this.store.clearLeases();
   }

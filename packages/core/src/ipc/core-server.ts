@@ -847,6 +847,15 @@ export class CoreServer {
           decisions: recovery.decisions
         };
       case "company.stop":
+        if (this.#lifecycle !== undefined) {
+          await this.#lifecycle.pause("shutdown");
+          setImmediate(() => {
+            void this.closeTransportAfterResponses().catch((error: unknown) => {
+              this.#recordBackgroundError(error);
+            });
+          });
+          return { status: "stopped" };
+        }
         await this.#orchestrator.stopDispatching();
         return { status: "stopping" };
       case "tasks.list":
@@ -914,6 +923,7 @@ export class CoreServer {
     return {
       protocolVersion: IPC_PROTOCOL_VERSION,
       coreVersion: "0.0.0",
+      leaseTtlMs: this.#leases.ttlMs,
       capabilities: {
         eventReplay: true,
         clientLeases: true
