@@ -55,6 +55,8 @@ function assertNever(value: never): never {
 export class CompanyOrchestrator {
   readonly #inFlight = new Map<string, Promise<void>>();
   #acceptingActions = false;
+  #dispatchEpoch = 0;
+  #dispatchController = new AbortController();
 
   constructor(
     private readonly companyId: string,
@@ -78,6 +80,9 @@ export class CompanyOrchestrator {
         causationEventId: null,
         payload: {}
       });
+      if (this.#dispatchController.signal.aborted) {
+        this.#dispatchController = new AbortController();
+      }
       this.#acceptingActions = true;
     } catch (error) {
       await this.sessions.stopAll().catch(() => undefined);
@@ -126,7 +131,12 @@ export class CompanyOrchestrator {
     }
   }
 
-  async sendTask(taskId: string): Promise<void> {
+  async sendTask(
+    taskId: string,
+    epoch = this.#dispatchEpoch,
+    signal = this.#dispatchController.signal
+  ): Promise<void> {
+    this.#assertEpoch(epoch);
     while (true) {
       const task = this.tasks.get(taskId);
       const employee = this.#taskOwner(task);
@@ -135,13 +145,16 @@ export class CompanyOrchestrator {
       try {
         for await (const event of this.sessions.send(
           employee,
-          this.#taskMessage(task, employee)
+          this.#taskMessage(task, employee),
+          signal
         )) {
+          this.#assertEpoch(epoch);
           if (event.type === "action.proposed") {
             try {
               this.#assertProposalTask(event.action, taskId);
               await this.dispatch(event.action);
             } catch (error) {
+              if (epoch !== this.#dispatchEpoch) return;
               failed = true;
               this.#recordEvent("action.rejected", "core", taskId, {
                 actionId: event.action.actionId,
@@ -155,12 +168,14 @@ export class CompanyOrchestrator {
           }
         }
       } catch (error) {
+        if (epoch !== this.#dispatchEpoch) return;
         failed = true;
         this.#recordEvent("task.execution_error", employee.id, taskId, {
           reason: this.#errorMessage(error)
         });
       }
 
+      if (epoch !== this.#dispatchEpoch) return;
       const current = this.tasks.get(taskId);
       if (current.status !== "running") return;
       if (!failed) {
@@ -196,7 +211,9 @@ export class CompanyOrchestrator {
       };
       try {
         await this.sessions.resumeOne(employee, checkpoint);
+        this.#assertEpoch(epoch);
       } catch (resumeError) {
+        if (epoch !== this.#dispatchEpoch) return;
         if (resumeError instanceof SessionReplacementCleanupError) {
           this.#recordApprovalRequest(
             taskId,
@@ -208,7 +225,9 @@ export class CompanyOrchestrator {
         }
         try {
           await this.sessions.rebuildOne(employee, checkpoint.handoff);
+          this.#assertEpoch(epoch);
         } catch (rebuildError) {
+          if (epoch !== this.#dispatchEpoch) return;
           this.#recordApprovalRequest(
             taskId,
             this.leaderId,
@@ -226,7 +245,12 @@ export class CompanyOrchestrator {
     }
   }
 
-  async requestReview(taskId: string): Promise<void> {
+  async requestReview(
+    taskId: string,
+    epoch = this.#dispatchEpoch,
+    signal = this.#dispatchController.signal
+  ): Promise<void> {
+    this.#assertEpoch(epoch);
     const reviewer = this.#employee(this.reviewerId);
     let decisionReceived = false;
     for await (const event of this.sessions.send(reviewer, {
@@ -235,7 +259,8 @@ export class CompanyOrchestrator {
       taskId,
       text: `Review task ${taskId} and propose approval or rejection.`,
       actionRequest: null
-    })) {
+    }, signal)) {
+      this.#assertEpoch(epoch);
       if (event.type === "action.proposed") {
         try {
           if (event.action.type !== "task.approve" && event.action.type !== "task.reject") {
@@ -267,6 +292,7 @@ export class CompanyOrchestrator {
         return;
       }
     }
+    if (epoch !== this.#dispatchEpoch) return;
     if (!decisionReceived && this.tasks.get(taskId).status === "review") {
       this.#recordApprovalRequest(
         taskId,
@@ -279,10 +305,31 @@ export class CompanyOrchestrator {
 
   async stopDispatching(): Promise<void> {
     this.#acceptingActions = false;
+    this.#dispatchEpoch += 1;
+    this.#dispatchController.abort();
   }
 
   resumeDispatching(): void {
+    this.#dispatchController = new AbortController();
     this.#acceptingActions = true;
+  }
+
+  async quiesce(signal: AbortSignal): Promise<boolean> {
+    const pending = Promise.allSettled([...this.#inFlight.values()]).then(() => true);
+    if (this.#inFlight.size === 0) return true;
+    if (signal.aborted) return false;
+    let onAbort: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<false>((resolvePromise) => {
+          onAbort = () => resolvePromise(false);
+          signal.addEventListener("abort", onAbort, { once: true });
+        })
+      ]);
+    } finally {
+      if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   #createProposedTask(action: ActionProposal): TaskRecord {
@@ -405,15 +452,18 @@ export class CompanyOrchestrator {
       taskId: action.taskId,
       text,
       actionRequest: action
-    })) {
+    }, this.#dispatchController.signal)) {
       if (event.type === "action.proposed") await this.dispatch(event.action);
     }
   }
 
   #startInFlight(taskId: string): void {
+    const epoch = this.#dispatchEpoch;
+    const signal = this.#dispatchController.signal;
     let tracked: Promise<void>;
-    tracked = this.sendTask(taskId)
+    tracked = this.sendTask(taskId, epoch, signal)
       .catch((error: unknown) => {
+        if (epoch !== this.#dispatchEpoch) return;
         this.#recordEvent("task.execution_error", "core", taskId, {
           message: error instanceof Error ? error.message : String(error)
         });
@@ -422,6 +472,12 @@ export class CompanyOrchestrator {
         if (this.#inFlight.get(taskId) === tracked) this.#inFlight.delete(taskId);
       });
     this.#inFlight.set(taskId, tracked);
+  }
+
+  #assertEpoch(epoch: number): void {
+    if (epoch !== this.#dispatchEpoch) {
+      throw new Error("orchestrator dispatch epoch expired");
+    }
   }
 
   #startReadyTask(taskId: string, actorId: string): boolean {

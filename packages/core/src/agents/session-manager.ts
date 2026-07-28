@@ -20,6 +20,18 @@ export class SessionReplacementCleanupError extends AggregateError {
   }
 }
 
+export interface InterruptOutcome {
+  employeeId: string;
+  status: "interrupted" | "not_interrupted" | "failed" | "aborted";
+  error: string | null;
+}
+
+export interface StopOutcome {
+  employeeId: string;
+  status: "stopped" | "failed" | "aborted";
+  error: string | null;
+}
+
 export class SessionManager {
   readonly #sessions = new Map<string, SessionHandle>();
   readonly #unavailableEmployees = new Set<string>();
@@ -110,7 +122,8 @@ export class SessionManager {
 
   async *send(
     employee: EmployeeDefinition,
-    message: AgentMessage
+    message: AgentMessage,
+    signal?: AbortSignal
   ): AsyncIterable<AgentEvent> {
     if (message.employeeId !== employee.id) {
       throw new Error(`message employee mismatch: ${message.employeeId}`);
@@ -122,6 +135,7 @@ export class SessionManager {
         throw new Error(`session unavailable: ${employee.id}`);
       }
       for await (const event of this.adapterFor(employee.agent).send(session, message)) {
+        if (signal?.aborted === true) return;
         if (event.type === "usage.updated") {
           const usage = {
             inputTokens: event.inputTokens,
@@ -169,12 +183,25 @@ export class SessionManager {
     }
   }
 
-  async interruptAll(): Promise<void> {
+  async interruptAll(signal?: AbortSignal): Promise<InterruptOutcome[]> {
     const entries = [...this.#sessions.entries()];
-    await Promise.all(entries.map(async ([employeeId, session]) => {
+    return Promise.all(entries.map(async ([employeeId, session]) => {
+      if (this.#isAborted(signal)) {
+        return { employeeId, status: "aborted", error: "interruption aborted" };
+      }
       const employee = this.#employeeAdapterName(session);
-      const result = await this.adapterFor(employee).interrupt(session);
-      if (result.interrupted) {
+      try {
+        const operation = this.adapterFor(employee).interrupt(session);
+        const result = await this.#raceAbort(operation, signal);
+        if (result === null) {
+          return { employeeId, status: "aborted", error: "interruption aborted" };
+        }
+        if (!result.interrupted) {
+          return { employeeId, status: "not_interrupted", error: "adapter declined interrupt" };
+        }
+        if (this.#isAborted(signal)) {
+          return { employeeId, status: "aborted", error: "interruption aborted" };
+        }
         this.store.putSession(
           this.companyId,
           employeeId,
@@ -184,6 +211,52 @@ export class SessionManager {
             reason: "requested"
           })
         );
+        return { employeeId, status: "interrupted", error: null };
+      } catch (error) {
+        return {
+          employeeId,
+          status: this.#isAborted(signal) ? "aborted" : "failed",
+          error: this.#errorMessage(error)
+        };
+      }
+    }));
+  }
+
+  async stopAllBounded(
+    signal: AbortSignal,
+    force = false
+  ): Promise<StopOutcome[]> {
+    const entries = [...this.#sessions.entries()];
+    return Promise.all(entries.map(async ([employeeId, handle]) => {
+      if (signal.aborted) {
+        return { employeeId, status: "aborted", error: "stop aborted" };
+      }
+      const adapter = this.adapterFor(this.#employeeAdapterName(handle));
+      const stop = force && adapter.forceStop !== undefined
+        ? adapter.forceStop.bind(adapter)
+        : adapter.stop.bind(adapter);
+      try {
+        const result = await this.#raceAbort(stop(handle), signal);
+        if (result === null || signal.aborted) {
+          return { employeeId, status: "aborted", error: "stop aborted" };
+        }
+        this.store.putSession(
+          this.companyId,
+          employeeId,
+          handle,
+          "stopped",
+          this.#newEvent("session.stopped", employeeId, null, { forced: force })
+        );
+        const current = this.#sessions.get(employeeId);
+        if (current !== undefined && this.#handleKey(current) === this.#handleKey(handle)) {
+          this.#sessions.delete(employeeId);
+        }
+        this.#unavailableEmployees.delete(employeeId);
+        this.#cleanupHandles.delete(this.#handleKey(handle));
+        this.#handleOrders.delete(this.#handleKey(handle));
+        return { employeeId, status: "stopped", error: null };
+      } catch (error) {
+        return { employeeId, status: "failed", error: this.#errorMessage(error) };
       }
     }));
   }
@@ -320,6 +393,31 @@ export class SessionManager {
     } finally {
       release();
     }
+  }
+
+  async #raceAbort<T>(
+    operation: Promise<T>,
+    signal: AbortSignal | undefined
+  ): Promise<T | null> {
+    if (signal === undefined) return operation;
+    if (signal.aborted) return null;
+    let onAbort: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<null>((resolvePromise) => {
+          onAbort = () => resolvePromise(null);
+          signal.addEventListener("abort", onAbort, { once: true });
+        })
+      ]);
+    } finally {
+      if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+      void operation.catch(() => undefined);
+    }
+  }
+
+  #isAborted(signal: AbortSignal | undefined): boolean {
+    return signal?.aborted ?? false;
   }
 
   #persistAgentEvent(

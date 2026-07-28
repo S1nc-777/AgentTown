@@ -35,6 +35,7 @@ function adapterWithNativeResume(
     interrupt: (session) => adapter.interrupt(session),
     resume: (input) => adapter.resume(input),
     stop: (session) => adapter.stop(session),
+    forceStop: (session) => adapter.forceStop(session),
     usage: (session) => adapter.usage(session)
   };
 }
@@ -46,13 +47,20 @@ interface Harness {
   sessions: SessionManager;
   orchestrator: CompanyOrchestrator;
   lifecycle: CheckpointService;
+  cleanupAdapter: FakeAgentAdapter;
 }
 
 const harnesses: Harness[] = [];
 
 afterEach(async () => {
   for (const harness of harnesses.splice(0)) {
-    await harness.sessions.stopAll().catch(() => undefined);
+    await Promise.race([
+      harness.sessions.stopAll().catch(() => undefined),
+      new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 50))
+    ]);
+    for (const { handle } of harness.store.listSessions(companyId)) {
+      await harness.cleanupAdapter.forceStop(handle).catch(() => undefined);
+    }
     harness.store.close();
     await harness.project.cleanup();
   }
@@ -63,16 +71,12 @@ async function createHarness(options: {
   pauseTimeoutMs?: number;
   interrupt?: AgentAdapter["interrupt"];
   reviewerResume?: AgentAdapter["resume"];
+  scenarios?: Readonly<Record<string, string>>;
+  stop?: AgentAdapter["stop"];
+  forceStop?: NonNullable<AgentAdapter["forceStop"]>;
 } = {}): Promise<Harness> {
   const project = await createTemporaryProject();
-  const base = companyDefinitionFixture();
-  const company: CompanyDefinition = {
-    ...base,
-    employees: base.employees.map((employee) => ({
-      ...employee,
-      agent: employee.id === "reviewer" ? "fake-reviewer" : "fake"
-    }))
-  };
+  const company = companyDefinitionFixture();
   const store = new CoreStore(project.databasePath);
   store.initialize();
   store.createCompany({
@@ -94,18 +98,28 @@ async function createHarness(options: {
     allowedEmployeeIds: new Set(company.employees.map(({ id }) => id))
   });
   const normal = adapterWithNativeResume(baseAdapter, "supported");
-  const reviewerBase = adapterWithNativeResume(
-    baseAdapter,
-    options.reviewerNativeResume ?? "supported"
-  );
-  const reviewer: AgentAdapter = options.reviewerResume === undefined
-    ? reviewerBase
-    : { ...reviewerBase, resume: options.reviewerResume };
-  const interrupted: AgentAdapter = options.interrupt === undefined
-    ? normal
-    : { ...normal, interrupt: options.interrupt };
-  const adapterFor = (name: string): AgentAdapter =>
-    name === "fake-reviewer" ? reviewer : interrupted;
+  const configured: AgentAdapter = {
+    ...normal,
+    ...(options.interrupt === undefined ? {} : { interrupt: options.interrupt }),
+    ...(options.reviewerResume === undefined
+      ? {}
+      : {
+          resume: (input) => input.employeeId === "reviewer"
+            ? options.reviewerResume!(input)
+            : normal.resume(input)
+        }),
+    ...(options.reviewerNativeResume === undefined
+      ? {}
+      : {
+          capabilities: async () => ({
+            ...await normal.capabilities(),
+            nativeResume: options.reviewerNativeResume!
+          })
+        }),
+    ...(options.stop === undefined ? {} : { stop: options.stop }),
+    ...(options.forceStop === undefined ? {} : { forceStop: options.forceStop })
+  };
+  const adapterFor = (): AgentAdapter => configured;
   const sessions = new SessionManager(adapterFor, store, companyId, project.root);
   const tasks = new TaskService(store, companyId, company, "leader");
   const orchestrator = new CompanyOrchestrator(
@@ -129,9 +143,17 @@ async function createHarness(options: {
       ? {}
       : { pauseTimeoutMs: options.pauseTimeoutMs })
   });
-  const harness = { project, company, store, sessions, orchestrator, lifecycle };
+  const harness = {
+    project,
+    company,
+    store,
+    sessions,
+    orchestrator,
+    lifecycle,
+    cleanupAdapter: baseAdapter
+  };
   harnesses.push(harness);
-  await orchestrator.start({});
+  await orchestrator.start(options.scenarios ?? {});
   return harness;
 }
 
@@ -179,15 +201,19 @@ describe("CheckpointService", () => {
   });
 
   it("uses native resume only when declared and rebuilds the other real session", async () => {
-    const { lifecycle, sessions, store } = await createHarness({
-      reviewerNativeResume: "unsupported"
-    });
+    const { lifecycle, sessions, store } = await createHarness();
     const checkpoint = await lifecycle.pause("last_client_exited");
+    const mixedCheckpoint = {
+      ...checkpoint,
+      sessions: checkpoint.sessions.map((session) => session.employeeId === "reviewer"
+        ? { ...session, handle: { ...session.handle, nativeSessionId: null } }
+        : session)
+    };
     const oldHandles = new Map(
       checkpoint.sessions.map((session) => [session.employeeId, session.handle])
     );
 
-    const { decisions } = await lifecycle.recoverLatest();
+    const { decisions } = await lifecycle.recover(mixedCheckpoint);
 
     expect(decisions).toEqual([
       { employeeId: "leader", mode: "native" },
@@ -208,19 +234,31 @@ describe("CheckpointService", () => {
     ]);
   });
 
-  it("records an interrupt timeout and still leaves a stopped, paused company", async () => {
+  it("blocks within the total deadline when termination cannot be confirmed", async () => {
     const neverInterrupt: AgentAdapter["interrupt"] = async () =>
       await new Promise<never>(() => undefined);
-    const { lifecycle, store } = await createHarness({
+    const { lifecycle, store, sessions } = await createHarness({
       interrupt: neverInterrupt,
+      stop: async () => await new Promise<never>(() => undefined),
+      forceStop: async () => await new Promise<never>(() => undefined),
       pauseTimeoutMs: 20
     });
 
-    await lifecycle.pause("shutdown");
+    const startedAt = Date.now();
+    await expect(lifecycle.pause("shutdown")).rejects.toThrow("pause failed");
+    const elapsedMs = Date.now() - startedAt;
 
-    expect(store.getCompany(companyId)?.status).toBe("paused");
-    expect(store.listSessions(companyId).every(({ status }) => status === "stopped")).toBe(true);
+    expect(elapsedMs).toBeLessThanOrEqual(120);
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).not.toThrow();
     expect(store.listEvents(0).some(({ type }) => type === "company.pause_timeout")).toBe(true);
+    expect(store.listEvents(0).map(({ type }) => type)).toEqual(expect.arrayContaining([
+      "session.stop_failed",
+      "company.pause_failed",
+      "user.approval.requested"
+    ]));
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
   });
 
   it("records interrupt failure and continues the same checkpoint path", async () => {
@@ -285,5 +323,229 @@ describe("CheckpointService", () => {
         })
       })
     ]));
+  });
+
+  it("returns the original checkpoint for sequential pause reasons", async () => {
+    const { lifecycle, store } = await createHarness();
+
+    const first = await lifecycle.pause("user_requested");
+    const second = await lifecycle.pause("last_client_exited");
+
+    expect(second).toEqual(first);
+    expect(second.reason).toBe("user_requested");
+    expect(store.listEvents(0).filter(({ type }) => type === "company.checkpointed"))
+      .toHaveLength(1);
+    expect(store.listEvents(0).filter(({ type }) => type === "company.paused"))
+      .toHaveLength(1);
+  });
+
+  it("records interrupted false as employee-owned failure", async () => {
+    const { lifecycle, store } = await createHarness({
+      interrupt: async () => ({ interrupted: false })
+    });
+
+    await lifecycle.pause("user_requested");
+
+    expect(store.listEvents(0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "session.interrupt_failed",
+        actorId: "leader",
+        payload: expect.objectContaining({ employeeId: "leader" })
+      })
+    ]));
+  });
+
+  it("blocks and requests approval when stop and force-stop cannot clean up", async () => {
+    const project = await createTemporaryProject();
+    const company = companyDefinitionFixture();
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    store.createCompany({
+      id: companyId,
+      definition: company,
+      event: {
+        id: randomUUID(),
+        type: "company.created",
+        actorId: "owner",
+        taskId: null,
+        causationEventId: null,
+        payload: {}
+      }
+    });
+    const baseAdapter = new FakeAgentAdapter({
+      executable: process.execPath,
+      packageRoot: fakeRoot,
+      allowedEmployeeIds: new Set(company.employees.map(({ id }) => id))
+    });
+    const unkillable: AgentAdapter = {
+      ...adapterWithNativeResume(baseAdapter, "supported"),
+      stop: async () => await new Promise<never>(() => undefined),
+      forceStop: async () => await new Promise<never>(() => undefined)
+    };
+    const sessions = new SessionManager(() => unkillable, store, companyId, project.root);
+    const tasks = new TaskService(store, companyId, company, "leader");
+    const orchestrator = new CompanyOrchestrator(
+      companyId,
+      company,
+      store,
+      tasks,
+      new ActionPolicy(company, "leader", new Set(["reviewer"])),
+      sessions,
+      "leader",
+      "reviewer"
+    );
+    const lifecycle = new CheckpointService({
+      companyId,
+      company,
+      store,
+      orchestrator,
+      sessions,
+      adapterFor: () => unkillable,
+      pauseTimeoutMs: 40
+    });
+    await orchestrator.start({});
+    try {
+      await expect(lifecycle.pause("shutdown")).rejects.toThrow("pause failed");
+
+      expect(store.getCompany(companyId)?.status).toBe("blocked");
+      expect(store.listEvents(0).map(({ type }) => type)).toEqual(expect.arrayContaining([
+        "session.stop_failed",
+        "company.pause_failed",
+        "user.approval.requested"
+      ]));
+    } finally {
+      for (const { handle } of store.listSessions(companyId)) {
+        await baseAdapter.stop(handle).catch(() => undefined);
+      }
+      store.close();
+      await project.cleanup();
+    }
+  });
+
+  it("blocks corrupt persisted recovery before starting a process", async () => {
+    const { lifecycle, store, sessions } = await createHarness();
+    await lifecycle.pause("user_requested");
+    const stored = store.latestCheckpoint(companyId);
+    if (stored === null) throw new Error("checkpoint missing");
+    store.putCheckpoint(
+      {
+        ...stored,
+        id: randomUUID(),
+        createdAt: new Date(Date.now() + 1_000).toISOString(),
+        payload: { ...stored.payload, sessions: [{ employeeId: "intruder" }] }
+      },
+      {
+        id: randomUUID(),
+        type: "test.corrupt_checkpoint",
+        actorId: "test",
+        taskId: null,
+        causationEventId: null,
+        payload: {}
+      }
+    );
+
+    await expect(lifecycle.recoverLatest()).rejects.toThrow();
+
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).toThrow("session not started");
+    expect(store.listEvents(0).map(({ type }) => type)).toEqual(expect.arrayContaining([
+      "company.recovery_blocked",
+      "user.approval.requested"
+    ]));
+  });
+
+  it("blocks semantic adapter mismatch before starting a recovery process", async () => {
+    const { lifecycle, store, sessions } = await createHarness();
+    const checkpoint = await lifecycle.pause("user_requested");
+    const mismatched = {
+      ...checkpoint,
+      sessions: checkpoint.sessions.map((session, index) => index === 0
+        ? { ...session, handle: { ...session.handle, adapter: "other-adapter" } }
+        : session)
+    };
+
+    await expect(lifecycle.recover(mismatched)).rejects.toThrow("recovery blocked");
+
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).toThrow("session not started");
+    expect(store.listEvents(0).map(({ type }) => type)).toEqual(expect.arrayContaining([
+      "company.recovery_blocked",
+      "user.approval.requested"
+    ]));
+  });
+
+  it("fences late interrupt completion from writing session facts", async () => {
+    let resolveInterrupt: ((value: { interrupted: boolean }) => void) | undefined;
+    const lateInterrupt = new Promise<{ interrupted: boolean }>((resolvePromise) => {
+      resolveInterrupt = resolvePromise;
+    });
+    const { lifecycle, store } = await createHarness({
+      interrupt: async () => lateInterrupt,
+      pauseTimeoutMs: 100
+    });
+
+    await lifecycle.pause("user_requested");
+    const eventCount = store.listEvents(0).length;
+    resolveInterrupt?.({ interrupted: true });
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
+
+    expect(store.listEvents(0)).toHaveLength(eventCount);
+    expect(store.listEvents(0).some(({ type }) => type === "session.interrupted")).toBe(false);
+  });
+
+  it("fences an in-flight Fake Agent continuation after checkpoint creation", async () => {
+    const harness = await createHarness({
+      scenarios: { developer: "silent" },
+      pauseTimeoutMs: 500
+    });
+    const tasks = new TaskService(harness.store, companyId, harness.company, "leader");
+    tasks.create({
+      id: "task-fenced",
+      title: "Fence late work",
+      objective: "Do not mutate after pause",
+      ownerEmployeeId: null,
+      dependencies: [],
+      acceptanceCriteria: ["No post-checkpoint task events"],
+      status: "draft",
+      retryCount: 0,
+      reviewLoopCount: 0,
+      artifacts: [],
+      evidence: []
+    });
+    tasks.assign("task-fenced", "developer");
+    tasks.transition("task-fenced", "running", "developer");
+    const running = harness.orchestrator.sendTask("task-fenced");
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+
+    await harness.lifecycle.pause("user_requested");
+    await running;
+
+    const checkpointEvent = harness.store.listEvents(0)
+      .find(({ type }) => type === "company.checkpointed");
+    if (checkpointEvent === undefined) throw new Error("checkpoint event missing");
+    expect(harness.store.listEvents(checkpointEvent.sequence)
+      .filter(({ taskId }) => taskId === "task-fenced")).toEqual([]);
+    expect(tasks.get("task-fenced").status).toBe("running");
+  });
+
+  it("singleflights concurrent recovery and rejects a repeat from running", async () => {
+    const { lifecycle, store } = await createHarness();
+    const checkpoint = await lifecycle.pause("user_requested");
+
+    const first = lifecycle.recover(checkpoint);
+    const second = lifecycle.recover(checkpoint);
+    expect(second).toBe(first);
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    const recoveredCount = store.listEvents(0)
+      .filter(({ type }) => type === "session.recovered").length;
+    const startedCount = store.listEvents(0)
+      .filter(({ type }) => type === "session.started").length;
+
+    await expect(lifecycle.recover(checkpoint)).rejects.toThrow("not eligible");
+
+    expect(store.listEvents(0).filter(({ type }) => type === "session.recovered"))
+      .toHaveLength(recoveredCount);
+    expect(store.listEvents(0).filter(({ type }) => type === "session.started"))
+      .toHaveLength(startedCount);
   });
 });

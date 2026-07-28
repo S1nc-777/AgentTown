@@ -84,5 +84,6 @@ export interface AgentAdapter {
   interrupt(session: SessionHandle): Promise<{ interrupted: boolean }>;
   resume(input: ResumeSessionInput): Promise<SessionHandle>;
   stop(session: SessionHandle): Promise<void>;
+  forceStop?(session: SessionHandle): Promise<void>;
   usage(session: SessionHandle): Promise<UsageSnapshot>;
 }

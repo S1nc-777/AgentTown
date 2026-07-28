@@ -412,6 +412,57 @@ export class CoreStore {
     this.#publishEvents([insertedEvent]);
   }
 
+  commitPauseFacts(
+    checkpoint: StoredCheckpoint,
+    checkpointEvent: NewEvent,
+    pausedEvent: NewEvent
+  ): void {
+    const insertedEvents = this.inTransaction(() => {
+      this.#database.prepare(`
+        INSERT INTO checkpoints (id, company_id, created_at, payload_json)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        checkpoint.id,
+        checkpoint.companyId,
+        checkpoint.createdAt,
+        JSON.stringify(checkpoint.payload)
+      );
+      const updated = this.#database.prepare(`
+        UPDATE companies
+        SET status = 'paused', updated_at = ?
+        WHERE id = ?
+      `).run(new Date().toISOString(), checkpoint.companyId);
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`company not found: ${checkpoint.companyId}`);
+      }
+      return [
+        this.#insertEventRow(checkpointEvent),
+        this.#insertEventRow(pausedEvent)
+      ];
+    });
+    this.#publishEvents(insertedEvents);
+  }
+
+  commitCompanyStatusWithEvents(
+    companyId: string,
+    status: string,
+    events: readonly NewEvent[]
+  ): void {
+    if (events.length === 0) {
+      throw new Error("commitCompanyStatusWithEvents requires at least one event");
+    }
+    const insertedEvents = this.inTransaction(() => {
+      const updated = this.#database.prepare(`
+        UPDATE companies
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+      `).run(status, new Date().toISOString(), companyId);
+      if (Number(updated.changes) !== 1) throw new Error(`company not found: ${companyId}`);
+      return events.map((event) => this.#insertEventRow(event));
+    });
+    this.#publishEvents(insertedEvents);
+  }
+
   latestCheckpoint(companyId: string): StoredCheckpoint | null {
     const row = this.#database.prepare(`
       SELECT id, company_id, created_at, payload_json

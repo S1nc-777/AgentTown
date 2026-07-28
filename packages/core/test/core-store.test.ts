@@ -63,6 +63,85 @@ describe("CoreStore", () => {
     store.close();
   });
 
+  it("atomically rolls back checkpoint and paused status when either pause event fails", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    const duplicateEvent = {
+      id: "pause-duplicate",
+      type: "company.created",
+      actorId: "owner",
+      payload: {},
+      causationEventId: null,
+      taskId: null
+    };
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: duplicateEvent
+    });
+
+    expect(() => store.commitPauseFacts(
+      {
+        id: "checkpoint-1",
+        companyId: "company-1",
+        createdAt: new Date().toISOString(),
+        payload: { companyId: "company-1" }
+      },
+      {
+        ...duplicateEvent,
+        id: "checkpoint-event",
+        type: "company.checkpointed"
+      },
+      {
+        ...duplicateEvent,
+        type: "company.paused"
+      }
+    )).toThrow();
+
+    expect(store.latestCheckpoint("company-1")).toBeNull();
+    expect(store.getCompany("company-1")?.status).toBe("active");
+    expect(store.listEvents(0)).toHaveLength(1);
+    store.close();
+  });
+
+  it("atomically rolls back a lifecycle status bundle when a later event fails", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    const companyEvent = {
+      id: "company-event",
+      type: "company.created",
+      actorId: "owner",
+      payload: {},
+      causationEventId: null,
+      taskId: null
+    };
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: companyEvent
+    });
+
+    expect(() => store.commitCompanyStatusWithEvents("company-1", "blocked", [
+      {
+        ...companyEvent,
+        id: "first-failure-event",
+        type: "company.recovery_blocked"
+      },
+      {
+        ...companyEvent,
+        type: "user.approval.requested"
+      }
+    ])).toThrow();
+
+    expect(store.getCompany("company-1")?.status).toBe("active");
+    expect(store.listEvents(0).map(({ id }) => id)).toEqual(["company-event"]);
+    store.close();
+  });
+
   it("rejects status changes for a missing company without publishing an event", async () => {
     const project = await createTemporaryProject();
     cleanups.push(project.cleanup);

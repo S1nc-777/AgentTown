@@ -47,6 +47,7 @@ interface LiveFakeSession {
   interruptWaiters: Array<(interrupted: boolean) => void>;
   logFileDescriptor: number;
   logFileClosed: boolean;
+  stopping: Promise<void> | null;
 }
 
 interface QueueWaiter<T> {
@@ -240,23 +241,46 @@ export class FakeAgentAdapter implements AgentAdapter {
   async stop(session: SessionHandle): Promise<void> {
     const live = this.#sessions.get(session.internalSessionId);
     if (live === undefined) return;
+    if (live.stopping !== null) return live.stopping;
 
-    if (live.child.exitCode === null && live.child.signalCode === null) {
-      writeJsonLine(live.child, { type: "stop" });
-      const closed = await Promise.race([
-        live.closed.then(() => true),
-        new Promise<false>((resolvePromise) => {
-          setTimeout(() => resolvePromise(false), STOP_TIMEOUT_MS);
-        })
-      ]);
-      if (!closed) {
-        live.child.kill();
+    const stopping = (async () => {
+      if (live.child.exitCode === null && live.child.signalCode === null) {
+        writeJsonLine(live.child, { type: "stop" });
+        const closed = await Promise.race([
+          live.closed.then(() => true),
+          new Promise<false>((resolvePromise) => {
+            setTimeout(() => resolvePromise(false), STOP_TIMEOUT_MS);
+          })
+        ]);
+        if (!closed) {
+          live.child.stdin.destroy();
+          live.child.kill();
+          await live.closed;
+        }
+      } else {
         await live.closed;
       }
-    } else {
-      await live.closed;
+      this.#sessions.delete(session.internalSessionId);
+    })();
+    live.stopping = stopping;
+    return stopping;
+  }
+
+  async forceStop(session: SessionHandle): Promise<void> {
+    const live = this.#sessions.get(session.internalSessionId);
+    if (live === undefined) return;
+    if (live.child.exitCode === null && live.child.signalCode === null) {
+      live.child.stdin.destroy();
+      if (!live.child.kill()) {
+        throw new Error(`failed to force-stop Fake Agent: ${session.employeeId}`);
+      }
     }
-    this.#sessions.delete(session.internalSessionId);
+    // A successful kill transfers termination ownership to the OS. Keep the
+    // adapter record until close is observed, without extending Core's deadline.
+    void live.closed.then(
+      () => this.#sessions.delete(session.internalSessionId),
+      () => this.#sessions.delete(session.internalSessionId)
+    );
   }
 
   async usage(session: SessionHandle): Promise<UsageSnapshot> {
@@ -356,8 +380,10 @@ export class FakeAgentAdapter implements AgentAdapter {
       closed: Promise.resolve(),
       interruptWaiters: [],
       logFileDescriptor,
-      logFileClosed: false
+      logFileClosed: false,
+      stopping: null
     };
+    child.stdin.on("error", () => undefined);
 
     let stdoutBuffer = "";
     child.stdout.on("data", (chunk: string) => {

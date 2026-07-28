@@ -9,7 +9,11 @@ import type {
   SessionHandle,
   TaskRecord
 } from "@agenttown/runtime-contract";
-import { SessionManager } from "../agents/session-manager.js";
+import {
+  SessionManager,
+  type InterruptOutcome,
+  type StopOutcome
+} from "../agents/session-manager.js";
 import { CompanyOrchestrator } from "../company/orchestrator.js";
 import { CoreStore, type NewEvent, type StoredCheckpoint } from "../storage/core-store.js";
 
@@ -22,8 +26,18 @@ export interface CheckpointServiceOptions {
   companyId: string;
   company: CompanyDefinition;
   store: CoreStore;
-  orchestrator: Pick<CompanyOrchestrator, "stopDispatching" | "resumeDispatching">;
-  sessions: Pick<SessionManager, "interruptAll" | "stopAll" | "resumeOne" | "rebuildOne">;
+  orchestrator: Pick<
+    CompanyOrchestrator,
+    "stopDispatching" | "resumeDispatching" | "quiesce"
+  >;
+  sessions: Pick<
+    SessionManager,
+    | "interruptAll"
+    | "stopAll"
+    | "stopAllBounded"
+    | "resumeOne"
+    | "rebuildOne"
+  >;
   adapterFor: (agentName: string) => AgentAdapter;
   pauseTimeoutMs?: number;
 }
@@ -32,6 +46,13 @@ export class RecoveryBlockedError extends Error {
   constructor(readonly employeeId: string, cause: unknown) {
     super(`company recovery blocked at employee ${employeeId}`, { cause });
     this.name = "RecoveryBlockedError";
+  }
+}
+
+export class PauseFailedError extends Error {
+  constructor(readonly outcomes: readonly StopOutcome[]) {
+    super(`company pause failed because sessions remain live: ${JSON.stringify(outcomes)}`);
+    this.name = "PauseFailedError";
   }
 }
 
@@ -44,8 +65,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function readString(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new TypeError(`${label} must be a non-empty string`);
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new TypeError(`${label} must be a well-formed non-empty string`);
   }
   return value;
 }
@@ -60,11 +86,8 @@ function parseHandle(value: unknown): SessionHandle {
   return {
     employeeId: readString(value.employeeId, "checkpoint handle employeeId"),
     adapter: readString(value.adapter, "checkpoint handle adapter"),
-    internalSessionId: readString(value.internalSessionId, "checkpoint handle internalSessionId"),
-    nativeSessionId: readNullableString(
-      value.nativeSessionId,
-      "checkpoint handle nativeSessionId"
-    )
+    internalSessionId: readString(value.internalSessionId, "checkpoint internalSessionId"),
+    nativeSessionId: readNullableString(value.nativeSessionId, "checkpoint nativeSessionId")
   };
 }
 
@@ -81,34 +104,37 @@ export function parseCompanyCheckpoint(value: unknown): CompanyCheckpoint {
   if (!Number.isSafeInteger(value.lastEventSequence) || Number(value.lastEventSequence) < 0) {
     throw new TypeError("checkpoint lastEventSequence must be a non-negative integer");
   }
-  if (!Array.isArray(value.sessions)) {
-    throw new TypeError("checkpoint sessions must be an array");
-  }
+  if (!Array.isArray(value.sessions)) throw new TypeError("checkpoint sessions must be an array");
   return {
     companyId: readString(value.companyId, "checkpoint companyId"),
     reason,
     lastEventSequence: Number(value.lastEventSequence),
-    sessions: value.sessions.map((sessionValue): SessionCheckpoint => {
-      if (!isRecord(sessionValue)) throw new TypeError("checkpoint session must be an object");
-      const employeeId = readString(
-        sessionValue.employeeId,
-        "checkpoint session employeeId"
-      );
-      const handle = parseHandle(sessionValue.handle);
+    sessions: value.sessions.map((raw): SessionCheckpoint => {
+      if (!isRecord(raw)) throw new TypeError("checkpoint session must be an object");
+      const employeeId = readString(raw.employeeId, "checkpoint session employeeId");
+      const handle = parseHandle(raw.handle);
       if (handle.employeeId !== employeeId) {
         throw new TypeError(`checkpoint handle employee mismatch: ${employeeId}`);
       }
       return {
         employeeId,
         handle,
-        activeTaskId: readNullableString(
-          sessionValue.activeTaskId,
-          "checkpoint session activeTaskId"
-        ),
-        handoff: readString(sessionValue.handoff, "checkpoint session handoff")
+        activeTaskId: readNullableString(raw.activeTaskId, "checkpoint activeTaskId"),
+        handoff: readString(raw.handoff, "checkpoint handoff")
       };
     })
   };
+}
+
+interface ActiveOperation {
+  kind: "pause" | "recover";
+  promise: Promise<unknown>;
+}
+
+interface Deadline {
+  at: number;
+  controller: AbortController;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export class CheckpointService {
@@ -119,7 +145,7 @@ export class CheckpointService {
   readonly #sessions: CheckpointServiceOptions["sessions"];
   readonly #adapterFor: CheckpointServiceOptions["adapterFor"];
   readonly #pauseTimeoutMs: number;
-  #pauseInFlight: Promise<CompanyCheckpoint> | null = null;
+  #operation: ActiveOperation | null = null;
 
   constructor(options: CheckpointServiceOptions) {
     this.#companyId = options.companyId;
@@ -135,34 +161,144 @@ export class CheckpointService {
   }
 
   pause(reason: PauseReason): Promise<CompanyCheckpoint> {
-    if (this.#pauseInFlight !== null) return this.#pauseInFlight;
-    const operation = this.#pause(reason).finally(() => {
-      if (this.#pauseInFlight === operation) this.#pauseInFlight = null;
+    if (this.#operation !== null) {
+      if (this.#operation.kind !== "pause") {
+        return Promise.reject(new Error("company lifecycle recovery is in progress"));
+      }
+      return this.#operation.promise as Promise<CompanyCheckpoint>;
+    }
+    const existing = this.#existingPausedCheckpoint();
+    if (existing !== null) return Promise.resolve(existing);
+    return this.#runOperation("pause", () => this.#pause(reason));
+  }
+
+  recoverLatest(): Promise<RecoveryResult> {
+    if (this.#operation !== null) {
+      if (this.#operation.kind !== "recover") {
+        return Promise.reject(new Error("company lifecycle pause is in progress"));
+      }
+      return this.#operation.promise as Promise<RecoveryResult>;
+    }
+    return this.#runOperation("recover", async () => {
+      const stored = this.#store.latestCheckpoint(this.#companyId);
+      if (stored === null) {
+        return this.#blockInvalidRecovery("checkpoint", new Error("checkpoint not found"));
+      }
+      let checkpoint: CompanyCheckpoint;
+      try {
+        checkpoint = this.#checkpointFromStored(stored);
+        this.#validateCheckpoint(checkpoint, this.#company);
+      } catch (error) {
+        return this.#blockInvalidRecovery("checkpoint", error);
+      }
+      return this.#recover(checkpoint, this.#company);
     });
-    this.#pauseInFlight = operation;
-    return operation;
   }
 
-  async recoverLatest(): Promise<RecoveryResult> {
-    const stored = this.#store.latestCheckpoint(this.#companyId);
-    if (stored === null) throw new Error(`checkpoint not found: ${this.#companyId}`);
-    return this.recover(this.#checkpointFromStored(stored));
-  }
-
-  async recover(
+  recover(
     checkpoint: CompanyCheckpoint,
     company: CompanyDefinition = this.#company
   ): Promise<RecoveryResult> {
-    this.#validateCheckpointRoster(checkpoint, company);
+    if (this.#operation !== null) {
+      if (this.#operation.kind !== "recover") {
+        return Promise.reject(new Error("company lifecycle pause is in progress"));
+      }
+      return this.#operation.promise as Promise<RecoveryResult>;
+    }
+    return this.#runOperation("recover", async () => {
+      try {
+        this.#validateCheckpoint(checkpoint, company);
+      } catch (error) {
+        return this.#blockInvalidRecovery("checkpoint", error);
+      }
+      return this.#recover(checkpoint, company);
+    });
+  }
+
+  async #pause(reason: PauseReason): Promise<CompanyCheckpoint> {
+    const deadline = this.#deadline(this.#pauseTimeoutMs);
+    try {
+      await this.#orchestrator.stopDispatching();
+      const interruptSignal = this.#phaseSignal(
+        deadline,
+        Math.max(1, Math.floor(this.#pauseTimeoutMs * 0.05))
+      );
+      const interruptOutcomes = await this.#sessions.interruptAll(interruptSignal.signal);
+      interruptSignal.dispose();
+      this.#recordInterruptOutcomes(interruptOutcomes);
+
+      const quiesceSignal = this.#phaseSignal(
+        deadline,
+        Math.max(1, Math.floor(this.#pauseTimeoutMs * 0.05))
+      );
+      const quiesced = await this.#orchestrator.quiesce(quiesceSignal.signal);
+      quiesceSignal.dispose();
+      if (!quiesced) {
+        this.#store.insertEvent(this.#event("company.pause_timeout", "core", null, {
+          phase: "quiesce",
+          timeoutMs: this.#pauseTimeoutMs
+        }));
+      }
+
+      const checkpoint = this.#buildCheckpoint(reason);
+      const stored: StoredCheckpoint = {
+        id: randomUUID(),
+        companyId: this.#companyId,
+        createdAt: new Date().toISOString(),
+        payload: checkpoint as unknown as Record<string, unknown>
+      };
+      this.#store.commitPauseFacts(
+        stored,
+        this.#event("company.checkpointed", "core", null, {
+          reason,
+          lastEventSequence: checkpoint.lastEventSequence,
+          sessionCount: checkpoint.sessions.length
+        }),
+        this.#event("company.paused", "core", null, { reason })
+      );
+
+      const forceReserve = Math.max(1, Math.floor(this.#pauseTimeoutMs * 0.9));
+      const gracefulSignal = this.#signalUntil(Math.max(Date.now(), deadline.at - forceReserve));
+      const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
+      gracefulSignal.dispose();
+      const remaining = graceful.filter(({ status }) => status !== "stopped");
+      let finalOutcomes = graceful;
+      if (remaining.length > 0) {
+        finalOutcomes = await this.#sessions.stopAllBounded(deadline.controller.signal, true);
+      }
+      const failed = finalOutcomes.filter(({ status }) => status !== "stopped");
+      if (failed.length > 0) {
+        this.#commitPauseFailure(failed);
+        throw new PauseFailedError(failed);
+      }
+      return checkpoint;
+    } finally {
+      clearTimeout(deadline.timer);
+      deadline.controller.abort();
+    }
+  }
+
+  async #recover(
+    checkpoint: CompanyCheckpoint,
+    company: CompanyDefinition
+  ): Promise<RecoveryResult> {
+    const companyFact = this.#store.getCompany(this.#companyId);
+    if (companyFact?.status !== "paused") {
+      throw new Error(`company is not eligible for recovery: ${companyFact?.status ?? "missing"}`);
+    }
     await this.#orchestrator.stopDispatching();
+    this.#store.commitCompanyStatusWithEvents(this.#companyId, "recovering", [
+      this.#event("company.recovery_started", "core", null, {
+        checkpointSequence: checkpoint.lastEventSequence
+      })
+    ]);
     const decisions: RecoveryDecision[] = [];
+    const decisionEvents: NewEvent[] = [];
     let currentEmployeeId = "unknown";
     try {
       for (const employee of company.employees) {
         currentEmployeeId = employee.id;
-        const session = checkpoint.sessions.find(
-          ({ employeeId }) => employeeId === employee.id
-        );
+        const session = checkpoint.sessions.find(({ employeeId }) => employeeId === employee.id);
         if (session === undefined) throw new Error(`checkpoint session missing: ${employee.id}`);
         const capabilities = await this.#adapterFor(employee.agent).capabilities();
         const native = capabilities.nativeResume === "supported"
@@ -175,7 +311,7 @@ export class CheckpointService {
           mode: native ? "native" : "rebuilt"
         };
         decisions.push(decision);
-        this.#store.insertEvent(this.#event(
+        decisionEvents.push(this.#event(
           native ? "session.recovered" : "session.rebuilt",
           employee.id,
           session.activeTaskId,
@@ -188,111 +324,127 @@ export class CheckpointService {
           }
         ));
       }
-      this.#store.setCompanyStatus(
-        this.#companyId,
-        "running",
+      this.#store.commitCompanyStatusWithEvents(this.#companyId, "running", [
+        ...decisionEvents,
         this.#event("company.recovered", "core", null, { decisions })
-      );
+      ]);
       this.#orchestrator.resumeDispatching();
       return { decisions };
     } catch (error) {
-      let cleanupError: unknown;
-      try {
-        await this.#sessions.stopAll();
-      } catch (stopError) {
-        cleanupError = stopError;
-      }
-      this.#store.setCompanyStatus(
-        this.#companyId,
-        "blocked",
-        this.#event("company.recovery_blocked", "core", null, {
-          employeeId: currentEmployeeId,
-          error: errorMessage(error),
-          cleanupError: cleanupError === undefined ? null : errorMessage(cleanupError)
-        })
+      const cleanupDeadline = this.#deadline(this.#pauseTimeoutMs);
+      const gracefulSignal = this.#signalUntil(
+        Math.max(Date.now(), cleanupDeadline.at - Math.floor(this.#pauseTimeoutMs * 0.5))
       );
+      const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
+      gracefulSignal.dispose();
+      const cleanupOutcomes = graceful.some(({ status }) => status !== "stopped")
+        ? await this.#sessions.stopAllBounded(cleanupDeadline.controller.signal, true)
+        : graceful;
+      clearTimeout(cleanupDeadline.timer);
+      cleanupDeadline.controller.abort();
+      const cleanupFailures = cleanupOutcomes.filter(({ status }) => status !== "stopped");
+      const cleanupError = cleanupFailures.length === 0
+        ? undefined
+        : new Error(`recovery cleanup incomplete: ${JSON.stringify(cleanupFailures)}`);
+      this.#commitRecoveryBlocked(currentEmployeeId, error, cleanupError);
       throw new RecoveryBlockedError(currentEmployeeId, error);
     }
   }
 
-  async #pause(reason: PauseReason): Promise<CompanyCheckpoint> {
-    await this.#orchestrator.stopDispatching();
-    await this.#interruptWithinDeadline();
-    const checkpoint = this.#buildCheckpoint(reason);
-    this.#store.putCheckpoint(
-      {
-        id: randomUUID(),
-        companyId: this.#companyId,
-        createdAt: new Date().toISOString(),
-        payload: checkpoint as unknown as Record<string, unknown>
-      },
-      this.#event("company.checkpointed", "core", null, {
-        reason,
-        lastEventSequence: checkpoint.lastEventSequence,
-        sessionCount: checkpoint.sessions.length
-      })
-    );
-    this.#store.setCompanyStatus(
-      this.#companyId,
-      "paused",
-      this.#event("company.paused", "core", null, { reason })
-    );
-    await this.#sessions.stopAll();
-    return checkpoint;
+  #recordInterruptOutcomes(outcomes: readonly InterruptOutcome[]): void {
+    for (const outcome of outcomes) {
+      if (outcome.status === "interrupted") continue;
+      this.#store.insertEvent(this.#event(
+        outcome.status === "aborted" ? "company.pause_timeout" : "session.interrupt_failed",
+        outcome.employeeId,
+        null,
+        {
+          employeeId: outcome.employeeId,
+          status: outcome.status,
+          error: outcome.error
+        }
+      ));
+    }
   }
 
-  async #interruptWithinDeadline(): Promise<void> {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const outcome = this.#sessions.interruptAll().then(
-      () => "interrupted" as const,
-      (error) => ({ error })
-    );
-    const timed = new Promise<"timeout">((resolve) => {
-      timeout = setTimeout(() => resolve("timeout"), this.#pauseTimeoutMs);
-    });
-    const result = await Promise.race([outcome, timed]);
-    if (timeout !== undefined) clearTimeout(timeout);
-    if (result === "timeout") {
-      this.#store.insertEvent(this.#event("company.pause_timeout", "core", null, {
-        timeoutMs: this.#pauseTimeoutMs
-      }));
-    } else if (result !== "interrupted") {
-      this.#store.insertEvent(this.#event("session.interrupt_failed", "core", null, {
-        error: errorMessage(result.error)
-      }));
-    }
+  #commitPauseFailure(outcomes: readonly StopOutcome[]): void {
+    this.#store.commitCompanyStatusWithEvents(this.#companyId, "blocked", [
+      ...outcomes.map((outcome) => this.#event(
+        "session.stop_failed",
+        outcome.employeeId,
+        null,
+        {
+          employeeId: outcome.employeeId,
+          status: outcome.status,
+          error: outcome.error
+        }
+      )),
+      this.#event("company.pause_failed", "core", null, {
+        employees: outcomes.map(({ employeeId }) => employeeId)
+      }),
+      this.#approvalEvent("pause_cleanup_failed", {
+        employees: outcomes.map(({ employeeId }) => employeeId)
+      })
+    ]);
+  }
+
+  #commitRecoveryBlocked(
+    employeeId: string,
+    error: unknown,
+    cleanupError?: unknown
+  ): void {
+    this.#store.commitCompanyStatusWithEvents(this.#companyId, "blocked", [
+      this.#event("company.recovery_blocked", "core", null, {
+        employeeId,
+        error: errorMessage(error),
+        cleanupError: cleanupError === undefined ? null : errorMessage(cleanupError)
+      }),
+      this.#approvalEvent("company_recovery_blocked", {
+        employeeId,
+        error: errorMessage(error)
+      })
+    ]);
+  }
+
+  #blockInvalidRecovery(employeeId: string, error: unknown): never {
+    this.#commitRecoveryBlocked(employeeId, error);
+    throw new RecoveryBlockedError(employeeId, error);
+  }
+
+  #existingPausedCheckpoint(): CompanyCheckpoint | null {
+    if (this.#store.getCompany(this.#companyId)?.status !== "paused") return null;
+    const stored = this.#store.latestCheckpoint(this.#companyId);
+    if (stored === null) return null;
+    const checkpoint = this.#checkpointFromStored(stored);
+    this.#validateCheckpoint(checkpoint, this.#company);
+    return checkpoint;
   }
 
   #buildCheckpoint(reason: PauseReason): CompanyCheckpoint {
     const events = this.#store.listEvents(0);
     const tasks = this.#store.listTasks(this.#companyId);
-    const sessionsByEmployee = new Map(
-      this.#store.listSessions(this.#companyId)
-        .map((session) => [session.employeeId, session] as const)
+    const sessions = new Map(
+      this.#store.listSessions(this.#companyId).map((session) => [session.employeeId, session])
     );
     return {
       companyId: this.#companyId,
       reason,
       lastEventSequence: events.at(-1)?.sequence ?? 0,
       sessions: this.#company.employees.map((employee) => {
-        const session = sessionsByEmployee.get(employee.id);
+        const session = sessions.get(employee.id);
         if (session === undefined) throw new Error(`active session fact missing: ${employee.id}`);
-        const activeTask = this.#activeTask(tasks, employee.id);
+        const task = tasks.find((candidate) =>
+          candidate.ownerEmployeeId === employee.id
+          && (candidate.status === "running" || candidate.status === "review")
+        );
         return {
           employeeId: employee.id,
           handle: session.handle,
-          activeTaskId: activeTask?.id ?? null,
-          handoff: this.#handoff(employee, activeTask)
+          activeTaskId: task?.id ?? null,
+          handoff: this.#handoff(employee, task)
         };
       })
     };
-  }
-
-  #activeTask(tasks: readonly TaskRecord[], employeeId: string): TaskRecord | undefined {
-    return tasks.find((task) =>
-      task.ownerEmployeeId === employeeId
-      && (task.status === "running" || task.status === "review")
-    );
   }
 
   #handoff(employee: EmployeeDefinition, task: TaskRecord | undefined): string {
@@ -305,7 +457,7 @@ export class CheckpointService {
     ].join("\n");
   }
 
-  #validateCheckpointRoster(
+  #validateCheckpoint(
     checkpoint: CompanyCheckpoint,
     company: CompanyDefinition
   ): void {
@@ -321,6 +473,36 @@ export class CheckpointService {
     ) {
       throw new Error("checkpoint employee roster mismatch");
     }
+    const internalIds = new Set<string>();
+    const nativeIds = new Set<string>();
+    for (const employee of company.employees) {
+      const session = checkpoint.sessions.find(({ employeeId }) => employeeId === employee.id);
+      if (session === undefined) throw new Error(`checkpoint session missing: ${employee.id}`);
+      if (session.handle.employeeId !== employee.id) {
+        throw new Error(`checkpoint handle employee mismatch: ${employee.id}`);
+      }
+      if (session.handle.adapter !== employee.agent) {
+        throw new Error(`checkpoint adapter mismatch: ${employee.id}`);
+      }
+      if (internalIds.has(session.handle.internalSessionId)) {
+        throw new Error("checkpoint internal session IDs must be unique");
+      }
+      internalIds.add(session.handle.internalSessionId);
+      if (session.handle.nativeSessionId !== null) {
+        if (nativeIds.has(session.handle.nativeSessionId)) {
+          throw new Error("checkpoint native session IDs must be unique");
+        }
+        nativeIds.add(session.handle.nativeSessionId);
+      }
+      if (
+        session.activeTaskId !== null
+        && !this.#store.listTasks(this.#companyId).some((task) =>
+          task.id === session.activeTaskId && task.ownerEmployeeId === employee.id
+        )
+      ) {
+        throw new Error(`checkpoint active task is not owned by employee: ${employee.id}`);
+      }
+    }
   }
 
   #checkpointFromStored(stored: StoredCheckpoint): CompanyCheckpoint {
@@ -328,6 +510,55 @@ export class CheckpointService {
       throw new Error(`checkpoint company mismatch: ${stored.companyId}`);
     }
     return parseCompanyCheckpoint(stored.payload);
+  }
+
+  #runOperation<T>(kind: ActiveOperation["kind"], run: () => Promise<T>): Promise<T> {
+    const promise = run().finally(() => {
+      if (this.#operation?.promise === promise) this.#operation = null;
+    });
+    this.#operation = { kind, promise };
+    return promise;
+  }
+
+  #deadline(timeoutMs: number): Deadline {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return { at: Date.now() + timeoutMs, controller, timer };
+  }
+
+  #phaseSignal(deadline: Deadline, maxMs: number): {
+    signal: AbortSignal;
+    dispose: () => void;
+  } {
+    return this.#signalUntil(Math.min(deadline.at, Date.now() + maxMs));
+  }
+
+  #signalUntil(at: number): {
+    signal: AbortSignal;
+    dispose: () => void;
+  } {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(0, at - Date.now()));
+    return {
+      signal: controller.signal,
+      dispose: () => {
+        clearTimeout(timer);
+        controller.abort();
+      }
+    };
+  }
+
+  #approvalEvent(reason: string, payload: Record<string, unknown>): NewEvent {
+    return this.#event("user.approval.requested", "core", null, {
+      ...payload,
+      reason,
+      operation: "restore safe company lifecycle state",
+      impact: "AgentTown cannot prove all sessions are safely stopped.",
+      alternatives: ["retry_cleanup", "inspect_processes", "keep_blocked"],
+      consequenceOfNonApproval: "The company remains blocked.",
+      question: "How should AgentTown resolve the lifecycle cleanup failure?",
+      options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
+    });
   }
 
   #event(

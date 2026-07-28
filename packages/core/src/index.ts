@@ -22,6 +22,7 @@ export {
 } from "./ipc/core-server.js";
 export {
   CheckpointService,
+  PauseFailedError,
   RecoveryBlockedError,
   parseCompanyCheckpoint,
   type CheckpointServiceOptions,
