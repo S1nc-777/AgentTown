@@ -6,11 +6,14 @@ import type {
   AgentCapabilities,
   CompanyDefinition
 } from "@agenttown/runtime-contract";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeAgentAdapter } from "../src/agents/fake-adapter.js";
 import { SessionManager } from "../src/agents/session-manager.js";
 import { CompanyOrchestrator } from "../src/company/orchestrator.js";
-import { CheckpointService } from "../src/lifecycle/checkpoint-service.js";
+import {
+  CheckpointService,
+  type CheckpointServiceOptions
+} from "../src/lifecycle/checkpoint-service.js";
 import { RecoveryBlockedError } from "../src/lifecycle/checkpoint-service.js";
 import { ActionPolicy } from "../src/policy/action-policy.js";
 import { CoreStore } from "../src/storage/core-store.js";
@@ -300,6 +303,64 @@ describe("CheckpointService", () => {
         reason: "cleanup_failed",
         options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
       });
+  });
+
+  it("does not invoke synchronous stop when the global deadline expires before the attempt", async () => {
+    let stopCalls = 0;
+    const harness = await createHarness({
+      pauseTimeoutMs: 100,
+      stop: async () => {
+        stopCalls += 1;
+      }
+    });
+    const {
+      company,
+      store,
+      sessions,
+      orchestrator,
+      cleanupAdapter
+    } = harness;
+    let now = 1_000;
+    let ownershipSnapshots = 0;
+    let cleanupClockReads = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      if (ownershipSnapshots < 2) return now;
+      cleanupClockReads += 1;
+      return cleanupClockReads === 1 ? 1_099 : 1_101;
+    });
+    const lifecycleSessions: CheckpointServiceOptions["sessions"] = {
+      interruptAll: (signal) => sessions.interruptAll(signal),
+      stopAll: () => sessions.stopAll(),
+      stopAllBounded: (signal, force) => sessions.stopAllBounded(signal, force),
+      cleanupOwnershipSnapshot: () => {
+        ownershipSnapshots += 1;
+        return sessions.cleanupOwnershipSnapshot();
+      },
+      cancelPendingReplacements: () => sessions.cancelPendingReplacements(),
+      resumeOne: (employee, checkpoint, signal) =>
+        sessions.resumeOne(employee, checkpoint, signal),
+      rebuildOne: (employee, handoff, signal) =>
+        sessions.rebuildOne(employee, handoff, signal)
+    };
+    const lifecycle = new CheckpointService({
+      companyId,
+      company,
+      store,
+      orchestrator,
+      sessions: lifecycleSessions,
+      adapterFor: () => adapterWithNativeResume(cleanupAdapter, "supported"),
+      pauseTimeoutMs: 100
+    });
+
+    try {
+      await expect(lifecycle.pause("shutdown")).rejects.toThrow("pause failed");
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(stopCalls).toBe(0);
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).not.toThrow();
   });
 
   it("uses native resume only when declared and rebuilds the other real session", async () => {

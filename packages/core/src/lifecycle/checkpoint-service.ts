@@ -561,7 +561,15 @@ export class CheckpointService {
     dispose: () => void;
   } {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(0, at - Date.now()));
+    const remaining = at - Date.now();
+    if (remaining <= 0) {
+      controller.abort();
+      return {
+        signal: controller.signal,
+        dispose: () => undefined
+      };
+    }
+    const timer = setTimeout(() => controller.abort(), remaining);
     return {
       signal: controller.signal,
       dispose: () => {
@@ -654,11 +662,19 @@ export class CheckpointService {
       if (initialOwnership.owners.length === 0 && await this.#ownershipIsStablyEmpty()) {
         return [];
       }
+      if (this.#remaining(deadline) === 0) {
+        return this.#abortedOwnershipOutcomes(
+          this.#sessions.cleanupOwnershipSnapshot().owners
+        );
+      }
       const gracefulSignal = this.#signalUntil(
         Math.max(Date.now(), deadline.at - forceTailMs)
       );
       const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
       gracefulSignal.dispose();
+      if (this.#remaining(deadline) === 0) {
+        return this.#lateCleanupOutcomes(graceful);
+      }
       if (graceful.length === 0) {
         if (await this.#ownershipIsStablyEmpty()) return [];
         if (this.#remaining(deadline) === 0) {
@@ -680,7 +696,12 @@ export class CheckpointService {
       if (this.#remaining(deadline) === 0) {
         return graceful.filter(({ status }) => status !== "stopped");
       }
-      const forced = await this.#sessions.stopAllBounded(deadline.controller.signal, true);
+      const forceSignal = this.#signalUntil(deadline.at);
+      const forced = await this.#sessions.stopAllBounded(forceSignal.signal, true);
+      forceSignal.dispose();
+      if (this.#remaining(deadline) === 0) {
+        return this.#lateCleanupOutcomes(forced);
+      }
       if (forced.length === 0) {
         if (await this.#ownershipIsStablyEmpty()) return [];
         if (this.#remaining(deadline) === 0) {
@@ -712,6 +733,23 @@ export class CheckpointService {
       error: owner.kind === "pending_replacement"
         ? "replacement creation still pending"
         : "stop aborted"
+    }));
+  }
+
+  #lateCleanupOutcomes(outcomes: readonly StopOutcome[]): StopOutcome[] {
+    if (outcomes.length === 0) {
+      return [{
+        employeeId: "unknown",
+        status: "aborted",
+        error: "cleanup attempt crossed the company pause deadline"
+      }];
+    }
+    return outcomes.map((outcome) => ({
+      employeeId: outcome.employeeId,
+      status: "aborted",
+      error: outcome.status === "stopped"
+        ? "stop completed after the company pause deadline"
+        : outcome.error ?? "stop exceeded the company pause deadline"
     }));
   }
 
