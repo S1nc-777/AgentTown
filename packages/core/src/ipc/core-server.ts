@@ -53,6 +53,7 @@ interface ClientConnection {
   inboundQueuedBytes: number;
   outboundQueuedBytes: number;
   outboundIdleWaiters: Array<() => void>;
+  eventStreamTerminal: boolean;
   clientId: string | null;
   buffer: string;
   afterSequence: number;
@@ -99,6 +100,17 @@ function requestIdFrom(value: unknown, fallback: string): string {
     return value.requestId.length > 0 ? value.requestId : fallback;
   }
   return fallback;
+}
+
+function correlationId(value: unknown): {
+  requestId: string;
+  oversized: boolean;
+} {
+  const requestId = requestIdFrom(value, "invalid-request");
+  if (Buffer.byteLength(requestId, "utf8") <= MAX_REQUEST_ID_BYTES) {
+    return { requestId, oversized: false };
+  }
+  return { requestId: "invalid-request", oversized: true };
 }
 
 function stableJson(value: unknown): string {
@@ -236,6 +248,7 @@ export class CoreServer {
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
   #listenStarted = false;
   #draining = false;
+  #transportClosePromise: Promise<void> | null = null;
   #closePromise: Promise<void> | null = null;
   #gracefulClosePromise: Promise<void> | null = null;
 
@@ -331,12 +344,17 @@ export class CoreServer {
   closeAfterResponses(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
     if (this.#gracefulClosePromise === null) {
-      this.#gracefulClosePromise = this.#closeGracefully();
+      this.#gracefulClosePromise = this.closeTransportAfterResponses()
+        .then(() => this.#waitForLeaseCleanup());
     }
-    if (this.#leases.isInsideLastClientCallback) {
-      return this.#gracefulClosePromise;
+    return this.#gracefulClosePromise;
+  }
+
+  closeTransportAfterResponses(): Promise<void> {
+    if (this.#transportClosePromise === null) {
+      this.#transportClosePromise = this.#closeGracefully();
     }
-    return this.#gracefulClosePromise.then(() => this.#waitForLeaseCleanup());
+    return this.#transportClosePromise;
   }
 
   get backgroundErrors(): readonly Error[] {
@@ -345,6 +363,15 @@ export class CoreServer {
 
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
+    if (this.#transportClosePromise === null) {
+      this.#transportClosePromise = this.#closeImmediately();
+    }
+    this.#closePromise = this.#transportClosePromise
+      .then(() => this.#waitForLeaseCleanup());
+    return this.#closePromise;
+  }
+
+  #closeImmediately(): Promise<void> {
     this.#draining = true;
     this.#clearSweepTimer();
     const connections = [...this.#connections];
@@ -353,13 +380,10 @@ export class CoreServer {
       this.#stopReading(connection);
       connection.socket.destroy();
     }
-    this.#closePromise = Promise.all([
+    return Promise.all([
       closed,
       ...connections.map((connection) => connection.closed)
-    ])
-      .then(() => this.#waitForLeaseCleanup())
-      .then(() => undefined);
-    return this.#closePromise;
+    ]).then(() => undefined);
   }
 
   async #closeGracefully(): Promise<void> {
@@ -418,6 +442,7 @@ export class CoreServer {
       inboundQueuedBytes: 0,
       outboundQueuedBytes: 0,
       outboundIdleWaiters: [],
+      eventStreamTerminal: false,
       clientId: null,
       buffer: "",
       afterSequence: 0,
@@ -557,7 +582,24 @@ export class CoreServer {
       return;
     }
 
-    const requestId = requestIdFrom(raw, "invalid-request");
+    const correlation = correlationId(raw);
+    const requestId = correlation.requestId;
+    if (correlation.oversized) {
+      const invalidId = errorResponse(
+        requestId,
+        "invalid_request_id",
+        `requestId exceeds ${MAX_REQUEST_ID_BYTES} bytes`
+      );
+      if (
+        isRecord(raw) &&
+        raw.protocolVersion !== IPC_PROTOCOL_VERSION
+      ) {
+        this.#rejectAndClose(connection, invalidId);
+      } else {
+        this.#send(connection, invalidId);
+      }
+      return;
+    }
     if (
       isRecord(raw) &&
       raw.protocolVersion !== IPC_PROTOCOL_VERSION
@@ -594,17 +636,6 @@ export class CoreServer {
       ));
       return;
     }
-    if (
-      Buffer.byteLength(request.requestId, "utf8") > MAX_REQUEST_ID_BYTES
-    ) {
-      this.#send(connection, errorResponse(
-        "invalid-request",
-        "invalid_request",
-        `requestId exceeds ${MAX_REQUEST_ID_BYTES} bytes`
-      ));
-      return;
-    }
-
     const fingerprint = requestFingerprint(request);
     const cacheKey = requestKey(request.requestId);
     const cached = this.#requestCache.get(cacheKey);
@@ -890,9 +921,20 @@ export class CoreServer {
     connection: ClientConnection,
     event: EventRecord
   ): void {
-    if (event.sequence <= connection.afterSequence) return;
-    connection.afterSequence = event.sequence;
-    this.#send(connection, ipcEvent(event));
+    if (
+      connection.eventStreamTerminal ||
+      event.sequence <= connection.afterSequence
+    ) {
+      return;
+    }
+    const message = ipcEvent(event);
+    if (this.#messageBytes(message) > this.#maxOutboundQueuedBytes) {
+      this.#terminateEventStream(connection, event.sequence);
+      return;
+    }
+    if (this.#send(connection, message)) {
+      connection.afterSequence = event.sequence;
+    }
   }
 
   #cache(
@@ -950,7 +992,6 @@ export class CoreServer {
   ): boolean {
     if (connection.socket.destroyed) return false;
     let outbound = message;
-    let closeAfterWrite = false;
     if (
       message.kind === "response" &&
       this.#messageBytes(message) > this.#maxOutboundQueuedBytes
@@ -960,15 +1001,8 @@ export class CoreServer {
       message.kind === "event" &&
       this.#messageBytes(message) > this.#maxOutboundQueuedBytes
     ) {
-      outbound = {
-        protocolVersion: IPC_PROTOCOL_VERSION,
-        kind: "event",
-        sequence: message.sequence,
-        type: "ipc.stream_error",
-        payload: { code: "event_too_large" }
-      };
-      closeAfterWrite = true;
-      this.#stopReading(connection);
+      this.#terminateEventStream(connection, message.sequence);
+      return false;
     }
     const encoded = `${JSON.stringify(outbound)}\n`;
     const bytes = Buffer.byteLength(encoded, "utf8");
@@ -988,11 +1022,47 @@ export class CoreServer {
           resolvePromise();
         }
       }
-      if (closeAfterWrite && !connection.socket.destroyed) {
-        connection.socket.end(() => connection.socket.destroy());
-      }
     });
     return true;
+  }
+
+  #terminateEventStream(
+    connection: ClientConnection,
+    sequence: number
+  ): void {
+    if (connection.eventStreamTerminal || connection.socket.destroyed) return;
+    connection.eventStreamTerminal = true;
+    connection.unsubscribe?.();
+    connection.unsubscribe = null;
+    this.#stopReading(connection);
+    const terminal: IpcEvent = {
+      protocolVersion: IPC_PROTOCOL_VERSION,
+      kind: "event",
+      sequence,
+      type: "ipc.stream_error",
+      payload: { code: "event_too_large" }
+    };
+    const encoded = `${JSON.stringify(terminal)}\n`;
+    const bytes = Buffer.byteLength(encoded, "utf8");
+    if (bytes > this.#maxOutboundQueuedBytes) {
+      connection.socket.destroy();
+      return;
+    }
+
+    // One fixed-size terminal event is reserved beyond the normal queue budget.
+    connection.outboundQueuedBytes += bytes;
+    connection.socket.write(encoded, () => {
+      connection.outboundQueuedBytes -= bytes;
+      if (connection.outboundQueuedBytes === 0) {
+        for (const resolvePromise of connection.outboundIdleWaiters.splice(0)) {
+          resolvePromise();
+        }
+      }
+      if (!connection.socket.destroyed) {
+        connection.socket.end();
+        connection.socket.resume();
+      }
+    });
   }
 
   #messageBytes(message: IpcEvent | IpcResponse): number {
@@ -1000,6 +1070,15 @@ export class CoreServer {
   }
 
   #boundedResponse(response: IpcResponse): IpcResponse {
+    if (
+      Buffer.byteLength(response.requestId, "utf8") > MAX_REQUEST_ID_BYTES
+    ) {
+      return errorResponse(
+        "invalid-request",
+        "invalid_request_id",
+        `requestId exceeds ${MAX_REQUEST_ID_BYTES} bytes`
+      );
+    }
     if (this.#messageBytes(response) <= this.#maxOutboundQueuedBytes) {
       return response;
     }

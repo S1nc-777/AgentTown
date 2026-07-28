@@ -45,6 +45,7 @@ class TestClient {
   readonly #waiters: MessageWaiter[] = [];
   #buffer = "";
   #closed = false;
+  #eventCount = 0;
 
   private constructor(socket: Socket) {
     this.#socket = socket;
@@ -157,6 +158,10 @@ class TestClient {
     });
   }
 
+  get eventCount(): number {
+    return this.#eventCount;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     const closed = this.waitForClose();
@@ -165,6 +170,7 @@ class TestClient {
   }
 
   #accept(message: WireMessage): void {
+    if (message.kind === "event") this.#eventCount += 1;
     const waiterIndex = this.#waiters.findIndex((waiter) =>
       waiter.predicate(message)
     );
@@ -531,6 +537,53 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
       expect(pauses).toBe(0);
     }
   );
+
+  it("normalizes an oversized pre-handshake request ID and keeps the socket usable", async () => {
+    const { pipeName } = await createServer({
+      serverOptions: { maxOutboundQueuedBytes: 512 }
+    });
+    const client = await connectClient(pipeName);
+    client.sendRaw(`${JSON.stringify({
+      protocolVersion: 1,
+      kind: "request",
+      requestId: "x".repeat(400),
+      method: "company.status",
+      params: {}
+    })}\n`);
+
+    await expect(client.nextResponse("invalid_request_id")).resolves.toMatchObject({
+      requestId: "invalid-request",
+      ok: false
+    });
+    await expect(client.handshake("client-normalized-id")).resolves.toMatchObject({
+      ok: true
+    });
+  });
+
+  it("normalizes an oversized request ID before failing a protocol mismatch", async () => {
+    const { pipeName } = await createServer({
+      serverOptions: { maxOutboundQueuedBytes: 512 }
+    });
+    const client = await connectClient(pipeName);
+    const closed = client.waitForClose();
+    client.sendRaw(`${JSON.stringify({
+      protocolVersion: 2,
+      kind: "request",
+      requestId: "x".repeat(400),
+      method: "handshake",
+      params: {
+        clientId: "client-protocol-id",
+        protocolVersion: 1,
+        afterSequence: 0
+      }
+    })}\n`);
+
+    await expect(client.nextResponse("invalid_request_id")).resolves.toMatchObject({
+      requestId: "invalid-request",
+      ok: false
+    });
+    await expect(closed).resolves.toBeUndefined();
+  });
 
   it("rejects invalid JSON, unknown methods, and request ID conflicts", async () => {
     const { pipeName } = await createServer();
@@ -907,28 +960,82 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     orchestrator.release();
   });
 
-  it("reports and closes when one streamed event exceeds its byte budget", async () => {
+  it("reserves one terminal error for an oversized event stream", async () => {
     const { pipeName, store } = await createServer({
-      serverOptions: { maxOutboundQueuedBytes: 512 }
+      serverOptions: { maxOutboundQueuedBytes: 768 }
     });
     const client = await connectClient(pipeName);
     await client.handshake("client-outbound-budget");
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
     const closed = client.waitForClose();
 
-    store.insertEvent({
+    const normal = store.insertEvent({
+      id: randomUUID(),
+      type: "normal-event",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: { padding: "x".repeat(440) }
+    });
+    const normalWireBytes = Buffer.byteLength(`${JSON.stringify({
+      protocolVersion: 1,
+      kind: "event",
+      sequence: normal.sequence,
+      type: normal.type,
+      payload: {
+        ...normal.payload,
+        eventId: normal.id,
+        occurredAt: normal.occurredAt,
+        actorId: normal.actorId,
+        taskId: normal.taskId,
+        causationEventId: normal.causationEventId
+      }
+    })}\n`, "utf8");
+    expect(normalWireBytes).toBeLessThan(768);
+    const terminalWireBytes = Buffer.byteLength(`${JSON.stringify({
+      protocolVersion: 1,
+      kind: "event",
+      sequence: normal.sequence + 1,
+      type: "ipc.stream_error",
+      payload: { code: "event_too_large" }
+    })}\n`, "utf8");
+    expect(normalWireBytes + terminalWireBytes).toBeGreaterThan(768);
+    const oversized = store.insertEvent({
       id: randomUUID(),
       type: "large-event",
       actorId: "test",
       taskId: null,
       causationEventId: null,
-      payload: { padding: "x".repeat(1_024) }
+      payload: { padding: "x".repeat(2_048) }
+    });
+    store.insertEvent({
+      id: randomUUID(),
+      type: "event-after-terminal",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: {}
+    });
+    store.insertEvent({
+      id: randomUUID(),
+      type: "second-large-event",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: { padding: "x".repeat(2_048) }
     });
 
     await expect(client.nextEvent()).resolves.toMatchObject({
+      sequence: normal.sequence,
+      type: "normal-event"
+    });
+    await expect(client.nextEvent()).resolves.toMatchObject({
+      sequence: oversized.sequence,
       type: "ipc.stream_error",
       payload: { code: "event_too_large" }
     });
     await expect(closed).resolves.toBeUndefined();
+    expect(client.eventCount).toBe(2);
   });
 
   it("replays a bounded error when a request result is too large", async () => {
@@ -1101,7 +1208,7 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     });
     const leases = createLeases(store, async () => {
       callbackCalls += 1;
-      await server.closeAfterResponses();
+      await server.closeTransportAfterResponses();
       resolveCallbackCompleted();
     });
     const created = await createServer({ store, leases });
@@ -1122,6 +1229,120 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(store.countLeases()).toBe(0);
     expect(callbackCalls).toBe(1);
     await server.close();
+  });
+
+  it("settles hard and graceful closes interleaved with final cleanup", async () => {
+    const store = createStore();
+    let server: CoreServer;
+    let resolveCallbackStarted: () => void = () => undefined;
+    const callbackStarted = new Promise<void>((resolvePromise) => {
+      resolveCallbackStarted = resolvePromise;
+    });
+    let releaseCallback: () => void = () => undefined;
+    const callbackGate = new Promise<void>((resolvePromise) => {
+      releaseCallback = resolvePromise;
+    });
+    let resolveCallbackCompleted: () => void = () => undefined;
+    const callbackCompleted = new Promise<void>((resolvePromise) => {
+      resolveCallbackCompleted = resolvePromise;
+    });
+    const leases = createLeases(store, async () => {
+      resolveCallbackStarted();
+      await callbackGate;
+      await server.closeTransportAfterResponses();
+      resolveCallbackCompleted();
+    });
+    const created = await createServer({ store, leases });
+    server = created.server;
+    const client = await connectClient(created.pipeName);
+    await client.handshake("client-close-interleaving");
+    await client.close();
+    await callbackStarted;
+
+    const hardClose = server.close();
+    const repeatedHardClose = server.close();
+    const gracefulClose = server.closeAfterResponses();
+    releaseCallback();
+    const completed = await Promise.race([
+      Promise.all([
+        hardClose,
+        repeatedHardClose,
+        gracefulClose,
+        callbackCompleted
+      ]).then(() => true),
+      new Promise<false>((resolvePromise) => {
+        setTimeout(() => resolvePromise(false), 250);
+      })
+    ]);
+
+    expect(repeatedHardClose).toBe(hardClose);
+    expect(completed).toBe(true);
+    expect(store.countLeases()).toBe(0);
+  });
+
+  it("gives delayed callback descendants normal external close semantics", async () => {
+    const store = createStore();
+    let server: CoreServer;
+    let callbackCalls = 0;
+    let releaseDelayedClose: () => void = () => undefined;
+    const delayedCloseGate = new Promise<void>((resolvePromise) => {
+      releaseDelayedClose = resolvePromise;
+    });
+    let resolveDelayedSpawned: () => void = () => undefined;
+    const delayedSpawned = new Promise<void>((resolvePromise) => {
+      resolveDelayedSpawned = resolvePromise;
+    });
+    let resolveDelayedClosed: () => void = () => undefined;
+    const delayedClosed = new Promise<void>((resolvePromise) => {
+      resolveDelayedClosed = resolvePromise;
+    });
+    let resolveSecondStarted: () => void = () => undefined;
+    const secondStarted = new Promise<void>((resolvePromise) => {
+      resolveSecondStarted = resolvePromise;
+    });
+    let releaseSecond: () => void = () => undefined;
+    const secondGate = new Promise<void>((resolvePromise) => {
+      releaseSecond = resolvePromise;
+    });
+    const leases = createLeases(store, async () => {
+      callbackCalls += 1;
+      if (callbackCalls === 1) {
+        setImmediate(() => {
+          void (async () => {
+            await delayedCloseGate;
+            await server.closeAfterResponses();
+            resolveDelayedClosed();
+          })();
+        });
+        resolveDelayedSpawned();
+        return;
+      }
+      resolveSecondStarted();
+      await secondGate;
+    });
+    const created = await createServer({ store, leases });
+    server = created.server;
+    const first = await connectClient(created.pipeName);
+    await first.handshake("client-delayed-first");
+    await first.close();
+    await delayedSpawned;
+
+    const second = await connectClient(created.pipeName);
+    await second.handshake("client-delayed-second");
+    await second.close();
+    await secondStarted;
+    let delayedSettled = false;
+    void delayedClosed.then(() => {
+      delayedSettled = true;
+    });
+    releaseDelayedClose();
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    const settledBeforeCleanup = delayedSettled;
+    releaseSecond();
+    await delayedClosed;
+
+    expect(settledBeforeCleanup).toBe(false);
+    expect(callbackCalls).toBe(2);
   });
 
   it("captures and reports periodic lease sweep failures", async () => {
