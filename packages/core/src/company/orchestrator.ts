@@ -210,7 +210,7 @@ export class CompanyOrchestrator {
         handoff: `Retry ${taskId} after Agent session failure`
       };
       try {
-        await this.sessions.resumeOne(employee, checkpoint);
+        await this.sessions.resumeOne(employee, checkpoint, signal);
         this.#assertEpoch(epoch);
       } catch (resumeError) {
         if (epoch !== this.#dispatchEpoch) return;
@@ -224,7 +224,7 @@ export class CompanyOrchestrator {
           return;
         }
         try {
-          await this.sessions.rebuildOne(employee, checkpoint.handoff);
+          await this.sessions.rebuildOne(employee, checkpoint.handoff, signal);
           this.#assertEpoch(epoch);
         } catch (rebuildError) {
           if (epoch !== this.#dispatchEpoch) return;
@@ -270,6 +270,7 @@ export class CompanyOrchestrator {
           await this.dispatch(event.action);
           decisionReceived = true;
         } catch (error) {
+          if (epoch !== this.#dispatchEpoch) return;
           this.#recordApprovalRequest(
             taskId,
             this.leaderId,

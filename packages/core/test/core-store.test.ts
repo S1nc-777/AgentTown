@@ -142,6 +142,32 @@ describe("CoreStore", () => {
     store.close();
   });
 
+  it("reads the latest event sequence without loading event history", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    expect(store.getLatestEventSequence()).toBe(0);
+    store.insertEvent({
+      id: "event-sequence-1",
+      type: "test.one",
+      actorId: "test",
+      payload: {},
+      causationEventId: null,
+      taskId: null
+    });
+    store.insertEvent({
+      id: "event-sequence-2",
+      type: "test.two",
+      actorId: "test",
+      payload: {},
+      causationEventId: null,
+      taskId: null
+    });
+    expect(store.getLatestEventSequence()).toBe(2);
+    store.close();
+  });
+
   it("rejects status changes for a missing company without publishing an event", async () => {
     const project = await createTemporaryProject();
     cleanups.push(project.cleanup);

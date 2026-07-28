@@ -15,6 +15,7 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../src/agents/session-manager.js";
 import { CompanyOrchestrator } from "../src/company/orchestrator.js";
+import { CheckpointService } from "../src/lifecycle/checkpoint-service.js";
 import { ActionPolicy } from "../src/policy/action-policy.js";
 import { CoreStore } from "../src/storage/core-store.js";
 import type { NewEvent } from "../src/storage/core-store.js";
@@ -954,5 +955,85 @@ describe("SessionManager", () => {
         session.handle.internalSessionId
       )
     )).toBe(false);
+  });
+
+  it("bounded cleanup retries retained replacement handles as well as active handles", async () => {
+    const store = new DuplicateLifecycleEventStore(":memory:");
+    const { adapter, company, sessions, orchestrator } = createHarness(store);
+    await orchestrator.start({});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    adapter.failStopEmployeeIds.add(employee.id);
+    store.armDuplicateSessionEvent();
+    await expect(sessions.resumeOne(employee, {
+      employeeId: employee.id,
+      handle: sessions.get(employee.id),
+      activeTaskId: "task-a",
+      handoff: "retained cleanup"
+    })).rejects.toThrow("cleanup stop also failed");
+    const failedReplacementAttempts = adapter.stoppedSessionIds
+      .filter((id) => id === "developer-a-5").length;
+
+    adapter.failStopEmployeeIds.clear();
+    const lifecycle = new CheckpointService({
+      companyId: "company-1",
+      company,
+      store,
+      orchestrator,
+      sessions,
+      adapterFor: () => adapter,
+      pauseTimeoutMs: 1_000
+    });
+    await lifecycle.pause("user_requested");
+
+    expect(adapter.stoppedSessionIds.filter((id) => id === "developer-a-5"))
+      .toHaveLength(failedReplacementAttempts + 1);
+    expect(() => sessions.get("developer-a")).toThrow("session not started");
+  });
+
+  it("does not persist an aborted replacement and retains it when cleanup initially fails", async () => {
+    const { adapter, company, sessions, store } = createHarness();
+    await sessions.startAll(company, {});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    const previous = sessions.get(employee.id);
+    const originalResume = adapter.resume.bind(adapter);
+    let releaseResume: () => void = () => undefined;
+    const resumeGate = new Promise<void>((resolvePromise) => {
+      releaseResume = resolvePromise;
+    });
+    let replacementCreated: () => void = () => undefined;
+    const created = new Promise<void>((resolvePromise) => {
+      replacementCreated = resolvePromise;
+    });
+    adapter.resume = async (input) => {
+      const handle = await originalResume(input);
+      replacementCreated();
+      await resumeGate;
+      return handle;
+    };
+    const controller = new AbortController();
+    const replacing = sessions.resumeOne(employee, {
+      employeeId: employee.id,
+      handle: previous,
+      activeTaskId: "task-a",
+      handoff: "abort replacement"
+    }, controller.signal);
+    await created;
+    adapter.failStopEmployeeIds.add(employee.id);
+    controller.abort();
+    releaseResume();
+
+    await expect(replacing).rejects.toThrow("cleanup stop failed");
+    expect(sessions.get(employee.id)).toEqual(previous);
+    expect(store.listSessions("company-1").find(
+      (session) => session.employeeId === employee.id
+    )?.handle).toEqual(previous);
+
+    adapter.failStopEmployeeIds.clear();
+    const cleanup = await sessions.stopAllBounded(new AbortController().signal);
+    expect(cleanup.every(({ status }) => status === "stopped")).toBe(true);
+    expect(adapter.stoppedSessionIds.filter((id) => id === "developer-a-5"))
+      .toHaveLength(2);
   });
 });

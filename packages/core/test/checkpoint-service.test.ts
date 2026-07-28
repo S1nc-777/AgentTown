@@ -52,6 +52,12 @@ interface Harness {
 
 const harnesses: Harness[] = [];
 
+class PauseCommitFailureStore extends CoreStore {
+  override commitPauseFacts(): void {
+    throw new Error("injected pause commit failure");
+  }
+}
+
 afterEach(async () => {
   for (const harness of harnesses.splice(0)) {
     await Promise.race([
@@ -74,10 +80,13 @@ async function createHarness(options: {
   scenarios?: Readonly<Record<string, string>>;
   stop?: AgentAdapter["stop"];
   forceStop?: NonNullable<AgentAdapter["forceStop"]>;
+  forceStopDelayMs?: number;
+  storeFactory?: (databasePath: string) => CoreStore;
 } = {}): Promise<Harness> {
   const project = await createTemporaryProject();
   const company = companyDefinitionFixture();
-  const store = new CoreStore(project.databasePath);
+  const store = options.storeFactory?.(project.databasePath)
+    ?? new CoreStore(project.databasePath);
   store.initialize();
   store.createCompany({
     id: companyId,
@@ -117,7 +126,17 @@ async function createHarness(options: {
           })
         }),
     ...(options.stop === undefined ? {} : { stop: options.stop }),
-    ...(options.forceStop === undefined ? {} : { forceStop: options.forceStop })
+    ...(options.forceStop === undefined ? {} : { forceStop: options.forceStop }),
+    ...(options.forceStopDelayMs === undefined
+      ? {}
+      : {
+          forceStop: async (session) => {
+            await new Promise<void>((resolvePromise) => {
+              setTimeout(resolvePromise, options.forceStopDelayMs);
+            });
+            await normal.forceStop?.(session);
+          }
+        })
   };
   const adapterFor = (): AgentAdapter => configured;
   const sessions = new SessionManager(adapterFor, store, companyId, project.root);
@@ -196,8 +215,59 @@ describe("CheckpointService", () => {
     expect(() => sessions.get("developer")).toThrow("session not started");
 
     const types = store.listEvents(0).map(({ type }) => type);
+    expect(types.indexOf("company.pausing")).toBeLessThan(types.indexOf("company.checkpointed"));
     expect(types.indexOf("company.checkpointed")).toBeLessThan(types.indexOf("company.paused"));
     expect(types.indexOf("company.paused")).toBeLessThan(types.indexOf("session.stopped"));
+  });
+
+  it("uses cooperative stop under the default deadline without force escalation", async () => {
+    let forceCalls = 0;
+    const { lifecycle, store } = await createHarness({
+      forceStop: async () => {
+        forceCalls += 1;
+      }
+    });
+
+    await lifecycle.pause("user_requested");
+
+    expect(forceCalls).toBe(0);
+    expect(store.getCompany(companyId)?.status).toBe("paused");
+  });
+
+  it("cleans sessions and atomically blocks when pause commit fails before checkpoint", async () => {
+    const { lifecycle, store, sessions } = await createHarness({
+      storeFactory: (databasePath) => new PauseCommitFailureStore(databasePath)
+    });
+
+    await expect(lifecycle.pause("user_requested"))
+      .rejects.toThrow("injected pause commit failure");
+
+    expect(store.latestCheckpoint(companyId)).toBeNull();
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).toThrow("session not started");
+    expect(store.listEvents(0).map(({ type }) => type)).toEqual(expect.arrayContaining([
+      "company.pause_failed",
+      "user.approval.requested"
+    ]));
+    expect(store.listEvents(0).find(({ type }) => type === "user.approval.requested")?.payload)
+      .toMatchObject({ reason: "pause_failed" });
+  });
+
+  it("retains ownership when force-stop close is observed after the literal deadline", async () => {
+    const { lifecycle, store, sessions } = await createHarness({
+      stop: async () => await new Promise<never>(() => undefined),
+      forceStopDelayMs: 60,
+      pauseTimeoutMs: 30
+    });
+
+    await expect(lifecycle.pause("shutdown")).rejects.toThrow("pause failed");
+
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).not.toThrow();
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 80));
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(() => sessions.get("leader")).not.toThrow();
+    expect(store.listSessions(companyId).every(({ status }) => status !== "stopped")).toBe(true);
   });
 
   it("uses native resume only when declared and rebuilds the other real session", async () => {
@@ -232,6 +302,7 @@ describe("CheckpointService", () => {
       "session.recovered",
       "session.rebuilt"
     ]);
+    expect(store.listEvents(0).map(({ type }) => type)).toContain("company.starting");
   });
 
   it("blocks within the total deadline when termination cannot be confirmed", async () => {
@@ -257,6 +328,8 @@ describe("CheckpointService", () => {
       "company.pause_failed",
       "user.approval.requested"
     ]));
+    expect(store.listEvents(0).find(({ type }) => type === "user.approval.requested")?.payload)
+      .toMatchObject({ reason: "pause_failed" });
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
     expect(store.getCompany(companyId)?.status).toBe("blocked");
   });
@@ -452,6 +525,11 @@ describe("CheckpointService", () => {
       "company.recovery_blocked",
       "user.approval.requested"
     ]));
+    expect(store.listEvents(0).find(({ type }) => type === "user.approval.requested")?.payload)
+      .toMatchObject({
+        reason: "invalid_checkpoint",
+        options: expect.arrayContaining(["repair_checkpoint", "select_checkpoint"])
+      });
   });
 
   it("blocks semantic adapter mismatch before starting a recovery process", async () => {

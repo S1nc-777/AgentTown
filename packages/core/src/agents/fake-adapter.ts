@@ -275,12 +275,8 @@ export class FakeAgentAdapter implements AgentAdapter {
         throw new Error(`failed to force-stop Fake Agent: ${session.employeeId}`);
       }
     }
-    // A successful kill transfers termination ownership to the OS. Keep the
-    // adapter record until close is observed, without extending Core's deadline.
-    void live.closed.then(
-      () => this.#sessions.delete(session.internalSessionId),
-      () => this.#sessions.delete(session.internalSessionId)
-    );
+    await live.closed;
+    this.#sessions.delete(session.internalSessionId);
   }
 
   async usage(session: SessionHandle): Promise<UsageSnapshot> {

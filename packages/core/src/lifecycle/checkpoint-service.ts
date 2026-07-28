@@ -219,9 +219,12 @@ export class CheckpointService {
     const deadline = this.#deadline(this.#pauseTimeoutMs);
     try {
       await this.#orchestrator.stopDispatching();
+      this.#store.commitCompanyStatusWithEvents(this.#companyId, "pausing", [
+        this.#event("company.pausing", "core", null, { reason })
+      ]);
       const interruptSignal = this.#phaseSignal(
         deadline,
-        Math.max(1, Math.floor(this.#pauseTimeoutMs * 0.05))
+        Math.max(1, Math.floor(this.#remaining(deadline) * 0.3))
       );
       const interruptOutcomes = await this.#sessions.interruptAll(interruptSignal.signal);
       interruptSignal.dispose();
@@ -229,7 +232,7 @@ export class CheckpointService {
 
       const quiesceSignal = this.#phaseSignal(
         deadline,
-        Math.max(1, Math.floor(this.#pauseTimeoutMs * 0.05))
+        Math.max(1, Math.floor(this.#remaining(deadline) * 0.3))
       );
       const quiesced = await this.#orchestrator.quiesce(quiesceSignal.signal);
       quiesceSignal.dispose();
@@ -257,21 +260,21 @@ export class CheckpointService {
         this.#event("company.paused", "core", null, { reason })
       );
 
-      const forceReserve = Math.max(1, Math.floor(this.#pauseTimeoutMs * 0.9));
-      const gracefulSignal = this.#signalUntil(Math.max(Date.now(), deadline.at - forceReserve));
-      const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
-      gracefulSignal.dispose();
-      const remaining = graceful.filter(({ status }) => status !== "stopped");
-      let finalOutcomes = graceful;
-      if (remaining.length > 0) {
-        finalOutcomes = await this.#sessions.stopAllBounded(deadline.controller.signal, true);
-      }
-      const failed = finalOutcomes.filter(({ status }) => status !== "stopped");
+      const failed = await this.#cleanupWithinDeadline(deadline);
       if (failed.length > 0) {
-        this.#commitPauseFailure(failed);
+        this.#commitPauseFailure(failed, "pause_failed");
         throw new PauseFailedError(failed);
       }
       return checkpoint;
+    } catch (error) {
+      if (error instanceof PauseFailedError) throw error;
+      const cleanup = await this.#cleanupWithinDeadline(deadline);
+      this.#commitPauseFailure(
+        cleanup,
+        cleanup.length === 0 ? "pause_failed" : "cleanup_failed",
+        error
+      );
+      throw error;
     } finally {
       clearTimeout(deadline.timer);
       deadline.controller.abort();
@@ -287,13 +290,14 @@ export class CheckpointService {
       throw new Error(`company is not eligible for recovery: ${companyFact?.status ?? "missing"}`);
     }
     await this.#orchestrator.stopDispatching();
-    this.#store.commitCompanyStatusWithEvents(this.#companyId, "recovering", [
-      this.#event("company.recovery_started", "core", null, {
+    this.#store.commitCompanyStatusWithEvents(this.#companyId, "starting", [
+      this.#event("company.starting", "core", null, {
         checkpointSequence: checkpoint.lastEventSequence
       })
     ]);
     const decisions: RecoveryDecision[] = [];
     const decisionEvents: NewEvent[] = [];
+    const attemptController = new AbortController();
     let currentEmployeeId = "unknown";
     try {
       for (const employee of company.employees) {
@@ -304,8 +308,12 @@ export class CheckpointService {
         const native = capabilities.nativeResume === "supported"
           && session.handle.nativeSessionId !== null;
         const handle = native
-          ? await this.#sessions.resumeOne(employee, session)
-          : await this.#sessions.rebuildOne(employee, session.handoff);
+          ? await this.#sessions.resumeOne(employee, session, attemptController.signal)
+          : await this.#sessions.rebuildOne(
+              employee,
+              session.handoff,
+              attemptController.signal
+            );
         const decision: RecoveryDecision = {
           employeeId: employee.id,
           mode: native ? "native" : "rebuilt"
@@ -329,8 +337,10 @@ export class CheckpointService {
         this.#event("company.recovered", "core", null, { decisions })
       ]);
       this.#orchestrator.resumeDispatching();
+      attemptController.abort();
       return { decisions };
     } catch (error) {
+      attemptController.abort();
       const cleanupDeadline = this.#deadline(this.#pauseTimeoutMs);
       const gracefulSignal = this.#signalUntil(
         Math.max(Date.now(), cleanupDeadline.at - Math.floor(this.#pauseTimeoutMs * 0.5))
@@ -346,7 +356,7 @@ export class CheckpointService {
       const cleanupError = cleanupFailures.length === 0
         ? undefined
         : new Error(`recovery cleanup incomplete: ${JSON.stringify(cleanupFailures)}`);
-      this.#commitRecoveryBlocked(currentEmployeeId, error, cleanupError);
+      this.#commitRecoveryBlocked(currentEmployeeId, error, cleanupError, false);
       throw new RecoveryBlockedError(currentEmployeeId, error);
     }
   }
@@ -367,7 +377,11 @@ export class CheckpointService {
     }
   }
 
-  #commitPauseFailure(outcomes: readonly StopOutcome[]): void {
+  #commitPauseFailure(
+    outcomes: readonly StopOutcome[],
+    approvalReason: "pause_failed" | "cleanup_failed",
+    cause?: unknown
+  ): void {
     this.#store.commitCompanyStatusWithEvents(this.#companyId, "blocked", [
       ...outcomes.map((outcome) => this.#event(
         "session.stop_failed",
@@ -380,9 +394,10 @@ export class CheckpointService {
         }
       )),
       this.#event("company.pause_failed", "core", null, {
-        employees: outcomes.map(({ employeeId }) => employeeId)
+        employees: outcomes.map(({ employeeId }) => employeeId),
+        error: cause === undefined ? null : errorMessage(cause)
       }),
-      this.#approvalEvent("pause_cleanup_failed", {
+      this.#pauseApprovalEvent(approvalReason, {
         employees: outcomes.map(({ employeeId }) => employeeId)
       })
     ]);
@@ -391,7 +406,8 @@ export class CheckpointService {
   #commitRecoveryBlocked(
     employeeId: string,
     error: unknown,
-    cleanupError?: unknown
+    cleanupError?: unknown,
+    invalidCheckpoint = false
   ): void {
     this.#store.commitCompanyStatusWithEvents(this.#companyId, "blocked", [
       this.#event("company.recovery_blocked", "core", null, {
@@ -399,15 +415,18 @@ export class CheckpointService {
         error: errorMessage(error),
         cleanupError: cleanupError === undefined ? null : errorMessage(cleanupError)
       }),
-      this.#approvalEvent("company_recovery_blocked", {
-        employeeId,
-        error: errorMessage(error)
-      })
+      invalidCheckpoint
+        ? this.#invalidCheckpointApproval(error)
+        : this.#recoveryApproval(
+            cleanupError === undefined ? "recovery_failed" : "cleanup_failed",
+            employeeId,
+            error
+          )
     ]);
   }
 
   #blockInvalidRecovery(employeeId: string, error: unknown): never {
-    this.#commitRecoveryBlocked(employeeId, error);
+    this.#commitRecoveryBlocked(employeeId, error, undefined, true);
     throw new RecoveryBlockedError(employeeId, error);
   }
 
@@ -421,7 +440,6 @@ export class CheckpointService {
   }
 
   #buildCheckpoint(reason: PauseReason): CompanyCheckpoint {
-    const events = this.#store.listEvents(0);
     const tasks = this.#store.listTasks(this.#companyId);
     const sessions = new Map(
       this.#store.listSessions(this.#companyId).map((session) => [session.employeeId, session])
@@ -429,7 +447,7 @@ export class CheckpointService {
     return {
       companyId: this.#companyId,
       reason,
-      lastEventSequence: events.at(-1)?.sequence ?? 0,
+      lastEventSequence: this.#store.getLatestEventSequence(),
       sessions: this.#company.employees.map((employee) => {
         const session = sessions.get(employee.id);
         if (session === undefined) throw new Error(`active session fact missing: ${employee.id}`);
@@ -548,17 +566,91 @@ export class CheckpointService {
     };
   }
 
-  #approvalEvent(reason: string, payload: Record<string, unknown>): NewEvent {
+  #pauseApprovalEvent(
+    reason: "pause_failed" | "cleanup_failed",
+    payload: Record<string, unknown>
+  ): NewEvent {
     return this.#event("user.approval.requested", "core", null, {
       ...payload,
       reason,
-      operation: "restore safe company lifecycle state",
-      impact: "AgentTown cannot prove all sessions are safely stopped.",
+      operation: reason === "pause_failed" ? "complete company pause" : "clean up sessions",
+      impact: reason === "pause_failed"
+        ? "AgentTown could not complete the pause safely."
+        : "AgentTown cannot prove all processes stopped.",
       alternatives: ["retry_cleanup", "inspect_processes", "keep_blocked"],
       consequenceOfNonApproval: "The company remains blocked.",
       question: "How should AgentTown resolve the lifecycle cleanup failure?",
       options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
     });
+  }
+
+  #invalidCheckpointApproval(error: unknown): NewEvent {
+    return this.#event("user.approval.requested", "core", null, {
+      reason: "invalid_checkpoint",
+      error: errorMessage(error),
+      operation: "select a valid recovery checkpoint",
+      impact: "Recovery did not start any Agent process.",
+      alternatives: ["repair_checkpoint", "select_checkpoint", "keep_blocked"],
+      consequenceOfNonApproval: "The company remains blocked without starting processes.",
+      question: "Should AgentTown repair this checkpoint or use another checkpoint?",
+      options: ["repair_checkpoint", "select_checkpoint", "keep_blocked"]
+    });
+  }
+
+  #recoveryApproval(
+    reason: "recovery_failed" | "cleanup_failed",
+    employeeId: string,
+    error: unknown
+  ): NewEvent {
+    const cleanup = reason === "cleanup_failed";
+    return this.#event("user.approval.requested", "core", null, {
+      reason,
+      employeeId,
+      error: errorMessage(error),
+      operation: cleanup ? "clean up recovery processes" : "retry company recovery",
+      impact: cleanup
+        ? "AgentTown cannot prove all recovery processes stopped."
+        : "Recovery stopped before all employees were restored.",
+      alternatives: cleanup
+        ? ["retry_cleanup", "inspect_processes", "keep_blocked"]
+        : ["retry_recovery", "inspect_agent_config", "keep_blocked"],
+      consequenceOfNonApproval: "The company remains blocked.",
+      question: cleanup
+        ? "How should AgentTown clean up the recovery processes?"
+        : "Should AgentTown retry recovery or inspect Agent configuration?",
+      options: cleanup
+        ? ["retry_cleanup", "inspect_processes", "keep_blocked"]
+        : ["retry_recovery", "inspect_agent_config", "keep_blocked"]
+    });
+  }
+
+  async #cleanupWithinDeadline(deadline: Deadline): Promise<StopOutcome[]> {
+    let last: StopOutcome[] = [];
+    const forceTailMs = Math.max(
+      1,
+      Math.min(1_000, Math.floor(this.#pauseTimeoutMs * 0.15))
+    );
+    while (this.#remaining(deadline) > 0) {
+      const gracefulSignal = this.#signalUntil(
+        Math.max(Date.now(), deadline.at - forceTailMs)
+      );
+      const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
+      gracefulSignal.dispose();
+      if (graceful.length === 0) return [];
+      if (graceful.every(({ status }) => status === "stopped")) {
+        last = graceful;
+        continue;
+      }
+      last = await this.#sessions.stopAllBounded(deadline.controller.signal, true);
+      if (last.length === 0) return [];
+      if (last.every(({ status }) => status === "stopped")) continue;
+      break;
+    }
+    return last.filter(({ status }) => status !== "stopped");
+  }
+
+  #remaining(deadline: Deadline): number {
+    return Math.max(0, deadline.at - Date.now());
   }
 
   #event(

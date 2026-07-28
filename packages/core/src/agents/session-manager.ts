@@ -226,8 +226,9 @@ export class SessionManager {
     signal: AbortSignal,
     force = false
   ): Promise<StopOutcome[]> {
-    const entries = [...this.#sessions.entries()];
-    return Promise.all(entries.map(async ([employeeId, handle]) => {
+    const entries = this.#collectStopCandidates();
+    return Promise.all(entries.map(async ([key, candidate]) => {
+      const { employeeId, handle, active } = candidate;
       if (signal.aborted) {
         return { employeeId, status: "aborted", error: "stop aborted" };
       }
@@ -240,20 +241,22 @@ export class SessionManager {
         if (result === null || signal.aborted) {
           return { employeeId, status: "aborted", error: "stop aborted" };
         }
-        this.store.putSession(
-          this.companyId,
-          employeeId,
-          handle,
-          "stopped",
-          this.#newEvent("session.stopped", employeeId, null, { forced: force })
-        );
-        const current = this.#sessions.get(employeeId);
-        if (current !== undefined && this.#handleKey(current) === this.#handleKey(handle)) {
-          this.#sessions.delete(employeeId);
+        if (active) {
+          this.store.putSession(
+            this.companyId,
+            employeeId,
+            handle,
+            "stopped",
+            this.#newEvent("session.stopped", employeeId, null, { forced: force })
+          );
+          const current = this.#sessions.get(employeeId);
+          if (current !== undefined && this.#handleKey(current) === key) {
+            this.#sessions.delete(employeeId);
+          }
         }
         this.#unavailableEmployees.delete(employeeId);
-        this.#cleanupHandles.delete(this.#handleKey(handle));
-        this.#handleOrders.delete(this.#handleKey(handle));
+        this.#cleanupHandles.delete(key);
+        this.#handleOrders.delete(key);
         return { employeeId, status: "stopped", error: null };
       } catch (error) {
         return { employeeId, status: "failed", error: this.#errorMessage(error) };
@@ -262,33 +265,7 @@ export class SessionManager {
   }
 
   async stopAll(): Promise<void> {
-    const candidates = new Map<string, {
-      employeeId: string;
-      handle: SessionHandle;
-      active: boolean;
-      order: number;
-    }>();
-    for (const [employeeId, handle] of this.#sessions) {
-      const key = this.#handleKey(handle);
-      candidates.set(key, {
-        employeeId,
-        handle,
-        active: true,
-        order: this.#registerHandle(handle)
-      });
-    }
-    for (const [key, cleanup] of this.#cleanupHandles) {
-      if (candidates.has(key)) continue;
-      candidates.set(key, {
-        employeeId: cleanup.handle.employeeId,
-        handle: cleanup.handle,
-        active: false,
-        order: cleanup.order
-      });
-    }
-    const entries = [...candidates.entries()].sort(
-      ([, left], [, right]) => right.order - left.order
-    );
+    const entries = this.#collectStopCandidates();
     const errors: Error[] = [];
     for (const [key, candidate] of entries) {
       const { employeeId, handle, active } = candidate;
@@ -337,13 +314,15 @@ export class SessionManager {
 
   async resumeOne(
     employee: EmployeeDefinition,
-    checkpoint: SessionCheckpoint
+    checkpoint: SessionCheckpoint,
+    signal?: AbortSignal
   ): Promise<SessionHandle> {
     if (checkpoint.employeeId !== employee.id) {
       throw new Error(`checkpoint employee mismatch: ${checkpoint.employeeId}`);
     }
     const release = await this.#acquire(employee.id);
     try {
+      if (signal?.aborted === true) throw new Error("session replacement aborted");
       const handle = await this.adapterFor(employee.agent).resume({
         employeeId: employee.id,
         role: employee.role,
@@ -353,6 +332,7 @@ export class SessionManager {
         handoff: checkpoint.handoff
       });
       this.#registerHandle(handle);
+      await this.#rejectAbortedReplacement(employee, handle, signal);
       await this.#persistReplacement(
         employee,
         handle,
@@ -369,10 +349,12 @@ export class SessionManager {
 
   async rebuildOne(
     employee: EmployeeDefinition,
-    handoff: string
+    handoff: string,
+    signal?: AbortSignal
   ): Promise<SessionHandle> {
     const release = await this.#acquire(employee.id);
     try {
+      if (signal?.aborted === true) throw new Error("session replacement aborted");
       const handle = await this.adapterFor(employee.agent).start({
         employeeId: employee.id,
         role: employee.role,
@@ -380,6 +362,7 @@ export class SessionManager {
         scenario: "idle"
       });
       this.#registerHandle(handle);
+      await this.#rejectAbortedReplacement(employee, handle, signal);
       await this.#persistReplacement(
         employee,
         handle,
@@ -418,6 +401,60 @@ export class SessionManager {
 
   #isAborted(signal: AbortSignal | undefined): boolean {
     return signal?.aborted ?? false;
+  }
+
+  async #rejectAbortedReplacement(
+    employee: EmployeeDefinition,
+    handle: SessionHandle,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    if (signal?.aborted !== true) return;
+    try {
+      await this.adapterFor(employee.agent).stop(handle);
+      this.#forgetHandle(handle);
+    } catch (stopError) {
+      this.#retainForCleanup(handle);
+      throw new AggregateError(
+        [stopError],
+        `session replacement aborted and cleanup stop failed: ${employee.id}`
+      );
+    }
+    throw new Error(`session replacement aborted: ${employee.id}`);
+  }
+
+  #collectStopCandidates(): Array<[string, {
+    employeeId: string;
+    handle: SessionHandle;
+    active: boolean;
+    order: number;
+  }]> {
+    const candidates = new Map<string, {
+      employeeId: string;
+      handle: SessionHandle;
+      active: boolean;
+      order: number;
+    }>();
+    for (const [employeeId, handle] of this.#sessions) {
+      const key = this.#handleKey(handle);
+      candidates.set(key, {
+        employeeId,
+        handle,
+        active: true,
+        order: this.#registerHandle(handle)
+      });
+    }
+    for (const [key, cleanup] of this.#cleanupHandles) {
+      if (candidates.has(key)) continue;
+      candidates.set(key, {
+        employeeId: cleanup.handle.employeeId,
+        handle: cleanup.handle,
+        active: false,
+        order: cleanup.order
+      });
+    }
+    return [...candidates.entries()].sort(
+      ([, left], [, right]) => right.order - left.order
+    );
   }
 
   #persistAgentEvent(

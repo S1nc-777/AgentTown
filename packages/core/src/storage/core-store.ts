@@ -120,6 +120,14 @@ export class CoreStore {
     }));
   }
 
+  getLatestEventSequence(): number {
+    const row = this.#database.prepare(`
+      SELECT COALESCE(MAX(sequence), 0) AS sequence
+      FROM events
+    `).get() as DatabaseRow;
+    return readNumber(row, "sequence");
+  }
+
   subscribeEvents(listener: (event: EventRecord) => void): () => void {
     this.#eventListeners.add(listener);
     return () => {
