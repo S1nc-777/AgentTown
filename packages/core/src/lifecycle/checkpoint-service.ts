@@ -35,6 +35,8 @@ export interface CheckpointServiceOptions {
     | "interruptAll"
     | "stopAll"
     | "stopAllBounded"
+    | "cleanupOwnershipSnapshot"
+    | "cancelPendingReplacements"
     | "resumeOne"
     | "rebuildOne"
   >;
@@ -236,10 +238,13 @@ export class CheckpointService {
       );
       const quiesced = await this.#orchestrator.quiesce(quiesceSignal.signal);
       quiesceSignal.dispose();
-      if (!quiesced) {
+      const pendingReplacements = this.#sessions.cleanupOwnershipSnapshot().owners
+        .filter(({ kind }) => kind === "pending_replacement");
+      if (!quiesced || pendingReplacements.length > 0) {
         this.#store.insertEvent(this.#event("company.pause_timeout", "core", null, {
-          phase: "quiesce",
-          timeoutMs: this.#pauseTimeoutMs
+          phase: pendingReplacements.length > 0 ? "pending_replacement" : "quiesce",
+          timeoutMs: this.#pauseTimeoutMs,
+          pendingEmployees: pendingReplacements.map(({ employeeId }) => employeeId)
         }));
       }
 
@@ -262,7 +267,7 @@ export class CheckpointService {
 
       const failed = await this.#cleanupWithinDeadline(deadline);
       if (failed.length > 0) {
-        this.#commitPauseFailure(failed, "pause_failed");
+        this.#commitPauseFailure(failed, "cleanup_failed");
         throw new PauseFailedError(failed);
       }
       return checkpoint;
@@ -625,28 +630,89 @@ export class CheckpointService {
   }
 
   async #cleanupWithinDeadline(deadline: Deadline): Promise<StopOutcome[]> {
-    let last: StopOutcome[] = [];
+    this.#sessions.cancelPendingReplacements();
     const forceTailMs = Math.max(
       1,
       Math.min(1_000, Math.floor(this.#pauseTimeoutMs * 0.15))
     );
-    while (this.#remaining(deadline) > 0) {
+    while (true) {
+      const initialOwnership = this.#sessions.cleanupOwnershipSnapshot();
+      if (this.#remaining(deadline) === 0) {
+        if (initialOwnership.owners.length > 0) {
+          return this.#abortedOwnershipOutcomes(initialOwnership.owners);
+        }
+        if (await this.#ownershipIsStablyEmpty()) return [];
+        const racedOwnership = this.#sessions.cleanupOwnershipSnapshot();
+        return racedOwnership.owners.length > 0
+          ? this.#abortedOwnershipOutcomes(racedOwnership.owners)
+          : [{
+              employeeId: "unknown",
+              status: "aborted",
+              error: "session ownership changed during cleanup enumeration"
+            }];
+      }
+      if (initialOwnership.owners.length === 0 && await this.#ownershipIsStablyEmpty()) {
+        return [];
+      }
       const gracefulSignal = this.#signalUntil(
         Math.max(Date.now(), deadline.at - forceTailMs)
       );
       const graceful = await this.#sessions.stopAllBounded(gracefulSignal.signal);
       gracefulSignal.dispose();
-      if (graceful.length === 0) return [];
-      if (graceful.every(({ status }) => status === "stopped")) {
-        last = graceful;
+      if (graceful.length === 0) {
+        if (await this.#ownershipIsStablyEmpty()) return [];
+        if (this.#remaining(deadline) === 0) {
+          return this.#abortedOwnershipOutcomes(
+            this.#sessions.cleanupOwnershipSnapshot().owners
+          );
+        }
         continue;
       }
-      last = await this.#sessions.stopAllBounded(deadline.controller.signal, true);
-      if (last.length === 0) return [];
-      if (last.every(({ status }) => status === "stopped")) continue;
-      break;
+      if (graceful.every(({ status }) => status === "stopped")) {
+        if (await this.#ownershipIsStablyEmpty()) return [];
+        if (this.#remaining(deadline) === 0) {
+          return this.#abortedOwnershipOutcomes(
+            this.#sessions.cleanupOwnershipSnapshot().owners
+          );
+        }
+        continue;
+      }
+      if (this.#remaining(deadline) === 0) {
+        return graceful.filter(({ status }) => status !== "stopped");
+      }
+      const forced = await this.#sessions.stopAllBounded(deadline.controller.signal, true);
+      if (forced.length === 0) {
+        if (await this.#ownershipIsStablyEmpty()) return [];
+        if (this.#remaining(deadline) === 0) {
+          return this.#abortedOwnershipOutcomes(
+            this.#sessions.cleanupOwnershipSnapshot().owners
+          );
+        }
+        continue;
+      }
+      if (forced.every(({ status }) => status === "stopped")) continue;
+      return forced.filter(({ status }) => status !== "stopped");
     }
-    return last.filter(({ status }) => status !== "stopped");
+  }
+
+  async #ownershipIsStablyEmpty(): Promise<boolean> {
+    const first = this.#sessions.cleanupOwnershipSnapshot();
+    if (first.owners.length > 0) return false;
+    await Promise.resolve();
+    const second = this.#sessions.cleanupOwnershipSnapshot();
+    return second.owners.length === 0 && second.version === first.version;
+  }
+
+  #abortedOwnershipOutcomes(
+    owners: ReturnType<SessionManager["cleanupOwnershipSnapshot"]>["owners"]
+  ): StopOutcome[] {
+    return owners.map((owner) => ({
+      employeeId: owner.employeeId,
+      status: "aborted",
+      error: owner.kind === "pending_replacement"
+        ? "replacement creation still pending"
+        : "stop aborted"
+    }));
   }
 
   #remaining(deadline: Deadline): number {

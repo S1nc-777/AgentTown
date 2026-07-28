@@ -32,6 +32,14 @@ export interface StopOutcome {
   error: string | null;
 }
 
+export interface SessionOwnershipSnapshot {
+  version: number;
+  owners: readonly {
+    employeeId: string;
+    kind: "active" | "cleanup" | "pending_replacement";
+  }[];
+}
+
 export class SessionManager {
   readonly #sessions = new Map<string, SessionHandle>();
   readonly #unavailableEmployees = new Set<string>();
@@ -41,7 +49,12 @@ export class SessionManager {
     order: number;
   }>();
   readonly #handleOrders = new Map<string, number>();
+  readonly #pendingReplacements = new Map<string, {
+    employeeId: string;
+    cancelled: boolean;
+  }>();
   #nextHandleOrder = 0;
+  #ownershipVersion = 0;
 
   constructor(
     private readonly adapterFor: (agentName: string) => AgentAdapter,
@@ -93,12 +106,13 @@ export class SessionManager {
           })
         );
         this.#sessions.set(employee.id, result.value);
+        this.#ownershipVersion += 1;
         this.#unavailableEmployees.delete(employee.id);
       }
     } catch (error) {
       await this.#stopStartedHandles(company, results);
       for (const employee of company.employees) {
-        this.#sessions.delete(employee.id);
+        if (this.#sessions.delete(employee.id)) this.#ownershipVersion += 1;
         this.#unavailableEmployees.delete(employee.id);
         try {
           this.store.deleteSession(
@@ -226,8 +240,18 @@ export class SessionManager {
     signal: AbortSignal,
     force = false
   ): Promise<StopOutcome[]> {
+    const pending = [...this.#pendingReplacements.values()].map((replacement) => {
+      replacement.cancelled = true;
+      return {
+        employeeId: replacement.employeeId,
+        status: "aborted" as const,
+        error: "replacement creation still pending"
+      };
+    });
     const entries = this.#collectStopCandidates();
-    return Promise.all(entries.map(async ([key, candidate]) => {
+    const handles = await Promise.all(entries.map(async (
+      [key, candidate]
+    ): Promise<StopOutcome> => {
       const { employeeId, handle, active } = candidate;
       if (signal.aborted) {
         return { employeeId, status: "aborted", error: "stop aborted" };
@@ -252,21 +276,61 @@ export class SessionManager {
           const current = this.#sessions.get(employeeId);
           if (current !== undefined && this.#handleKey(current) === key) {
             this.#sessions.delete(employeeId);
+            this.#ownershipVersion += 1;
           }
         }
         this.#unavailableEmployees.delete(employeeId);
-        this.#cleanupHandles.delete(key);
+        if (this.#cleanupHandles.delete(key)) this.#ownershipVersion += 1;
         this.#handleOrders.delete(key);
         return { employeeId, status: "stopped", error: null };
       } catch (error) {
         return { employeeId, status: "failed", error: this.#errorMessage(error) };
       }
     }));
+    return [...pending, ...handles];
+  }
+
+  cleanupOwnershipSnapshot(): SessionOwnershipSnapshot {
+    const owners: SessionOwnershipSnapshot["owners"][number][] = [];
+    const handleKinds = new Map<string, SessionOwnershipSnapshot["owners"][number]>();
+    for (const [employeeId, handle] of this.#sessions) {
+      handleKinds.set(this.#handleKey(handle), { employeeId, kind: "active" });
+    }
+    for (const [key, cleanup] of this.#cleanupHandles) {
+      if (!handleKinds.has(key)) {
+        handleKinds.set(key, {
+          employeeId: cleanup.handle.employeeId,
+          kind: "cleanup"
+        });
+      }
+    }
+    owners.push(...handleKinds.values());
+    for (const replacement of this.#pendingReplacements.values()) {
+      owners.push({
+        employeeId: replacement.employeeId,
+        kind: "pending_replacement"
+      });
+    }
+    return { version: this.#ownershipVersion, owners };
+  }
+
+  cancelPendingReplacements(): StopOutcome[] {
+    return [...this.#pendingReplacements.values()].map((replacement) => {
+      replacement.cancelled = true;
+      return {
+        employeeId: replacement.employeeId,
+        status: "aborted",
+        error: "replacement creation still pending"
+      };
+    });
   }
 
   async stopAll(): Promise<void> {
     const entries = this.#collectStopCandidates();
-    const errors: Error[] = [];
+    const errors: Error[] = [...this.#pendingReplacements.values()].map((replacement) => {
+      replacement.cancelled = true;
+      return new Error(`${replacement.employeeId}: replacement creation still pending`);
+    });
     for (const [key, candidate] of entries) {
       const { employeeId, handle, active } = candidate;
       let adapterStopped = false;
@@ -278,7 +342,7 @@ export class SessionManager {
       }
       if (!adapterStopped) continue;
       if (!active) {
-        this.#cleanupHandles.delete(key);
+        if (this.#cleanupHandles.delete(key)) this.#ownershipVersion += 1;
         this.#handleOrders.delete(key);
         continue;
       }
@@ -296,9 +360,10 @@ export class SessionManager {
           && this.#handleKey(activeHandle) === key
         ) {
           this.#sessions.delete(employeeId);
+          this.#ownershipVersion += 1;
         }
         this.#unavailableEmployees.delete(employeeId);
-        this.#cleanupHandles.delete(key);
+        if (this.#cleanupHandles.delete(key)) this.#ownershipVersion += 1;
         this.#handleOrders.delete(key);
       } catch (error) {
         errors.push(new Error(`${employeeId} persistence: ${this.#errorMessage(error)}`));
@@ -323,16 +388,24 @@ export class SessionManager {
     const release = await this.#acquire(employee.id);
     try {
       if (signal?.aborted === true) throw new Error("session replacement aborted");
-      const handle = await this.adapterFor(employee.agent).resume({
-        employeeId: employee.id,
-        role: employee.role,
-        projectRoot: this.projectRoot,
-        scenario: "idle",
-        previous: checkpoint.handle,
-        handoff: checkpoint.handoff
-      });
-      this.#registerHandle(handle);
-      await this.#rejectAbortedReplacement(employee, handle, signal);
+      const pending = this.#beginReplacement(employee.id);
+      let handle: SessionHandle;
+      try {
+        handle = await this.adapterFor(employee.agent).resume({
+          employeeId: employee.id,
+          role: employee.role,
+          projectRoot: this.projectRoot,
+          scenario: "idle",
+          previous: checkpoint.handle,
+          handoff: checkpoint.handoff
+        });
+      } catch (error) {
+        this.#finishReplacement(pending.id);
+        throw error;
+      }
+      this.#retainForCleanup(handle);
+      this.#finishReplacement(pending.id);
+      await this.#rejectAbortedReplacement(employee, handle, signal, pending.state.cancelled);
       await this.#persistReplacement(
         employee,
         handle,
@@ -355,14 +428,22 @@ export class SessionManager {
     const release = await this.#acquire(employee.id);
     try {
       if (signal?.aborted === true) throw new Error("session replacement aborted");
-      const handle = await this.adapterFor(employee.agent).start({
-        employeeId: employee.id,
-        role: employee.role,
-        projectRoot: this.projectRoot,
-        scenario: "idle"
-      });
-      this.#registerHandle(handle);
-      await this.#rejectAbortedReplacement(employee, handle, signal);
+      const pending = this.#beginReplacement(employee.id);
+      let handle: SessionHandle;
+      try {
+        handle = await this.adapterFor(employee.agent).start({
+          employeeId: employee.id,
+          role: employee.role,
+          projectRoot: this.projectRoot,
+          scenario: "idle"
+        });
+      } catch (error) {
+        this.#finishReplacement(pending.id);
+        throw error;
+      }
+      this.#retainForCleanup(handle);
+      this.#finishReplacement(pending.id);
+      await this.#rejectAbortedReplacement(employee, handle, signal, pending.state.cancelled);
       await this.#persistReplacement(
         employee,
         handle,
@@ -406,9 +487,10 @@ export class SessionManager {
   async #rejectAbortedReplacement(
     employee: EmployeeDefinition,
     handle: SessionHandle,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    cancelled: boolean
   ): Promise<void> {
-    if (signal?.aborted !== true) return;
+    if (signal?.aborted !== true && !cancelled) return;
     try {
       await this.adapterFor(employee.agent).stop(handle);
       this.#forgetHandle(handle);
@@ -577,7 +659,9 @@ export class SessionManager {
     }
     const previous = this.#sessions.get(employee.id);
     this.#sessions.set(employee.id, handle);
+    this.#ownershipVersion += 1;
     this.#unavailableEmployees.delete(employee.id);
+    this.#removeCleanupHandle(handle);
     if (previous !== undefined && this.#handleKey(previous) !== this.#handleKey(handle)) {
       this.#forgetHandle(previous);
     }
@@ -598,12 +682,37 @@ export class SessionManager {
       handle,
       order: this.#registerHandle(handle)
     });
+    this.#ownershipVersion += 1;
   }
 
   #forgetHandle(handle: SessionHandle): void {
     const key = this.#handleKey(handle);
-    this.#cleanupHandles.delete(key);
+    const removed = this.#cleanupHandles.delete(key);
     this.#handleOrders.delete(key);
+    if (removed) this.#ownershipVersion += 1;
+  }
+
+  #removeCleanupHandle(handle: SessionHandle): void {
+    if (this.#cleanupHandles.delete(this.#handleKey(handle))) {
+      this.#ownershipVersion += 1;
+    }
+  }
+
+  #beginReplacement(employeeId: string): {
+    id: string;
+    state: { employeeId: string; cancelled: boolean };
+  } {
+    const id = randomUUID();
+    const state = { employeeId, cancelled: false };
+    this.#pendingReplacements.set(id, state);
+    this.#ownershipVersion += 1;
+    return { id, state };
+  }
+
+  #finishReplacement(id: string): void {
+    if (this.#pendingReplacements.delete(id)) {
+      this.#ownershipVersion += 1;
+    }
   }
 
   #handleKey(handle: SessionHandle): string {

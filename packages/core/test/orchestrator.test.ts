@@ -1036,4 +1036,61 @@ describe("SessionManager", () => {
     expect(adapter.stoppedSessionIds.filter((id) => id === "developer-a-5"))
       .toHaveLength(2);
   });
+
+  it("blocks pause on a pending replacement and retains the late handle for cleanup", async () => {
+    const { adapter, company, sessions, store, orchestrator } = createHarness();
+    await orchestrator.start({});
+    const employee = company.employees.find((item) => item.id === "developer-a");
+    if (employee === undefined) throw new Error("developer-a missing");
+    const previous = sessions.get(employee.id);
+    const originalResume = adapter.resume.bind(adapter);
+    let releaseResume: () => void = () => undefined;
+    const resumeGate = new Promise<void>((resolvePromise) => {
+      releaseResume = resolvePromise;
+    });
+    let resumeEntered: () => void = () => undefined;
+    const entered = new Promise<void>((resolvePromise) => {
+      resumeEntered = resolvePromise;
+    });
+    adapter.resume = async (input) => {
+      resumeEntered();
+      await resumeGate;
+      return originalResume(input);
+    };
+    const replacing = sessions.resumeOne(employee, {
+      employeeId: employee.id,
+      handle: previous,
+      activeTaskId: "task-a",
+      handoff: "late replacement"
+    });
+    await entered;
+    const lifecycle = new CheckpointService({
+      companyId: "company-1",
+      company,
+      store,
+      orchestrator,
+      sessions,
+      adapterFor: () => adapter,
+      pauseTimeoutMs: 1
+    });
+
+    await expect(lifecycle.pause("shutdown")).rejects.toThrow("pause failed");
+    expect(store.getCompany("company-1")?.status).toBe("blocked");
+    expect(store.listEvents(0).find(
+      ({ type }) => type === "user.approval.requested"
+    )?.payload).toMatchObject({ reason: "cleanup_failed" });
+
+    adapter.failStopEmployeeIds.add(employee.id);
+    releaseResume();
+    await expect(replacing).rejects.toThrow("cleanup stop failed");
+    expect(store.listSessions("company-1").find(
+      (session) => session.employeeId === employee.id
+    )?.handle).toEqual(previous);
+
+    adapter.failStopEmployeeIds.clear();
+    const cleanup = await sessions.stopAllBounded(new AbortController().signal);
+    expect(cleanup.every(({ status }) => status === "stopped")).toBe(true);
+    expect(adapter.stoppedSessionIds.filter((id) => id === "developer-a-5"))
+      .toHaveLength(2);
+  });
 });

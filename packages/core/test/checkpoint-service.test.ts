@@ -268,6 +268,38 @@ describe("CheckpointService", () => {
     expect(store.getCompany(companyId)?.status).toBe("blocked");
     expect(() => sessions.get("leader")).not.toThrow();
     expect(store.listSessions(companyId).every(({ status }) => status !== "stopped")).toBe(true);
+    expect(store.listEvents(0).find(({ type }) => type === "user.approval.requested")?.payload)
+      .toMatchObject({
+        reason: "cleanup_failed",
+        options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
+      });
+  });
+
+  it("takes an ownership snapshot at a one-millisecond deadline and retains live sessions", async () => {
+    let stopCalls = 0;
+    let forceCalls = 0;
+    const { lifecycle, store, sessions } = await createHarness({
+      pauseTimeoutMs: 1,
+      interrupt: async () => await new Promise<never>(() => undefined),
+      stop: async () => {
+        stopCalls += 1;
+      },
+      forceStop: async () => {
+        forceCalls += 1;
+      }
+    });
+
+    await expect(lifecycle.pause("shutdown")).rejects.toThrow("pause failed");
+
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(stopCalls).toBe(0);
+    expect(forceCalls).toBe(0);
+    expect(() => sessions.get("leader")).not.toThrow();
+    expect(store.listEvents(0).find(({ type }) => type === "user.approval.requested")?.payload)
+      .toMatchObject({
+        reason: "cleanup_failed",
+        options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
+      });
   });
 
   it("uses native resume only when declared and rebuilds the other real session", async () => {
@@ -329,7 +361,10 @@ describe("CheckpointService", () => {
       "user.approval.requested"
     ]));
     expect(store.listEvents(0).find(({ type }) => type === "user.approval.requested")?.payload)
-      .toMatchObject({ reason: "pause_failed" });
+      .toMatchObject({
+        reason: "cleanup_failed",
+        options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
+      });
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
     expect(store.getCompany(companyId)?.status).toBe("blocked");
   });
