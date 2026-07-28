@@ -824,6 +824,9 @@ export class CoreServer {
         }
         return this.#store.getCompany(companyId);
       }
+      case "status.snapshot": {
+        return this.#statusSnapshot(requiredString(request.params, "companyId"));
+      }
       case "company.start":
         await this.#orchestrator.start(
           stringRecord(request.params.scenarios ?? {}, "scenarios")
@@ -892,6 +895,49 @@ export class CoreServer {
           `unknown IPC method: ${request.method}`
         );
     }
+  }
+
+  #statusSnapshot(companyId: string): Record<string, unknown> {
+    const company = this.#store.getCompany(companyId);
+    if (company === null) {
+      throw new RequestError("not_found", `company not found: ${companyId}`);
+    }
+    const tasks = this.#store.listTasks(companyId);
+    const events = this.#store.listEvents(0);
+    const sessions = new Map(
+      this.#store.listSessions(companyId).map((session) => [
+        session.employeeId,
+        session
+      ])
+    );
+    const employees = this.#store.listEmployees(companyId).map((employee) => {
+      const currentTask = tasks.find((task) =>
+        task.ownerEmployeeId === employee.id
+        && (task.status === "running" || task.status === "review")
+      );
+      return {
+        ...employee,
+        status: sessions.get(employee.id)?.status ?? "not_started",
+        currentTaskId: currentTask?.id ?? null,
+        usage: this.#store.latestUsage(companyId, employee.id) ?? {
+          inputTokens: null,
+          outputTokens: null,
+          contextTokens: null,
+          capturedAt: "1970-01-01T00:00:00.000Z"
+        }
+      };
+    });
+    return {
+      companyId,
+      status: company.status,
+      activeTaskCount: tasks.filter(
+        (task) => task.status === "running" || task.status === "review"
+      ).length,
+      pendingApprovalCount: events.filter(
+        (event) => event.type === "user.approval.requested"
+      ).length,
+      employees
+    };
   }
 
   #handshake(

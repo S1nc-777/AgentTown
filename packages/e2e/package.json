@@ -1,0 +1,14 @@
+{
+  "name": "@agenttown/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pretest": "pnpm --filter @agenttown/runtime-contract build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1"
+  }
+}

@@ -27,8 +27,10 @@ import {
 } from "./paths.js";
 import {
   renderCompanyStatus,
+  renderEmployee,
   renderTasks,
-  renderTimeline
+  renderTimeline,
+  type EmployeeStatusView
 } from "./render.js";
 import {
   templateYaml,
@@ -131,6 +133,58 @@ function record(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`${label} returned an invalid response`);
   }
   return value as Record<string, unknown>;
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requiredNonnegativeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`${label} must be a nonnegative integer`);
+  }
+  return value as number;
+}
+
+function nullableUsageNumber(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  return requiredNonnegativeInteger(value, label);
+}
+
+function employeeStatus(value: unknown): EmployeeStatusView {
+  const employee = record(value, "status.snapshot employee");
+  const usage = record(employee.usage, "status.snapshot usage");
+  const currentTaskId = employee.currentTaskId;
+  if (currentTaskId !== null && typeof currentTaskId !== "string") {
+    throw new Error("status.snapshot currentTaskId must be a string or null");
+  }
+  return {
+    id: requiredString(employee.id, "status.snapshot employee id"),
+    role: requiredString(employee.role, "status.snapshot employee role"),
+    status: requiredString(employee.status, "status.snapshot employee status"),
+    currentTaskId,
+    usage: {
+      inputTokens: nullableUsageNumber(
+        usage.inputTokens,
+        "status.snapshot inputTokens"
+      ),
+      outputTokens: nullableUsageNumber(
+        usage.outputTokens,
+        "status.snapshot outputTokens"
+      ),
+      contextTokens: nullableUsageNumber(
+        usage.contextTokens,
+        "status.snapshot contextTokens"
+      ),
+      capturedAt: requiredString(
+        usage.capturedAt,
+        "status.snapshot capturedAt"
+      )
+    }
+  };
 }
 
 async function connectExisting(pipeName: string): Promise<AgentTownClient> {
@@ -270,24 +324,35 @@ async function start(projectRoot: string, runtime: CliRuntime): Promise<void> {
 async function status(projectRoot: string, runtime: CliRuntime): Promise<void> {
   const client = await runtime.connectOrStart(projectRoot, false);
   try {
-    const [company, tasks, events] = await Promise.all([
-      client.request("company.status", { companyId: COMPANY_ID }),
-      client.request("tasks.list", { companyId: COMPANY_ID }),
-      client.request("events.list", { afterSequence: 0 })
-    ]);
-    const companyFact = record(company, "company.status");
-    const taskRecords = tasks as TaskRecord[];
-    const eventRecords = events as EventRecord[];
-    await writeWithBackpressure(runtime.stdout, `${renderCompanyStatus({
-      companyId: COMPANY_ID,
-      status: typeof companyFact.status === "string" ? companyFact.status : "unknown",
-      activeTaskCount: taskRecords.filter(
-        ({ status: taskStatus }) => taskStatus === "running" || taskStatus === "review"
-      ).length,
-      pendingApprovalCount: eventRecords.filter(
-        ({ type }) => type === "user.approval.requested"
-      ).length
-    })}\n`);
+    const snapshot = record(
+      await client.request("status.snapshot", { companyId: COMPANY_ID }),
+      "status.snapshot"
+    );
+    if (!Array.isArray(snapshot.employees)) {
+      throw new Error("status.snapshot employees must be an array");
+    }
+    const employees = snapshot.employees
+      .map(employeeStatus)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const output = [
+      renderCompanyStatus({
+        companyId: requiredString(
+          snapshot.companyId,
+          "status.snapshot companyId"
+        ),
+        status: requiredString(snapshot.status, "status.snapshot status"),
+        activeTaskCount: requiredNonnegativeInteger(
+          snapshot.activeTaskCount,
+          "status.snapshot activeTaskCount"
+        ),
+        pendingApprovalCount: requiredNonnegativeInteger(
+          snapshot.pendingApprovalCount,
+          "status.snapshot pendingApprovalCount"
+        )
+      }),
+      ...employees.map(renderEmployee)
+    ].join("\n\n");
+    await writeWithBackpressure(runtime.stdout, `${output}\n`);
   } finally {
     await client.close();
   }

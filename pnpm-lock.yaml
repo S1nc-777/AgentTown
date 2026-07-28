@@ -43,6 +43,12 @@ importers:
         specifier: workspace:*
         version: link:../runtime-contract
 
+  packages/e2e:
+    devDependencies:
+      '@types/node':
+        specifier: ^26.1.1
+        version: 26.1.1
+
   packages/fake-agent:
     dependencies:
       '@agenttown/probe-contract':

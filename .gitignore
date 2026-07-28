@@ -1,5 +1,6 @@
 .worktrees/
 .superpowers/sdd/
+.agenttown/
 node_modules/
 dist/
 target/

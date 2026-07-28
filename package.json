@@ -9,7 +9,9 @@
   "scripts": {
     "pretypecheck": "pnpm --filter @agenttown/probe-contract build",
     "test": "pnpm -r --if-present test",
+    "test:p1a": "pnpm --filter @agenttown/e2e test",
     "typecheck": "pnpm -r --if-present typecheck",
+    "agenttown": "pnpm --filter @agenttown/cli exec tsx src/main.ts",
     "probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake",
     "probe:real": "powershell -NoProfile -File scripts/run-real-probes.ps1",
     "benchmark:frameworks": "powershell -NoProfile -File scripts/run-framework-benchmark.ps1"

@@ -709,6 +709,32 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
       ok: true,
       result: { id: "company-1", status: "active" }
     });
+    await expect(client.request("status.snapshot", {
+      companyId: "company-1"
+    })).resolves.toMatchObject({
+      ok: true,
+      result: {
+        companyId: "company-1",
+        status: "active",
+        activeTaskCount: 0,
+        pendingApprovalCount: 0,
+        employees: [
+          {
+            id: "developer",
+            role: "Developer",
+            status: "not_started",
+            currentTaskId: null,
+            usage: {
+              inputTokens: null,
+              outputTokens: null,
+              contextTokens: null
+            }
+          },
+          expect.objectContaining({ id: "leader" }),
+          expect.objectContaining({ id: "reviewer" })
+        ]
+      }
+    });
     await expect(client.request("tasks.list", {
       companyId: "company-1"
     })).resolves.toMatchObject({ ok: true, result: [] });

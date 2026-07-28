@@ -190,6 +190,22 @@ export class CoreStore {
     };
   }
 
+  listEmployees(companyId: string): Array<{
+    id: string;
+    role: string;
+  }> {
+    const rows = this.#database.prepare(`
+      SELECT id, role
+      FROM employees
+      WHERE company_id = ?
+      ORDER BY id ASC
+    `).all(companyId) as DatabaseRow[];
+    return rows.map((row) => ({
+      id: readString(row, "id"),
+      role: readString(row, "role")
+    }));
+  }
+
   setCompanyStatus(companyId: string, status: string, event: NewEvent): void {
     const insertedEvent = this.inTransaction(() => {
       const result = this.#database.prepare(`

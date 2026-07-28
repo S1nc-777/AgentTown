@@ -216,7 +216,26 @@ describe("thin CLI commands", () => {
 
   it("executes status, tasks and timeline through an injected client", async () => {
     const responses: Record<string, unknown> = {
-      "company.status": { status: "running" },
+      "status.snapshot": {
+        companyId: "company",
+        status: "running",
+        activeTaskCount: 1,
+        pendingApprovalCount: 1,
+        employees: [
+          {
+            id: "leader",
+            role: "product_lead",
+            status: "running",
+            currentTaskId: null,
+            usage: {
+              inputTokens: null,
+              outputTokens: null,
+              contextTokens: null,
+              capturedAt: "1970-01-01T00:00:00.000Z"
+            }
+          }
+        ]
+      },
       "tasks.list": [task()],
       "events.list": [event()]
     };
@@ -227,6 +246,14 @@ describe("thin CLI commands", () => {
       expect(fake.starts).toEqual([false]);
       expect(fake.closed).toEqual([1]);
       expect(fake.output.join("")).not.toBe("");
+      if (command === "status") {
+        expect(fake.calls).toEqual([{
+          method: "status.snapshot",
+          params: { companyId: "company" }
+        }]);
+        expect(fake.output.join("")).toContain("leader (product_lead)");
+        expect(fake.output.join("")).toContain("context=unknown");
+      }
     }
   });
 
