@@ -384,6 +384,13 @@ export class CoreServer {
     return this.#closePromise;
   }
 
+  forceCloseTransport(): void {
+    void this.#ensureTransportClosing().catch((error: unknown) => {
+      this.#recordBackgroundError(error);
+    });
+    this.#forceTransportClose();
+  }
+
   #ensureTransportClosing(): Promise<void> {
     if (this.#transportClosedPromise !== null) {
       return this.#transportClosedPromise;

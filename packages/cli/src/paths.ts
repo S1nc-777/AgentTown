@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import {
   isAbsolute,
@@ -40,6 +41,65 @@ export function resolveAgentTownPaths(projectRoot: string): AgentTownPaths {
     companyPath: assertWithinProject(root, join(stateDir, "company.yaml")),
     logsDir: assertWithinProject(root, join(stateDir, "logs"))
   };
+}
+
+async function optionalLstat(
+  path: string
+): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (
+      error instanceof Error
+      && "code" in error
+      && (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const childPath = relative(parent, child);
+  return childPath === ""
+    || (
+      childPath !== ".."
+      && !childPath.startsWith(`..${sep}`)
+      && !isAbsolute(childPath)
+    );
+}
+
+export async function validateAgentTownWriteLayout(
+  paths: AgentTownPaths
+): Promise<void> {
+  const projectReal = await realpath(paths.projectRoot);
+  const stateStat = await optionalLstat(paths.stateDir);
+  if (stateStat?.isSymbolicLink() === true) {
+    throw new Error(".agenttown must not be a symbolic link or junction");
+  }
+  if (stateStat === null) return;
+
+  const stateReal = await realpath(paths.stateDir);
+  if (!isWithin(projectReal, stateReal)) {
+    throw new Error(".agenttown resolves outside project");
+  }
+  for (const candidate of [
+    paths.databasePath,
+    paths.companyPath,
+    paths.logsDir
+  ]) {
+    const candidateStat = await optionalLstat(candidate);
+    if (candidateStat?.isSymbolicLink() === true) {
+      throw new Error(`AgentTown state path is a symbolic link or junction: ${candidate}`);
+    }
+    if (candidateStat !== null) {
+      const candidateReal = await realpath(candidate);
+      if (!isWithin(stateReal, candidateReal)) {
+        throw new Error(`AgentTown state path resolves outside .agenttown: ${candidate}`);
+      }
+    }
+  }
 }
 
 export function pipeNameForProject(

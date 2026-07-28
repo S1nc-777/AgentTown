@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import {
+  lstat,
+  readFile,
+  realpath
+} from "node:fs/promises";
+import {
+  dirname,
   isAbsolute,
+  join,
   relative,
   resolve,
   sep
@@ -31,6 +37,70 @@ export interface CoreArguments {
   companyPath: string;
   pipeName: string;
   leaseTtlMs: number;
+}
+
+export interface ShutdownCoordinator {
+  handleSignal(signal: NodeJS.Signals): void;
+}
+
+export function createShutdownCoordinator(options: {
+  timeoutMs: number;
+  pause: () => Promise<void>;
+  closeGracefully: () => Promise<void>;
+  closeTransportNow: () => void;
+  closeStore: () => void;
+  exit: (code: number) => void;
+  reportError: (message: string) => void;
+}): ShutdownCoordinator {
+  let signalCount = 0;
+  let started = false;
+  let finished = false;
+  return {
+    handleSignal(signal) {
+      signalCount += 1;
+      if (signalCount > 1) {
+        if (!finished) {
+          finished = true;
+          options.closeTransportNow();
+          options.exit(130);
+        }
+        return;
+      }
+      if (started) return;
+      started = true;
+      const timer = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        options.reportError(
+          `Core ${signal} shutdown timed out after ${options.timeoutMs}ms`
+        );
+        options.closeTransportNow();
+        options.exit(1);
+      }, options.timeoutMs);
+      void Promise.resolve()
+        .then(() => options.pause())
+        .then(() => options.closeGracefully())
+        .then(() => options.closeStore())
+        .then(() => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          options.exit(0);
+        })
+        .catch((error: unknown) => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          options.reportError(
+            `Core ${signal} shutdown failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+          options.closeTransportNow();
+          options.exit(1);
+        });
+    }
+  };
 }
 
 function requiredValue(values: Map<string, string>, key: string): string {
@@ -82,16 +152,28 @@ export function parseCoreArguments(argv: readonly string[]): CoreArguments {
     throw new Error("--project-root must be an absolute path");
   }
   const projectRoot = resolve(projectInput);
-  const databasePath = assertCorePathWithinProject(
-    projectRoot,
-    requiredValue(values, "--database"),
-    "--database"
-  );
-  const companyPath = assertCorePathWithinProject(
-    projectRoot,
-    requiredValue(values, "--company"),
-    "--company"
-  );
+  const stateDir = join(projectRoot, ".agenttown");
+  let databasePath: string;
+  let companyPath: string;
+  try {
+    databasePath = assertCorePathWithinProject(
+      stateDir,
+      requiredValue(values, "--database"),
+      "--database"
+    );
+    companyPath = assertCorePathWithinProject(
+      stateDir,
+      requiredValue(values, "--company"),
+      "--company"
+    );
+  } catch (error) {
+    throw new Error(
+      `Core state paths must remain within project .agenttown: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error }
+    );
+  }
   const pipeName = requiredValue(values, "--pipe-name");
   if (!PIPE_PATTERN.test(pipeName)) throw new Error("--pipe-name is invalid");
   const leaseText = requiredValue(values, "--lease-ttl-ms");
@@ -100,6 +182,70 @@ export function parseCoreArguments(argv: readonly string[]): CoreArguments {
     throw new Error("--lease-ttl-ms must be a positive integer");
   }
   return { projectRoot, databasePath, companyPath, pipeName, leaseTtlMs };
+}
+
+async function optionalLstat(path: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (
+      error instanceof Error
+      && "code" in error
+      && (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const childRelative = relative(parent, child);
+  return childRelative === ""
+    || (
+      childRelative !== ".."
+      && !childRelative.startsWith(`..${sep}`)
+      && !isAbsolute(childRelative)
+    );
+}
+
+export async function validateCoreStateLayout(args: CoreArguments): Promise<void> {
+  const stateDir = join(args.projectRoot, ".agenttown");
+  const stateStat = await optionalLstat(stateDir);
+  if (stateStat?.isSymbolicLink() === true) {
+    throw new Error(".agenttown must not be a symbolic link or junction");
+  }
+  const projectReal = await realpath(args.projectRoot);
+  if (stateStat !== null) {
+    const stateReal = await realpath(stateDir);
+    if (!isWithin(projectReal, stateReal)) {
+      throw new Error(".agenttown resolves outside project");
+    }
+  }
+  for (const target of [
+    args.databasePath,
+    args.companyPath,
+    join(stateDir, "logs")
+  ]) {
+    let current = target;
+    while (isWithin(stateDir, current)) {
+      const currentStat = await optionalLstat(current);
+      if (currentStat?.isSymbolicLink() === true) {
+        throw new Error(`Core state path is a symbolic link or junction: ${current}`);
+      }
+      if (currentStat !== null) {
+        const currentReal = await realpath(current);
+        const stateReal = stateStat === null ? stateDir : await realpath(stateDir);
+        if (!isWithin(stateReal, currentReal)) {
+          throw new Error(`Core state path resolves outside .agenttown: ${current}`);
+        }
+        break;
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
 }
 
 function employeeIds(company: CompanyDefinition): {
@@ -121,6 +267,7 @@ function employeeIds(company: CompanyDefinition): {
 export async function runCore(argv: readonly string[]): Promise<void> {
   // Parsing and lexical boundary validation intentionally happen before SQLite opens.
   const args = parseCoreArguments(argv);
+  await validateCoreStateLayout(args);
   const company = parseCompanyYaml(await readFile(args.companyPath, "utf8"));
   if (company.employees.some(({ agent }) => agent !== "fake")) {
     throw new Error("P1A Core accepts only the fake adapter");
@@ -128,8 +275,6 @@ export async function runCore(argv: readonly string[]): Promise<void> {
   const { leaderId, reviewerId } = employeeIds(company);
   const store = new CoreStore(args.databasePath);
   let server: CoreServer | undefined;
-  let shutdownStarted = false;
-  let signalCount = 0;
   try {
     store.initialize();
     if (store.getCompany(DEFAULT_COMPANY_ID) === null) {
@@ -208,41 +353,19 @@ export async function runCore(argv: readonly string[]): Promise<void> {
       }
     });
 
-    const shutdown = (signal: NodeJS.Signals): void => {
-      signalCount += 1;
-      if (signalCount > 1) {
-        process.exit(130);
-      }
-      if (shutdownStarted) return;
-      shutdownStarted = true;
-      const work = (async () => {
-        await lifecycle.pause("shutdown");
-        await server?.close();
-        store.close();
-      })();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      void Promise.race([
-        work,
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`Core shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms`)),
-            SHUTDOWN_TIMEOUT_MS
-          );
-        })
-      ]).then(
-        () => process.exit(0),
-        (error: unknown) => {
-          process.stderr.write(
-            `Core ${signal} shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`
-          );
-          void server?.close().finally(() => process.exit(1));
-        }
-      ).finally(() => {
-        if (timer !== undefined) clearTimeout(timer);
-      });
-    };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    const shutdown = createShutdownCoordinator({
+      timeoutMs: SHUTDOWN_TIMEOUT_MS,
+      pause: () => lifecycle.pause("shutdown").then(() => undefined),
+      closeGracefully: () => server?.close() ?? Promise.resolve(),
+      closeTransportNow: () => {
+        server?.forceCloseTransport();
+      },
+      closeStore: () => store.close(),
+      exit: (code) => process.exit(code),
+      reportError: (message) => process.stderr.write(`${message}\n`)
+    });
+    process.on("SIGINT", shutdown.handleSignal);
+    process.on("SIGTERM", shutdown.handleSignal);
 
     await server.listen();
     process.stdout.write(`${JSON.stringify({

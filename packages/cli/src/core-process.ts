@@ -61,6 +61,7 @@ export async function startCore(input: {
   pipeName: string;
   leaseTtlMs: number;
 }): Promise<{ child: ChildProcess; client: AgentTownClient }> {
+  const deadlineAt = Date.now() + READY_TIMEOUT_MS;
   const coreMain = fileURLToPath(new URL("../../core/src/main.ts", import.meta.url));
   const tsxImport = import.meta.resolve("tsx");
   const child = spawn(process.execPath, [
@@ -101,7 +102,7 @@ export async function startCore(input: {
       const timer = setTimeout(() => {
         cleanup();
         reject(new Error(`Core readiness timed out after ${READY_TIMEOUT_MS}ms`));
-      }, READY_TIMEOUT_MS);
+      }, Math.max(0, deadlineAt - Date.now()));
       const cleanup = () => {
         clearTimeout(timer);
         child.stdout?.off("data", onData);
@@ -141,10 +142,15 @@ export async function startCore(input: {
       child.stdout?.on("data", onData);
     });
     if (ready.pipeName !== input.pipeName) throw new Error("Core readiness pipe mismatch");
+    const connectBudgetMs = deadlineAt - Date.now();
+    if (connectBudgetMs <= 0) {
+      throw new Error(`Core startup timed out after ${READY_TIMEOUT_MS}ms`);
+    }
     const client = await AgentTownClient.connect(
       input.pipeName,
       `cli-${randomUUID()}`,
-      0
+      0,
+      connectBudgetMs
     );
     child.stderr?.off("data", onStderr);
     child.stdout?.resume();

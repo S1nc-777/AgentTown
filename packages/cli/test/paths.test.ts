@@ -1,8 +1,12 @@
+import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   assertWithinProject,
   pipeNameForProject,
-  resolveAgentTownPaths
+  resolveAgentTownPaths,
+  validateAgentTownWriteLayout
 } from "../src/paths.js";
 
 describe("AgentTown paths", () => {
@@ -41,5 +45,35 @@ describe("AgentTown paths", () => {
       .toThrow("outside project");
     expect(() => assertWithinProject("C:\\Work\\Project", "D:\\Work\\Project"))
       .toThrow("outside project");
+  });
+
+  it("rejects a symlinked or junction-backed .agenttown before writing", async () => {
+    const project = await mkdtemp(join(tmpdir(), "agenttown-cli-path-project-"));
+    const outside = await mkdtemp(join(tmpdir(), "agenttown-cli-path-outside-"));
+    const paths = resolveAgentTownPaths(project);
+    await mkdir(outside, { recursive: true });
+    try {
+      try {
+        await symlink(
+          outside,
+          paths.stateDir,
+          process.platform === "win32" ? "junction" : "dir"
+        );
+      } catch (error) {
+        if (
+          error instanceof Error
+          && "code" in error
+          && (error as NodeJS.ErrnoException).code === "EPERM"
+        ) {
+          return;
+        }
+        throw error;
+      }
+      await expect(validateAgentTownWriteLayout(paths))
+        .rejects.toThrow(/symbolic|junction/u);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });
