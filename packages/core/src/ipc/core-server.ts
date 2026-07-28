@@ -3,6 +3,7 @@ import {
   type Server,
   type Socket
 } from "node:net";
+import { createHash } from "node:crypto";
 import {
   IPC_PROTOCOL_VERSION,
   parseActionProposal,
@@ -20,7 +21,9 @@ import { LeaseRegistry } from "./lease-registry.js";
 
 const DEFAULT_LEASE_SWEEP_INTERVAL_MS = 1_000;
 const DEFAULT_REQUEST_CACHE_SIZE = 1_024;
-const MAX_LINE_BYTES = 1024 * 1024;
+const DEFAULT_BYTE_LIMIT = 1024 * 1024;
+const DEFAULT_REQUEST_CACHE_BYTE_LIMIT = 4 * 1024 * 1024;
+const BACKGROUND_ERROR_LIMIT = 100;
 const PIPE_NAME_PATTERN = /^agenttown-[A-Za-z0-9-]+$/u;
 
 type CoreServerOrchestrator = Pick<
@@ -35,10 +38,19 @@ export interface CoreServerOptions {
   leases: LeaseRegistry;
   leaseSweepIntervalMs?: number;
   requestCacheSize?: number;
+  maxInboundQueuedBytes?: number;
+  maxOutboundQueuedBytes?: number;
+  maxRequestLineBytes?: number;
+  requestCacheByteLimit?: number;
+  onBackgroundError?: (error: Error) => void;
 }
 
 interface ClientConnection {
   socket: Socket;
+  accepting: boolean;
+  inboundQueuedBytes: number;
+  outboundQueuedBytes: number;
+  outboundIdleWaiters: Array<() => void>;
   clientId: string | null;
   buffer: string;
   afterSequence: number;
@@ -51,6 +63,7 @@ interface ClientConnection {
 interface CachedRequest {
   fingerprint: string;
   response: IpcResponse;
+  bytes: number;
 }
 
 interface PendingRequest {
@@ -96,7 +109,11 @@ function stableJson(value: unknown): string {
 }
 
 function requestFingerprint(request: IpcRequest): string {
-  return `${request.method}\0${stableJson(request.params)}`;
+  return createHash("sha256")
+    .update(request.method)
+    .update("\0")
+    .update(stableJson(request.params))
+    .digest("hex");
 }
 
 function requiredString(
@@ -187,6 +204,7 @@ function ipcEvent(event: EventRecord): IpcEvent {
 export class CoreServer {
   readonly #server: Server;
   readonly #connections = new Set<ClientConnection>();
+  readonly #clientConnectionCounts = new Map<string, number>();
   readonly #requestCache = new Map<string, CachedRequest>();
   readonly #pendingRequests = new Map<string, PendingRequest>();
   readonly #pipeName: string;
@@ -195,8 +213,16 @@ export class CoreServer {
   readonly #leases: LeaseRegistry;
   readonly #leaseSweepIntervalMs: number;
   readonly #requestCacheSize: number;
+  readonly #maxInboundQueuedBytes: number;
+  readonly #maxOutboundQueuedBytes: number;
+  readonly #maxRequestLineBytes: number;
+  readonly #requestCacheByteLimit: number;
+  readonly #onBackgroundError: ((error: Error) => void) | undefined;
+  readonly #backgroundErrors: Error[] = [];
+  #requestCacheBytes = 0;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
   #listenStarted = false;
+  #draining = false;
   #closePromise: Promise<void> | null = null;
   #gracefulClosePromise: Promise<void> | null = null;
 
@@ -209,6 +235,15 @@ export class CoreServer {
       ?? DEFAULT_LEASE_SWEEP_INTERVAL_MS;
     this.#requestCacheSize = options.requestCacheSize
       ?? DEFAULT_REQUEST_CACHE_SIZE;
+    this.#maxInboundQueuedBytes = options.maxInboundQueuedBytes
+      ?? DEFAULT_BYTE_LIMIT;
+    this.#maxOutboundQueuedBytes = options.maxOutboundQueuedBytes
+      ?? DEFAULT_BYTE_LIMIT;
+    this.#maxRequestLineBytes = options.maxRequestLineBytes
+      ?? DEFAULT_BYTE_LIMIT;
+    this.#requestCacheByteLimit = options.requestCacheByteLimit
+      ?? DEFAULT_REQUEST_CACHE_BYTE_LIMIT;
+    this.#onBackgroundError = options.onBackgroundError;
     if (
       !Number.isInteger(this.#leaseSweepIntervalMs) ||
       this.#leaseSweepIntervalMs <= 0
@@ -220,6 +255,16 @@ export class CoreServer {
       this.#requestCacheSize <= 0
     ) {
       throw new Error("requestCacheSize must be a positive integer");
+    }
+    for (const [name, value] of [
+      ["maxInboundQueuedBytes", this.#maxInboundQueuedBytes],
+      ["maxOutboundQueuedBytes", this.#maxOutboundQueuedBytes],
+      ["maxRequestLineBytes", this.#maxRequestLineBytes],
+      ["requestCacheByteLimit", this.#requestCacheByteLimit]
+    ] as const) {
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(`${name} must be a positive integer`);
+      }
     }
     this.#server = createServer((socket) => this.#accept(socket));
   }
@@ -253,7 +298,11 @@ export class CoreServer {
     });
     this.#server.on("error", () => undefined);
     this.#sweepTimer = setInterval(
-      () => this.#leases.sweep(),
+      () => {
+        void this.#leases.sweep().catch((error: unknown) => {
+          this.#recordBackgroundError(error);
+        });
+      },
       this.#leaseSweepIntervalMs
     );
     this.#sweepTimer.unref();
@@ -266,12 +315,18 @@ export class CoreServer {
     return this.#gracefulClosePromise;
   }
 
+  get backgroundErrors(): readonly Error[] {
+    return [...this.#backgroundErrors];
+  }
+
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
+    this.#draining = true;
     this.#clearSweepTimer();
     const connections = [...this.#connections];
     const closed = this.#stopAccepting();
     for (const connection of connections) {
+      this.#stopReading(connection);
       connection.socket.destroy();
     }
     this.#closePromise = Promise.all([
@@ -282,16 +337,23 @@ export class CoreServer {
   }
 
   async #closeGracefully(): Promise<void> {
+    this.#draining = true;
     this.#clearSweepTimer();
-    const closed = this.#stopAccepting();
     const connections = [...this.#connections];
+    for (const connection of connections) this.#stopReading(connection);
+    const closed = this.#stopAccepting();
     await Promise.all(
       connections.map((connection) =>
         connection.processing.catch(() => undefined)
       )
     );
+    await Promise.all(
+      connections.map((connection) => this.#waitForOutbound(connection))
+    );
     for (const connection of connections) {
-      if (!connection.socket.destroyed) connection.socket.end();
+      if (!connection.socket.destroyed) {
+        connection.socket.end(() => connection.socket.destroy());
+      }
     }
     await Promise.all([
       closed,
@@ -316,12 +378,20 @@ export class CoreServer {
   }
 
   #accept(socket: Socket): void {
+    if (this.#draining) {
+      socket.destroy();
+      return;
+    }
     let resolveClosed: () => void = () => undefined;
     const closed = new Promise<void>((resolvePromise) => {
       resolveClosed = resolvePromise;
     });
     const connection: ClientConnection = {
       socket,
+      accepting: true,
+      inboundQueuedBytes: 0,
+      outboundQueuedBytes: 0,
+      outboundIdleWaiters: [],
       clientId: null,
       buffer: "",
       afterSequence: 0,
@@ -334,38 +404,84 @@ export class CoreServer {
     socket.setEncoding("utf8");
     socket.setNoDelay(true);
     socket.on("data", (chunk: string) => {
+      if (!connection.accepting) return;
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      if (
+        connection.inboundQueuedBytes + chunkBytes
+        > this.#maxInboundQueuedBytes
+      ) {
+        this.#stopReading(connection);
+        socket.destroy();
+        return;
+      }
+      connection.inboundQueuedBytes += chunkBytes;
       connection.processing = connection.processing
         .then(() => this.#consume(connection, chunk))
         .catch(() => {
           socket.destroy();
+        })
+        .finally(() => {
+          connection.inboundQueuedBytes -= chunkBytes;
         });
     });
     socket.on("error", () => {
       socket.destroy();
     });
     socket.once("close", () => {
-      try {
-        this.#connections.delete(connection);
-        connection.unsubscribe?.();
-        connection.unsubscribe = null;
-        if (connection.clientId !== null) {
-          this.#leases.disconnect(connection.clientId);
-        }
-      } finally {
-        connection.resolveClosed();
-      }
+      void this.#cleanupConnection(connection);
     });
   }
 
+  async #cleanupConnection(connection: ClientConnection): Promise<void> {
+    try {
+      connection.unsubscribe?.();
+      connection.unsubscribe = null;
+      if (connection.clientId !== null) {
+        const remaining =
+          (this.#clientConnectionCounts.get(connection.clientId) ?? 1) - 1;
+        if (remaining > 0) {
+          this.#clientConnectionCounts.set(connection.clientId, remaining);
+        } else {
+          this.#clientConnectionCounts.delete(connection.clientId);
+          await this.#leases.disconnect(connection.clientId);
+        }
+      }
+    } catch (error) {
+      this.#recordBackgroundError(error);
+    } finally {
+      this.#connections.delete(connection);
+      for (const resolvePromise of connection.outboundIdleWaiters.splice(0)) {
+        resolvePromise();
+      }
+      connection.resolveClosed();
+    }
+  }
+
+  #recordBackgroundError(error: unknown): void {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    this.#backgroundErrors.push(normalized);
+    if (this.#backgroundErrors.length > BACKGROUND_ERROR_LIMIT) {
+      this.#backgroundErrors.shift();
+    }
+    try {
+      this.#onBackgroundError?.(normalized);
+    } catch {
+      // The original background failure remains available via backgroundErrors.
+    }
+  }
+
   async #consume(connection: ClientConnection, chunk: string): Promise<void> {
+    if (!connection.accepting) return;
     connection.buffer += chunk;
-    if (Buffer.byteLength(connection.buffer, "utf8") > MAX_LINE_BYTES) {
-      this.#send(connection.socket, errorResponse(
+    if (
+      Buffer.byteLength(connection.buffer.split("\n", 1)[0] ?? "", "utf8")
+      > this.#maxRequestLineBytes
+    ) {
+      this.#rejectAndClose(connection, errorResponse(
         "invalid-request",
         "message_too_large",
         "IPC message exceeds the maximum line size"
       ));
-      connection.socket.end();
       return;
     }
 
@@ -374,8 +490,16 @@ export class CoreServer {
       if (newlineIndex < 0) return;
       const line = connection.buffer.slice(0, newlineIndex).replace(/\r$/u, "");
       connection.buffer = connection.buffer.slice(newlineIndex + 1);
+      if (Buffer.byteLength(line, "utf8") > this.#maxRequestLineBytes) {
+        this.#rejectAndClose(connection, errorResponse(
+          "invalid-request",
+          "message_too_large",
+          "IPC message exceeds the maximum line size"
+        ));
+        return;
+      }
       await this.#processLine(connection, line);
-      if (connection.socket.destroyed) return;
+      if (!connection.accepting || connection.socket.destroyed) return;
     }
   }
 
@@ -387,7 +511,7 @@ export class CoreServer {
     try {
       raw = JSON.parse(line);
     } catch {
-      this.#send(connection.socket, errorResponse(
+      this.#send(connection, errorResponse(
         "invalid-json",
         "invalid_json",
         "IPC line is not valid JSON"
@@ -400,12 +524,11 @@ export class CoreServer {
       isRecord(raw) &&
       raw.protocolVersion !== IPC_PROTOCOL_VERSION
     ) {
-      this.#send(connection.socket, errorResponse(
+      this.#rejectAndClose(connection, errorResponse(
         requestId,
         "unsupported_protocol",
         `unsupported protocol version: ${String(raw.protocolVersion)}`
       ));
-      connection.socket.end();
       return;
     }
 
@@ -417,7 +540,7 @@ export class CoreServer {
       }
       request = message;
     } catch (error) {
-      this.#send(connection.socket, errorResponse(
+      this.#send(connection, errorResponse(
         requestId,
         "invalid_request",
         error instanceof Error ? error.message : String(error)
@@ -426,7 +549,7 @@ export class CoreServer {
     }
 
     if (connection.clientId === null && request.method !== "handshake") {
-      this.#send(connection.socket, errorResponse(
+      this.#send(connection, errorResponse(
         request.requestId,
         "handshake_required",
         "handshake must be the first request"
@@ -438,7 +561,7 @@ export class CoreServer {
     const cached = this.#requestCache.get(request.requestId);
     if (cached !== undefined) {
       if (cached.fingerprint !== fingerprint) {
-        this.#send(connection.socket, errorResponse(
+        this.#send(connection, errorResponse(
           request.requestId,
           "request_id_conflict",
           "request ID was already used for different method or params"
@@ -455,13 +578,17 @@ export class CoreServer {
                 "request_failed",
                 error instanceof Error ? error.message : String(error)
               );
-            this.#send(connection.socket, response);
+            this.#send(connection, response);
             return;
           }
         }
-        this.#send(connection.socket, cached.response);
+        if (request.method === "client.heartbeat" && cached.response.ok) {
+          this.#heartbeat(connection, request.params);
+        }
         if (cached.response.error?.code === "unsupported_protocol") {
-          connection.socket.end();
+          this.#rejectAndClose(connection, cached.response);
+        } else {
+          this.#send(connection, cached.response);
         }
         if (request.method === "handshake" && cached.response.ok) {
           this.#startEventSubscription(connection);
@@ -473,7 +600,7 @@ export class CoreServer {
     const pending = this.#pendingRequests.get(request.requestId);
     if (pending !== undefined) {
       if (pending.fingerprint !== fingerprint) {
-        this.#send(connection.socket, errorResponse(
+        this.#send(connection, errorResponse(
           request.requestId,
           "request_id_conflict",
           "request ID is in flight with different method or params"
@@ -492,13 +619,17 @@ export class CoreServer {
               "request_failed",
               error instanceof Error ? error.message : String(error)
             );
-          this.#send(connection.socket, handshakeError);
+          this.#send(connection, handshakeError);
           return;
         }
       }
-      this.#send(connection.socket, response);
+      if (request.method === "client.heartbeat" && response.ok) {
+        this.#heartbeat(connection, request.params);
+      }
       if (response.error?.code === "unsupported_protocol") {
-        connection.socket.end();
+        this.#rejectAndClose(connection, response);
+      } else {
+        this.#send(connection, response);
       }
       if (request.method === "handshake" && response.ok) {
         this.#startEventSubscription(connection);
@@ -518,9 +649,10 @@ export class CoreServer {
       }
     }
     this.#cache(request.requestId, { fingerprint, response });
-    this.#send(connection.socket, response);
     if (response.error?.code === "unsupported_protocol") {
-      connection.socket.end();
+      this.#rejectAndClose(connection, response);
+    } else {
+      this.#send(connection, response);
     }
     if (response.ok && request.method === "handshake") {
       this.#startEventSubscription(connection);
@@ -556,21 +688,7 @@ export class CoreServer {
       case "handshake":
         return this.#handshake(connection, request.params);
       case "client.heartbeat": {
-        if (connection.clientId === null) {
-          throw new RequestError("handshake_required", "client is not handshaken");
-        }
-        const requestedClientId = request.params.clientId;
-        if (
-          requestedClientId !== undefined &&
-          requestedClientId !== connection.clientId
-        ) {
-          throw new RequestError(
-            "invalid_params",
-            "heartbeat clientId does not match the connection"
-          );
-        }
-        this.#leases.heartbeat(connection.clientId);
-        return { renewed: true };
+        return this.#heartbeat(connection, request.params);
       }
       case "company.status": {
         const companyId = request.params.companyId;
@@ -652,7 +770,13 @@ export class CoreServer {
         "connection is already assigned to a different client"
       );
     }
-    connection.clientId = clientId;
+    if (connection.clientId === null) {
+      this.#clientConnectionCounts.set(
+        clientId,
+        (this.#clientConnectionCounts.get(clientId) ?? 0) + 1
+      );
+      connection.clientId = clientId;
+    }
     connection.afterSequence = afterSequence;
     this.#leases.heartbeat(clientId);
     return {
@@ -663,6 +787,27 @@ export class CoreServer {
         clientLeases: true
       }
     };
+  }
+
+  #heartbeat(
+    connection: ClientConnection,
+    params: Record<string, unknown>
+  ): Record<string, boolean> {
+    if (connection.clientId === null) {
+      throw new RequestError("handshake_required", "client is not handshaken");
+    }
+    const requestedClientId = params.clientId;
+    if (
+      requestedClientId !== undefined &&
+      requestedClientId !== connection.clientId
+    ) {
+      throw new RequestError(
+        "invalid_params",
+        "heartbeat clientId does not match the connection"
+      );
+    }
+    this.#leases.heartbeat(connection.clientId);
+    return { renewed: true };
   }
 
   #startEventSubscription(connection: ClientConnection): void {
@@ -681,20 +826,85 @@ export class CoreServer {
   ): void {
     if (event.sequence <= connection.afterSequence) return;
     connection.afterSequence = event.sequence;
-    this.#send(connection.socket, ipcEvent(event));
+    this.#send(connection, ipcEvent(event));
   }
 
-  #cache(requestId: string, cached: CachedRequest): void {
-    this.#requestCache.set(requestId, cached);
-    while (this.#requestCache.size > this.#requestCacheSize) {
+  #cache(
+    requestId: string,
+    cached: Omit<CachedRequest, "bytes">
+  ): void {
+    const bytes = Buffer.byteLength(requestId, "utf8")
+      + cached.fingerprint.length
+      + Buffer.byteLength(JSON.stringify(cached.response), "utf8");
+    if (bytes > this.#requestCacheByteLimit) return;
+    const previous = this.#requestCache.get(requestId);
+    if (previous !== undefined) this.#requestCacheBytes -= previous.bytes;
+    this.#requestCache.set(requestId, { ...cached, bytes });
+    this.#requestCacheBytes += bytes;
+    while (
+      this.#requestCache.size > this.#requestCacheSize ||
+      this.#requestCacheBytes > this.#requestCacheByteLimit
+    ) {
       const oldest = this.#requestCache.keys().next().value as string | undefined;
       if (oldest === undefined) return;
+      const evicted = this.#requestCache.get(oldest);
       this.#requestCache.delete(oldest);
+      if (evicted !== undefined) this.#requestCacheBytes -= evicted.bytes;
     }
   }
 
-  #send(socket: Socket, message: IpcEvent | IpcResponse): void {
-    if (socket.destroyed) return;
-    socket.write(`${JSON.stringify(message)}\n`);
+  #send(
+    connection: ClientConnection,
+    message: IpcEvent | IpcResponse
+  ): boolean {
+    if (connection.socket.destroyed) return false;
+    const encoded = `${JSON.stringify(message)}\n`;
+    const bytes = Buffer.byteLength(encoded, "utf8");
+    if (
+      bytes > this.#maxOutboundQueuedBytes ||
+      connection.outboundQueuedBytes + bytes > this.#maxOutboundQueuedBytes
+    ) {
+      this.#stopReading(connection);
+      connection.socket.destroy();
+      return false;
+    }
+    connection.outboundQueuedBytes += bytes;
+    connection.socket.write(encoded, () => {
+      connection.outboundQueuedBytes -= bytes;
+      if (connection.outboundQueuedBytes === 0) {
+        for (const resolvePromise of connection.outboundIdleWaiters.splice(0)) {
+          resolvePromise();
+        }
+      }
+    });
+    return true;
+  }
+
+  #waitForOutbound(connection: ClientConnection): Promise<void> {
+    if (
+      connection.outboundQueuedBytes === 0 ||
+      connection.socket.destroyed
+    ) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolvePromise) => {
+      connection.outboundIdleWaiters.push(resolvePromise);
+    });
+  }
+
+  #stopReading(connection: ClientConnection): void {
+    if (!connection.accepting) return;
+    connection.accepting = false;
+    connection.buffer = "";
+    connection.socket.pause();
+  }
+
+  #rejectAndClose(
+    connection: ClientConnection,
+    response: IpcResponse
+  ): void {
+    this.#stopReading(connection);
+    this.#send(connection, response);
+    connection.socket.end();
   }
 }

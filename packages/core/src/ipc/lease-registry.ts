@@ -9,6 +9,7 @@ export interface LeaseRegistryOptions {
 export class LeaseRegistry {
   #hadLease = false;
   #pauseTriggered = false;
+  #triggerInFlight: Promise<void> | null = null;
 
   constructor(
     private readonly store: CoreStore,
@@ -28,25 +29,38 @@ export class LeaseRegistry {
     this.#pauseTriggered = false;
   }
 
-  disconnect(clientId: string): void {
+  async disconnect(clientId: string): Promise<void> {
     this.store.deleteLease(clientId);
-    void this.#triggerIfEmpty();
+    await this.#triggerIfEmpty();
   }
 
-  sweep(): void {
+  async sweep(): Promise<void> {
     this.store.deleteExpiredLeases(this.options.now());
-    void this.#triggerIfEmpty();
+    await this.#triggerIfEmpty();
   }
 
-  async #triggerIfEmpty(): Promise<void> {
+  #triggerIfEmpty(): Promise<void> {
+    if (this.#triggerInFlight !== null) {
+      return this.#triggerInFlight.then(() => this.#triggerIfEmpty());
+    }
     if (
       !this.#hadLease ||
       this.#pauseTriggered ||
       this.store.countLeases() !== 0
     ) {
-      return;
+      return Promise.resolve();
     }
     this.#pauseTriggered = true;
-    await this.options.onLastClientExpired();
+    const trigger = Promise.resolve()
+      .then(() => this.options.onLastClientExpired())
+      .catch((error: unknown) => {
+        this.#pauseTriggered = false;
+        throw error;
+      })
+      .finally(() => {
+        if (this.#triggerInFlight === trigger) this.#triggerInFlight = null;
+      });
+    this.#triggerInFlight = trigger;
+    return trigger;
   }
 }

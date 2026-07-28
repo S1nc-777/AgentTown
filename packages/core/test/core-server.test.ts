@@ -6,7 +6,10 @@ import type {
   IpcResponse
 } from "@agenttown/runtime-contract";
 import { afterEach, describe, expect, it } from "vitest";
-import { CoreServer } from "../src/ipc/core-server.js";
+import {
+  CoreServer,
+  type CoreServerOptions
+} from "../src/ipc/core-server.js";
 import { LeaseRegistry } from "../src/ipc/lease-registry.js";
 import { CoreStore } from "../src/storage/core-store.js";
 import { companyDefinitionFixture } from "./helpers.js";
@@ -131,6 +134,12 @@ class TestClient {
 
   sendRaw(text: string): void {
     this.#socket.write(text);
+  }
+
+  sendBatch(lines: readonly string[]): void {
+    this.#socket.cork();
+    for (const line of lines) this.#socket.write(line);
+    this.#socket.uncork();
   }
 
   waitForClose(timeoutMs = 2_000): Promise<void> {
@@ -305,6 +314,15 @@ async function createServer(input?: {
   store?: CoreStore;
   orchestrator?: RecordingOrchestrator;
   leases?: LeaseRegistry;
+  serverOptions?: Partial<Pick<
+    CoreServerOptions,
+    | "maxInboundQueuedBytes"
+    | "maxOutboundQueuedBytes"
+    | "maxRequestLineBytes"
+    | "requestCacheByteLimit"
+    | "leaseSweepIntervalMs"
+    | "onBackgroundError"
+  >>;
 }): Promise<{
   pipeName: string;
   server: CoreServer;
@@ -322,7 +340,8 @@ async function createServer(input?: {
     orchestrator,
     leases,
     leaseSweepIntervalMs: 10_000,
-    requestCacheSize: 16
+    requestCacheSize: 16,
+    ...input?.serverOptions
   });
   servers.push(server);
   await server.listen();
@@ -446,6 +465,63 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     });
     await expect(nestedClosed).resolves.toBeUndefined();
   });
+
+  it.each(["envelope", "handshake"] as const)(
+    "aborts buffered work after an unsupported %s version",
+    async (versionLocation) => {
+      const store = createStore();
+      let pauses = 0;
+      const leases = createLeases(store, () => {
+        pauses += 1;
+      });
+      const orchestrator = new RecordingOrchestrator();
+      const { pipeName } = await createServer({ store, leases, orchestrator });
+      const client = await connectClient(pipeName);
+      const unsupportedVersion = "2".repeat(128 * 1024);
+      const unsupported = {
+        protocolVersion:
+          versionLocation === "envelope" ? unsupportedVersion : 1,
+        kind: "request",
+        requestId: `unsupported-${versionLocation}`,
+        method: "handshake",
+        params: {
+          clientId: "client-buffered",
+          protocolVersion:
+            versionLocation === "handshake" ? unsupportedVersion : 1,
+          afterSequence: 0
+        }
+      };
+      const handshake = {
+        protocolVersion: 1,
+        kind: "request",
+        requestId: "buffered-handshake",
+        method: "handshake",
+        params: {
+          clientId: "client-buffered",
+          protocolVersion: 1,
+          afterSequence: 0
+        }
+      };
+      const start = {
+        protocolVersion: 1,
+        kind: "request",
+        requestId: "buffered-start",
+        method: "company.start",
+        params: { scenarios: {} }
+      };
+      const closed = client.waitForClose();
+
+      client.sendBatch([
+        `${JSON.stringify(unsupported)}\n`,
+        `${JSON.stringify(handshake)}\n`,
+        `${JSON.stringify(start)}\n`
+      ]);
+
+      await expect(closed).resolves.toBeUndefined();
+      expect(orchestrator.starts).toHaveLength(0);
+      expect(pauses).toBe(0);
+    }
+  );
 
   it("rejects invalid JSON, unknown methods, and request ID conflicts", async () => {
     const { pipeName } = await createServer();
@@ -622,6 +698,57 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     expect(pauses).toBe(1);
   });
 
+  it("keeps a shared client lease until its last socket disconnects", async () => {
+    const store = createStore();
+    let pauses = 0;
+    const leases = createLeases(store, () => {
+      pauses += 1;
+    });
+    const { pipeName } = await createServer({ store, leases });
+    const first = await connectClient(pipeName);
+    const second = await connectClient(pipeName);
+    await first.handshake("shared-client");
+    await second.handshake("shared-client");
+
+    await first.close();
+    expect(store.countLeases()).toBe(1);
+    expect(pauses).toBe(0);
+    await expect(second.request("client.heartbeat", {})).resolves.toMatchObject({
+      ok: true
+    });
+
+    await second.close();
+    await waitUntil(
+      () => store.countLeases() === 0,
+      "server did not release the final shared-client lease"
+    );
+    expect(pauses).toBe(1);
+  });
+
+  it("renews each client lease when a heartbeat response is replayed", async () => {
+    const store = createStore();
+    let now = 1_000;
+    const leases = new LeaseRegistry(store, {
+      ttlMs: 5_000,
+      now: () => now,
+      onLastClientExpired: () => undefined
+    });
+    const { pipeName } = await createServer({ store, leases });
+    const first = await connectClient(pipeName);
+    const second = await connectClient(pipeName);
+    await first.handshake("heartbeat-a");
+    await second.handshake("heartbeat-b");
+
+    now = 4_000;
+    await first.requestWithId("shared-heartbeat", "client.heartbeat", {});
+    now = 5_000;
+    await second.requestWithId("shared-heartbeat", "client.heartbeat", {});
+    now = 7_000;
+    await leases.sweep();
+
+    expect(store.countLeases()).toBe(2);
+  });
+
   it("rejects unsafe pipe names before binding and closes live sockets", async () => {
     const store = createStore();
     const unsafe = new CoreServer({
@@ -660,5 +787,184 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     await expect(response).resolves.toMatchObject({ ok: true });
     await expect(closing).resolves.toBeUndefined();
     await expect(closed).resolves.toBeUndefined();
+  });
+
+  it("atomically stops accepting work before graceful draining", async () => {
+    const orchestrator = new BlockingOrchestrator();
+    const { pipeName, server } = await createServer({ orchestrator });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-atomic-close");
+    const first = client.request("company.start", {
+      scenarios: { first: "scenario" }
+    });
+    await orchestrator.started;
+
+    const closing = server.closeAfterResponses();
+    client.sendRaw(`${JSON.stringify({
+      protocolVersion: 1,
+      kind: "request",
+      requestId: "after-drain-started",
+      method: "company.start",
+      params: { scenarios: { second: "scenario" } }
+    })}\n`);
+    orchestrator.release();
+
+    await expect(first).resolves.toMatchObject({ ok: true });
+    await expect(closing).resolves.toBeUndefined();
+    expect(orchestrator.starts).toEqual([{ first: "scenario" }]);
+  });
+
+  it("closes a client whose queued inbound work exceeds its byte budget", async () => {
+    const orchestrator = new BlockingOrchestrator();
+    const { pipeName } = await createServer({
+      orchestrator,
+      serverOptions: { maxInboundQueuedBytes: 512 }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-inbound-budget");
+    client.sendRaw(`${JSON.stringify({
+      protocolVersion: 1,
+      kind: "request",
+      requestId: "blocking-start",
+      method: "company.start",
+      params: { scenarios: { first: "scenario" } }
+    })}\n`);
+    await orchestrator.started;
+    const closed = client.waitForClose();
+    const padding = "x".repeat(300);
+    client.sendBatch([1, 2, 3].map((index) => `${JSON.stringify({
+      protocolVersion: 1,
+      kind: "request",
+      requestId: `queued-${index}`,
+      method: "company.start",
+      params: { scenarios: { padding } }
+    })}\n`));
+
+    await expect(closed).resolves.toBeUndefined();
+    expect(orchestrator.starts).toHaveLength(1);
+    orchestrator.release();
+  });
+
+  it("closes a client when one outbound message exceeds its byte budget", async () => {
+    const { pipeName, store } = await createServer({
+      serverOptions: { maxOutboundQueuedBytes: 512 }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-outbound-budget");
+    const closed = client.waitForClose();
+
+    store.insertEvent({
+      id: randomUUID(),
+      type: "large-event",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: { padding: "x".repeat(1_024) }
+    });
+
+    await expect(closed).resolves.toBeUndefined();
+  });
+
+  it("rejects a request line above the configured limit", async () => {
+    const orchestrator = new RecordingOrchestrator();
+    const { pipeName } = await createServer({
+      orchestrator,
+      serverOptions: { maxRequestLineBytes: 256 }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-request-limit");
+    client.sendRaw(`${JSON.stringify({
+      protocolVersion: 1,
+      kind: "request",
+      requestId: "oversized-request",
+      method: "company.start",
+      params: { scenarios: { padding: "x".repeat(300) } }
+    })}\n`);
+
+    await expect(client.nextResponse("message_too_large")).resolves.toMatchObject({
+      ok: false
+    });
+    await expect(client.waitForClose()).resolves.toBeUndefined();
+    expect(orchestrator.starts).toHaveLength(0);
+  });
+
+  it("does not retain completed responses above the cache byte budget", async () => {
+    const orchestrator = new RecordingOrchestrator();
+    const { pipeName } = await createServer({
+      orchestrator,
+      serverOptions: { requestCacheByteLimit: 1 }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-cache-budget");
+
+    await client.requestWithId("evicted-start", "company.start", {
+      scenarios: { first: "scenario" }
+    });
+    await client.requestWithId("evicted-start", "company.start", {
+      scenarios: { first: "scenario" }
+    });
+
+    expect(orchestrator.starts).toHaveLength(2);
+  });
+
+  it("awaits final lease cleanup before server close resolves", async () => {
+    const store = createStore();
+    let resolveStarted: () => void = () => undefined;
+    const callbackStarted = new Promise<void>((resolvePromise) => {
+      resolveStarted = resolvePromise;
+    });
+    let release: () => void = () => undefined;
+    const callbackGate = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    const leases = createLeases(store, async () => {
+      resolveStarted();
+      await callbackGate;
+    });
+    const { pipeName, server } = await createServer({ store, leases });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-awaited-cleanup");
+    await client.close();
+    await callbackStarted;
+
+    let closeSettled = false;
+    const closing = server.close().then(() => {
+      closeSettled = true;
+    });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    expect(closeSettled).toBe(false);
+    release();
+    await closing;
+  });
+
+  it("captures and reports periodic lease sweep failures", async () => {
+    const store = createStore();
+    let now = 0;
+    const leases = new LeaseRegistry(store, {
+      ttlMs: 5_000,
+      now: () => now,
+      onLastClientExpired: () => {
+        throw new Error("periodic pause failed");
+      }
+    });
+    const reported: Error[] = [];
+    const { pipeName, server } = await createServer({
+      store,
+      leases,
+      serverOptions: {
+        leaseSweepIntervalMs: 10,
+        onBackgroundError: (error) => reported.push(error)
+      }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("client-periodic-error");
+    now = 10_000;
+
+    await waitUntil(
+      () => server.backgroundErrors.length > 0 && reported.length > 0,
+      "server did not report the periodic lease failure"
+    );
+    expect(server.backgroundErrors[0]?.message).toBe("periodic pause failed");
+    expect(reported[0]?.message).toBe("periodic pause failed");
   });
 });
