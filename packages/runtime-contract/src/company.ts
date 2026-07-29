@@ -44,7 +44,7 @@ const validationCommandInputSchema = z.object({
   executable: nonEmpty,
   args: z.array(nonEmpty),
   cwd: nonEmpty,
-  timeout_seconds: z.number().int()
+  timeout_seconds: z.number().int().default(600)
 }).transform(({ timeout_seconds, ...command }) => validationCommandSchema.parse({
   ...command,
   timeoutSeconds: timeout_seconds

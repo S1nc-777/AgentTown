@@ -78,6 +78,18 @@ describe("parseCompanyYaml", () => {
     });
   });
 
+  it("defaults an omitted validation timeout to 600 seconds", () => {
+    expect(parseCompanyYaml(`${valid}
+validation:
+  commands:
+    - id: unit-tests
+      executable: pnpm
+      args: [test]
+      cwd: .
+  integration_command_ids: []
+`).validation.commands[0]?.timeoutSeconds).toBe(600);
+  });
+
   it("rejects hard evidence limits above 100 MiB", () => {
     expect(() => parseCompanyYaml(`${valid}\nevidence:\n  diff_warning_bytes: 20971520\n  diff_hard_limit_bytes: 104857601\n`)).toThrow();
   });
