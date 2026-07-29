@@ -14,6 +14,7 @@ export interface ProcessCapture {
   stdout: string;
   stderr: string;
   closed: Promise<ProcessExit>;
+  ownsProcessGroup: boolean;
 }
 
 export class CapturedProcessError extends Error {
@@ -27,13 +28,17 @@ export class CapturedProcessError extends Error {
   }
 }
 
-export function capture(child: ChildProcess): ProcessCapture {
+export function capture(
+  child: ChildProcess,
+  options: { ownsProcessGroup?: boolean } = {}
+): ProcessCapture {
   let resolveClosed: (exit: ProcessExit) => void = () => undefined;
   let rejectClosed: (error: Error) => void = () => undefined;
   const result: ProcessCapture = {
     child,
     stdout: "",
     stderr: "",
+    ownsProcessGroup: options.ownsProcessGroup ?? false,
     closed: new Promise<ProcessExit>((resolvePromise, reject) => {
       resolveClosed = resolvePromise;
       rejectClosed = reject;
@@ -145,46 +150,217 @@ function processAlive(pid: number): boolean {
   }
 }
 
+export interface AdapterProcessDiagnostic {
+  type: "adapter.process.started" | "adapter.process.exited";
+  employeeId: string;
+  pid: number;
+  processInstanceId: string;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+}
+
+export interface ParsedAdapterProcessDiagnostics {
+  diagnostics: AdapterProcessDiagnostic[];
+  errors: Error[];
+}
+
+export function parseAdapterProcessDiagnostics(
+  content: string,
+  source: string
+): ParsedAdapterProcessDiagnostics {
+  const diagnostics: AdapterProcessDiagnostic[] = [];
+  const errors: Error[] = [];
+  for (const [index, line] of content.split(/\r?\n/u).entries()) {
+    const jsonStart = line.indexOf("{");
+    if (jsonStart < 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line.slice(jsonStart));
+    } catch (error) {
+      errors.push(new Error(
+        `${source}:${index + 1} contains malformed JSON`,
+        { cause: error }
+      ));
+      continue;
+    }
+    if (
+      typeof parsed !== "object"
+      || parsed === null
+      || !("type" in parsed)
+      || (
+        parsed.type !== "adapter.process.started"
+        && parsed.type !== "adapter.process.exited"
+      )
+    ) {
+      continue;
+    }
+    const candidate = parsed as Partial<AdapterProcessDiagnostic>;
+    if (
+      typeof candidate.employeeId !== "string"
+      || !Number.isSafeInteger(candidate.pid)
+      || (candidate.pid as number) <= 0
+      || typeof candidate.processInstanceId !== "string"
+      || candidate.processInstanceId.length === 0
+    ) {
+      errors.push(new Error(
+        `${source}:${index + 1} contains an invalid process diagnostic`
+      ));
+      continue;
+    }
+    diagnostics.push(candidate as AdapterProcessDiagnostic);
+  }
+  return { diagnostics, errors };
+}
+
+export function activeAdapterProcessDiagnostics(
+  diagnostics: readonly AdapterProcessDiagnostic[]
+): AdapterProcessDiagnostic[] {
+  const exitedInstances = new Set(diagnostics
+    .filter(({ type }) => type === "adapter.process.exited")
+    .map(({ processInstanceId }) => processInstanceId));
+  const active = new Map<string, AdapterProcessDiagnostic>();
+  for (const diagnostic of diagnostics) {
+    if (
+      diagnostic.type === "adapter.process.started"
+      && !exitedInstances.has(diagnostic.processInstanceId)
+    ) {
+      active.set(diagnostic.processInstanceId, diagnostic);
+    }
+  }
+  return [...active.values()];
+}
+
+export interface ProcessVerification {
+  pids: readonly number[];
+  errors: readonly Error[];
+}
+
+export type OwnedProcessTreeTerminator = (input: {
+  processCapture: ProcessCapture;
+  label: string;
+  deadlineAt: number;
+}) => Promise<void>;
+
+function processCaptureIsLive(processCapture: ProcessCapture): boolean {
+  return processCapture.child.exitCode === null
+    && processCapture.child.signalCode === null;
+}
+
+export const terminateOwnedProcessTree: OwnedProcessTreeTerminator = async ({
+  processCapture,
+  label,
+  deadlineAt
+}) => {
+  if (!processCaptureIsLive(processCapture)) return;
+  const pid = processCapture.child.pid;
+  if (!Number.isSafeInteger(pid) || (pid as number) <= 0) {
+    throw new Error(`${label} live root process has no valid PID`);
+  }
+
+  if (process.platform === "win32") {
+    if (!processCaptureIsLive(processCapture)) return;
+    const taskkill = capture(spawn(
+      "taskkill.exe",
+      ["/PID", String(pid), "/T", "/F"],
+      {
+        windowsHide: true,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    ));
+    let taskkillExit: ProcessExit;
+    try {
+      taskkillExit = await waitForCloseUntil(
+        taskkill,
+        `${label} taskkill`,
+        deadlineAt
+      );
+    } catch (error) {
+      if (processCaptureIsLive(taskkill)) taskkill.child.kill("SIGKILL");
+      throw error;
+    }
+    if (taskkillExit.code !== 0 && processCaptureIsLive(processCapture)) {
+      throw new CapturedProcessError(
+        diagnostic(`${label} taskkill failed`, taskkill),
+        taskkill
+      );
+    }
+  } else if (processCapture.ownsProcessGroup) {
+    try {
+      process.kill(-(pid as number), "SIGKILL");
+    } catch (error) {
+      if (
+        !(error instanceof Error)
+        || !("code" in error)
+        || (error as NodeJS.ErrnoException).code !== "ESRCH"
+      ) {
+        throw error;
+      }
+    }
+  } else if (processCaptureIsLive(processCapture)) {
+    processCapture.child.kill("SIGKILL");
+  }
+
+  if (processCaptureIsLive(processCapture)) {
+    await waitForCloseUntil(processCapture, `${label} root reap`, deadlineAt);
+  }
+};
+
+async function verificationUntil(
+  provider: () => Promise<ProcessVerification>,
+  label: string,
+  deadlineAt: number
+): Promise<ProcessVerification> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      provider(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} verification provider exceeded deadline`)),
+          Math.max(0, deadlineAt - Date.now())
+        );
+      })
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export async function forceReapCapturedProcessTree(input: {
   processCapture: ProcessCapture;
-  descendantPids: () => Promise<readonly number[]>;
+  verification: () => Promise<ProcessVerification>;
+  terminateTree?: OwnedProcessTreeTerminator | undefined;
   label: string;
   deadlineAt: number;
 }): Promise<void> {
   const errors: Error[] = [];
-  let descendantPids: readonly number[] = [];
   try {
-    descendantPids = await input.descendantPids();
+    await (input.terminateTree ?? terminateOwnedProcessTree)({
+      processCapture: input.processCapture,
+      label: input.label,
+      deadlineAt: input.deadlineAt
+    });
   } catch (error) {
     errors.push(error instanceof Error ? error : new Error(String(error)));
   }
-  if (
-    input.processCapture.child.exitCode === null
-    && input.processCapture.child.signalCode === null
-  ) {
-    if (!input.processCapture.child.kill("SIGKILL")) {
-      errors.push(new Error(`${input.label} root process rejected SIGKILL`));
-    }
+  if (processCaptureIsLive(input.processCapture)) {
+    errors.push(new Error(`${input.label} root process remains live`));
   }
-  for (const pid of new Set(descendantPids)) {
-    try {
-      if (processAlive(pid)) process.kill(pid, "SIGKILL");
-    } catch (error) {
-      errors.push(error instanceof Error ? error : new Error(String(error)));
-    }
-  }
+  let verification: ProcessVerification = { pids: [], errors: [] };
   try {
-    await waitForCloseUntil(
-      input.processCapture,
-      `${input.label} root reap`,
+    verification = await verificationUntil(
+      input.verification,
+      input.label,
       input.deadlineAt
     );
   } catch (error) {
     errors.push(error instanceof Error ? error : new Error(String(error)));
   }
+  errors.push(...verification.errors);
   while (Date.now() < input.deadlineAt) {
     const live: number[] = [];
-    for (const pid of new Set(descendantPids)) {
+    for (const pid of new Set(verification.pids)) {
       try {
         if (processAlive(pid)) live.push(pid);
       } catch (error) {
@@ -194,7 +370,7 @@ export async function forceReapCapturedProcessTree(input: {
     if (live.length === 0) break;
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 5));
   }
-  const leaked = [...new Set(descendantPids)].filter((pid) => {
+  const leaked = [...new Set(verification.pids)].filter((pid) => {
     try {
       return processAlive(pid);
     } catch (error) {
@@ -204,17 +380,22 @@ export async function forceReapCapturedProcessTree(input: {
   });
   if (leaked.length > 0) {
     errors.push(new Error(
-      `${input.label} leaked descendant PIDs: ${leaked.join(", ")}`
+      `${input.label} still-live diagnostic PIDs: ${leaked.join(", ")}`
     ));
   }
   if (errors.length > 0) {
-    throw new AggregateError(errors, `${input.label} process-tree reap failed`);
+    throw new AggregateError(
+      errors,
+      `${input.label} process-tree reap failed: `
+      + errors.map(({ message }) => message).join("; ")
+    );
   }
 }
 
 export async function waitForCapturedProcessTreeExit(input: {
   processCapture: ProcessCapture;
-  descendantPids: () => Promise<readonly number[]>;
+  verification: () => Promise<ProcessVerification>;
+  terminateTree?: OwnedProcessTreeTerminator | undefined;
   label: string;
   totalBudgetMs: number;
 }): Promise<ProcessExit> {
@@ -231,7 +412,8 @@ export async function waitForCapturedProcessTreeExit(input: {
     try {
       await forceReapCapturedProcessTree({
         processCapture: input.processCapture,
-        descendantPids: input.descendantPids,
+        verification: input.verification,
+        terminateTree: input.terminateTree,
         label: input.label,
         deadlineAt
       });

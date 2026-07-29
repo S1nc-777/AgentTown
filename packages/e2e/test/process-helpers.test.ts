@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   CapturedProcessError,
+  activeAdapterProcessDiagnostics,
   capture,
   connectOrTerminateCapturedProcess,
+  forceReapCapturedProcessTree,
   formatErrorTree,
+  parseAdapterProcessDiagnostics,
   runCapturedCommand,
+  waitForCloseUntil,
   waitForCapturedProcessTreeExit
 } from "../src/process-helpers.js";
 import { spawn } from "node:child_process";
@@ -106,16 +110,17 @@ describe("E2E process helpers", () => {
           "const { spawn } = require('node:child_process');",
           "const child = spawn(process.execPath,",
           "  ['-e', 'setInterval(() => undefined, 1000)'],",
-          "  { detached: true, stdio: 'ignore' });",
+          "  { detached: false, stdio: 'ignore' });",
           "process.stdout.write(String(child.pid) + '\\n');",
           "setInterval(() => undefined, 1000);"
         ].join(" ")
       ],
       {
+        detached: process.platform !== "win32",
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"]
       }
-    ));
+    ), { ownsProcessGroup: process.platform !== "win32" });
     const pidDeadline = Date.now() + 1_000;
     while (!/^\d+/u.test(processCapture.stdout)) {
       if (Date.now() >= pidDeadline) throw new Error("grandchild PID was not emitted");
@@ -127,14 +132,99 @@ describe("E2E process helpers", () => {
 
     await expect(waitForCapturedProcessTreeExit({
       processCapture,
-      descendantPids: async () => [grandchildPid],
+      verification: async () => ({ pids: [grandchildPid], errors: [] }),
       label: "controlled hung Core",
-      totalBudgetMs: 500
+      totalBudgetMs: 2_000
     })).rejects.toBeInstanceOf(CapturedProcessError);
 
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(Date.now() - startedAt).toBeLessThan(2_200);
     expect(isProcessAlive(rootPid)).toBe(false);
     expect(isProcessAlive(grandchildPid)).toBe(false);
+  });
+
+  it("uses an injected owned-tree terminator and never kills verification PIDs", async () => {
+    const root = capture(spawn(
+      process.execPath,
+      ["-e", "setInterval(() => undefined, 1000)"],
+      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }
+    ));
+    const sentinel = capture(spawn(
+      process.execPath,
+      ["-e", "setInterval(() => undefined, 1000)"],
+      { windowsHide: true, stdio: "ignore" }
+    ));
+    let terminatorCalls = 0;
+    try {
+      await expect(forceReapCapturedProcessTree({
+        processCapture: root,
+        verification: async () => ({
+          pids: [sentinel.child.pid!],
+          errors: []
+        }),
+        terminateTree: async ({ processCapture, deadlineAt }) => {
+          terminatorCalls += 1;
+          processCapture.child.kill("SIGKILL");
+          await waitForCloseUntil(processCapture, "injected root", deadlineAt);
+        },
+        label: "owned tree only",
+        deadlineAt: Date.now() + 500
+      })).rejects.toThrow("still-live diagnostic PIDs");
+      expect(terminatorCalls).toBe(1);
+      expect(isProcessAlive(sentinel.child.pid!)).toBe(true);
+    } finally {
+      if (root.child.exitCode === null && root.child.signalCode === null) {
+        root.child.kill("SIGKILL");
+      }
+      if (
+        sentinel.child.exitCode === null
+        && sentinel.child.signalCode === null
+      ) {
+        sentinel.child.kill("SIGKILL");
+      }
+      await Promise.allSettled([root.closed, sentinel.closed]);
+    }
+  });
+
+  it("bounds a blocked verification provider by the tree-reap deadline", async () => {
+    const root = capture(spawn(
+      process.execPath,
+      ["-e", "setInterval(() => undefined, 1000)"],
+      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }
+    ));
+    const budgetMs = 500;
+    const startedAt = Date.now();
+
+    await expect(forceReapCapturedProcessTree({
+      processCapture: root,
+      verification: () => new Promise(() => undefined),
+      terminateTree: async ({ processCapture, deadlineAt }) => {
+        processCapture.child.kill("SIGKILL");
+        await waitForCloseUntil(processCapture, "blocked provider root", deadlineAt);
+      },
+      label: "blocked verification",
+      deadlineAt: startedAt + budgetMs
+    })).rejects.toThrow("verification provider exceeded");
+
+    expect(Date.now() - startedAt).toBeLessThan(700);
+    expect(isProcessAlive(root.child.pid!)).toBe(false);
+  });
+
+  it("pairs reused PIDs by process instance and preserves malformed diagnostics", () => {
+    const parsed = parseAdapterProcessDiagnostics([
+      '2026-01-01 {"type":"adapter.process.started","employeeId":"leader","pid":42,"processInstanceId":"instance-a"}',
+      '2026-01-01 {"type":"adapter.process.exited","employeeId":"leader","pid":42,"processInstanceId":"instance-a"}',
+      '2026-01-01 {"type":"adapter.process.started","employeeId":"leader","pid":42,"processInstanceId":"instance-b"}',
+      '2026-01-01 {"type":"adapter.process.started","employeeId":"leader"'
+    ].join("\n"), "leader.jsonl");
+
+    expect(parsed.diagnostics).toHaveLength(3);
+    expect(parsed.errors).toHaveLength(1);
+    expect(activeAdapterProcessDiagnostics(parsed.diagnostics)).toEqual([
+      expect.objectContaining({
+        pid: 42,
+        processInstanceId: "instance-b"
+      })
+    ]);
   });
 
   it("formats captured output and every refresh or cleanup member error", () => {

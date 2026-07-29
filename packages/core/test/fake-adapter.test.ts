@@ -209,18 +209,32 @@ describe("FakeAgentAdapter", () => {
       expect(resumed.nativeSessionId).toBe(first.nativeSessionId);
       await adapter.stop(resumed);
 
-      await expect(readFile(
+      const log = await readFile(
         join(project.root, ".agenttown", "logs", "developer.jsonl"),
         "utf8"
-      )).resolves.toEqual(expect.stringContaining(
-        "\"type\":\"adapter.process.started\""
-      ));
-      await expect(readFile(
-        join(project.root, ".agenttown", "logs", "developer.jsonl"),
-        "utf8"
-      )).resolves.toEqual(expect.stringContaining(
-        "\"type\":\"adapter.process.exited\""
-      ));
+      );
+      const diagnostics = log.split(/\r?\n/u)
+        .map((line) => line.slice(line.indexOf("{")))
+        .filter((line) => line.startsWith("{"))
+        .map((line) => JSON.parse(line) as {
+          type?: string;
+          processInstanceId?: string;
+        })
+        .filter(({ type }) => type?.startsWith("adapter.process."));
+      const started = diagnostics.filter(({ type }) =>
+        type === "adapter.process.started"
+      );
+      const exited = diagnostics.filter(({ type }) =>
+        type === "adapter.process.exited"
+      );
+      expect(started).toHaveLength(2);
+      expect(exited).toHaveLength(2);
+      expect(started.every(({ processInstanceId }) =>
+        typeof processInstanceId === "string"
+        && /^[0-9a-f-]{36}$/u.test(processInstanceId)
+      )).toBe(true);
+      expect(new Set(started.map(({ processInstanceId }) => processInstanceId)))
+        .toEqual(new Set(exited.map(({ processInstanceId }) => processInstanceId)));
     } finally {
       await Promise.all(handles.map(async (handle) => {
         await adapter.stop(handle).catch(() => undefined);

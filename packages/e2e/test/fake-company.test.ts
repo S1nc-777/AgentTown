@@ -23,13 +23,17 @@ import {
   resolveAgentTownPaths
 } from "../../cli/src/paths.js";
 import {
+  activeAdapterProcessDiagnostics,
+  type AdapterProcessDiagnostic,
   CapturedProcessError,
   capture,
   connectOrTerminateCapturedProcess,
   forceReapCapturedProcessTree,
   formatErrorTree,
+  parseAdapterProcessDiagnostics,
   runCapturedCommand,
   waitForCapturedProcessTreeExit,
+  type ProcessVerification,
   type ProcessCapture
 } from "../src/process-helpers.js";
 
@@ -48,6 +52,8 @@ const roots: string[] = [];
 
 interface RunningCore extends ProcessCapture {
   client: AgentTownClient;
+  priorProcessInstanceIds: ReadonlySet<string>;
+  ownedProcessInstanceIds: Set<string>;
 }
 
 function fakeOnlyEnv(): NodeJS.ProcessEnv {
@@ -67,13 +73,13 @@ function cliCommand(args: readonly string[]): { file: string; args: string[] } {
 }
 
 async function waitForCoreExit(
-  processCapture: ProcessCapture,
+  processCapture: RunningCore,
   label: string,
   logsDir: string
 ): Promise<number> {
   const exit = await waitForCapturedProcessTreeExit({
     processCapture,
-    descendantPids: () => knownLiveFakePids(logsDir),
+    verification: () => coreProcessVerification(logsDir, processCapture),
     label,
     totalBudgetMs: PHASE_TIMEOUT_MS
   });
@@ -105,6 +111,14 @@ async function runCli(
 async function startCore(projectRoot: string): Promise<RunningCore> {
   const paths = resolveAgentTownPaths(projectRoot);
   const pipeName = pipeNameForProject(projectRoot);
+  const priorDiagnostics = await processDiagnostics(
+    paths.logsDir,
+    EMPLOYEE_IDS,
+    true
+  );
+  const priorProcessInstanceIds = new Set(priorDiagnostics.diagnostics
+    .map(({ processInstanceId }) => processInstanceId));
+  const ownsProcessGroup = process.platform !== "win32";
   const processCapture = capture(spawn(process.execPath, [
     "--import",
     tsxImport,
@@ -121,10 +135,11 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
     "300"
   ], {
     cwd: projectRoot,
+    detached: ownsProcessGroup,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
     env: fakeOnlyEnv()
-  }));
+  }), { ownsProcessGroup });
   const deadline = Date.now() + PHASE_TIMEOUT_MS;
   const readyDeadline = deadline - CLEANUP_RESERVE_MS;
   try {
@@ -154,14 +169,23 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
       label: "Core after readiness",
       timeoutMs: Math.max(1, deadline - Date.now())
     });
-    return { ...processCapture, client };
+    return {
+      ...processCapture,
+      client,
+      priorProcessInstanceIds,
+      ownedProcessInstanceIds: new Set()
+    };
   } catch (error) {
     if (error instanceof CapturedProcessError) throw error;
     let cleanupError: unknown;
     try {
       await forceReapCapturedProcessTree({
         processCapture,
-        descendantPids: () => knownLiveFakePids(paths.logsDir),
+        verification: () => processVerification(
+          paths.logsDir,
+          priorProcessInstanceIds,
+          undefined
+        ),
         label: "Core startup failure",
         deadlineAt: deadline
       });
@@ -246,44 +270,25 @@ function readDatabaseTasks(databasePath: string): TaskRecord[] {
   }
 }
 
-interface ProcessDiagnostic {
-  type: "adapter.process.started" | "adapter.process.exited";
-  employeeId: string;
-  pid: number;
-  exitCode?: number | null;
-  signal?: NodeJS.Signals | null;
-}
-
 async function processDiagnostics(
   logsDir: string,
-  employeeIds: readonly string[]
-): Promise<ProcessDiagnostic[]> {
-  const diagnostics: ProcessDiagnostic[] = [];
+  employeeIds: readonly string[],
+  allowMissing = false
+): Promise<{
+  diagnostics: AdapterProcessDiagnostic[];
+  errors: Error[];
+}> {
+  const diagnostics: AdapterProcessDiagnostic[] = [];
+  const errors: Error[] = [];
   for (const employeeId of employeeIds) {
-    const log = await readFile(join(logsDir, `${employeeId}.jsonl`), "utf8");
-    for (const line of log.split(/\r?\n/u)) {
-      const jsonStart = line.indexOf("{");
-      if (jsonStart < 0) continue;
-      const parsed = JSON.parse(line.slice(jsonStart)) as Partial<ProcessDiagnostic>;
-      if (
-        parsed.type === "adapter.process.started"
-        || parsed.type === "adapter.process.exited"
-      ) {
-        diagnostics.push(parsed as ProcessDiagnostic);
-      }
-    }
-  }
-  return diagnostics;
-}
-
-async function knownLiveFakePids(logsDir: string): Promise<number[]> {
-  const diagnostics: ProcessDiagnostic[] = [];
-  for (const employeeId of EMPLOYEE_IDS) {
+    const path = join(logsDir, `${employeeId}.jsonl`);
+    let log: string;
     try {
-      diagnostics.push(...await processDiagnostics(logsDir, [employeeId]));
+      log = await readFile(path, "utf8");
     } catch (error) {
       if (
-        error instanceof Error
+        allowMissing
+        && error instanceof Error
         && "code" in error
         && (error as NodeJS.ErrnoException).code === "ENOENT"
       ) {
@@ -291,14 +296,60 @@ async function knownLiveFakePids(logsDir: string): Promise<number[]> {
       }
       throw error;
     }
+    const parsed = parseAdapterProcessDiagnostics(log, path);
+    diagnostics.push(...parsed.diagnostics);
+    errors.push(...parsed.errors);
   }
-  const exited = new Set(diagnostics
-    .filter(({ type }) => type === "adapter.process.exited")
-    .map(({ pid }) => pid));
-  return [...new Set(diagnostics
-    .filter(({ type }) => type === "adapter.process.started")
-    .map(({ pid }) => pid))]
-    .filter((pid) => !exited.has(pid) && isProcessAlive(pid));
+  return { diagnostics, errors };
+}
+
+async function processVerification(
+  logsDir: string,
+  excludedInstanceIds: ReadonlySet<string>,
+  includedInstanceIds: ReadonlySet<string> | undefined
+): Promise<ProcessVerification> {
+  const parsed = await processDiagnostics(logsDir, EMPLOYEE_IDS, true);
+  const active = activeAdapterProcessDiagnostics(parsed.diagnostics)
+    .filter(({ processInstanceId }) =>
+      includedInstanceIds === undefined
+        ? !excludedInstanceIds.has(processInstanceId)
+        : includedInstanceIds.has(processInstanceId)
+    );
+  return {
+    pids: active.map(({ pid }) => pid),
+    errors: parsed.errors
+  };
+}
+
+async function coreProcessVerification(
+  logsDir: string,
+  core: RunningCore
+): Promise<ProcessVerification> {
+  return processVerification(
+    logsDir,
+    core.priorProcessInstanceIds,
+    core.ownedProcessInstanceIds.size > 0
+      ? core.ownedProcessInstanceIds
+      : undefined
+  );
+}
+
+async function recordCoreProcessInstances(
+  logsDir: string,
+  core: RunningCore
+): Promise<void> {
+  const parsed = await processDiagnostics(logsDir, EMPLOYEE_IDS);
+  if (parsed.errors.length > 0) {
+    throw new AggregateError(
+      parsed.errors,
+      "Malformed process diagnostics while recording Core ownership"
+    );
+  }
+  for (const diagnostic of parsed.diagnostics) {
+    if (!core.priorProcessInstanceIds.has(diagnostic.processInstanceId)) {
+      core.ownedProcessInstanceIds.add(diagnostic.processInstanceId);
+    }
+  }
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -388,6 +439,7 @@ describe("P1A real Fake Company lifecycle", () => {
       await runCli(projectRoot, ["init", "--template", "parallel-software"]);
       firstCore = await startCore(projectRoot);
       await coreRequest(firstCore.client, "company.start", {});
+      await recordCoreProcessInstances(paths.logsDir, firstCore);
 
       lastEvents = await listEvents(firstCore.client);
       expect(lastEvents.filter(({ type }) => type === "session.started"))
@@ -503,19 +555,25 @@ describe("P1A real Fake Company lifecycle", () => {
         "developer-b",
         "reviewer"
       ]));
-      const firstStopDiagnostics = await processDiagnostics(paths.logsDir, [
-        "leader",
-        "developer-a",
-        "developer-b",
-        "reviewer"
-      ]);
+      const firstStopResult = await processDiagnostics(
+        paths.logsDir,
+        EMPLOYEE_IDS
+      );
+      expect(firstStopResult.errors).toEqual([]);
+      const firstStopDiagnostics = firstStopResult.diagnostics;
       const firstStartedPids = firstStopDiagnostics
         .filter(({ type }) => type === "adapter.process.started")
         .map(({ pid }) => pid);
+      const firstStartedInstances = firstStopDiagnostics
+        .filter(({ type }) => type === "adapter.process.started")
+        .map(({ processInstanceId }) => processInstanceId);
+      const firstExitedInstances = new Set(firstStopDiagnostics
+        .filter(({ type }) => type === "adapter.process.exited")
+        .map(({ processInstanceId }) => processInstanceId));
       expect(firstStartedPids).toHaveLength(4);
-      expect(firstStopDiagnostics.filter(({ type }) =>
-        type === "adapter.process.exited"
-      )).toHaveLength(4);
+      expect(firstStartedInstances.every((processInstanceId) =>
+        firstExitedInstances.has(processInstanceId)
+      )).toBe(true);
       expect(firstStartedPids.every((pid) => !isProcessAlive(pid))).toBe(true);
 
       secondCore = await startCore(projectRoot);
@@ -530,6 +588,7 @@ describe("P1A real Fake Company lifecycle", () => {
       expect(resumed.status).toBe("running");
       expect(resumed.decisions).toHaveLength(4);
       expect(resumed.decisions.every(({ mode }) => mode === "native")).toBe(true);
+      await recordCoreProcessInstances(paths.logsDir, secondCore);
       expect(await listTasks(secondCore.client)).toEqual([
         expect.objectContaining({
           id: "task-a",
@@ -569,20 +628,25 @@ describe("P1A real Fake Company lifecycle", () => {
         expect.objectContaining({ id: "task-a", status: "completed" }),
         expect.objectContaining({ id: "task-b", status: "completed" })
       ]);
-      const allProcessDiagnostics = await processDiagnostics(paths.logsDir, [
-        "leader",
-        "developer-a",
-        "developer-b",
-        "reviewer"
-      ]);
+      const allProcessResult = await processDiagnostics(
+        paths.logsDir,
+        EMPLOYEE_IDS
+      );
+      expect(allProcessResult.errors).toEqual([]);
+      const allProcessDiagnostics = allProcessResult.diagnostics;
       const allStartedPids = allProcessDiagnostics
         .filter(({ type }) => type === "adapter.process.started")
         .map(({ pid }) => pid);
-      const allExitedPids = new Set(allProcessDiagnostics
+      const allStartedInstances = allProcessDiagnostics
+        .filter(({ type }) => type === "adapter.process.started")
+        .map(({ processInstanceId }) => processInstanceId);
+      const allExitedInstances = new Set(allProcessDiagnostics
         .filter(({ type }) => type === "adapter.process.exited")
-        .map(({ pid }) => pid));
+        .map(({ processInstanceId }) => processInstanceId));
       expect(allStartedPids).toHaveLength(8);
-      expect(allStartedPids.every((pid) => allExitedPids.has(pid))).toBe(true);
+      expect(allStartedInstances.every((processInstanceId) =>
+        allExitedInstances.has(processInstanceId)
+      )).toBe(true);
       expect(allStartedPids.every((pid) => !isProcessAlive(pid))).toBe(true);
       await expect(readFile(paths.companyPath, "utf8"))
         .resolves.toContain("parallel-software");
@@ -662,21 +726,21 @@ describe("P1A real Fake Company lifecycle", () => {
         processCapture: secondCore
       });
     }
-    const reapResults = await Promise.allSettled(
-      coreCleanupTargets.map(({ label, processCapture }) =>
-        forceReapCapturedProcessTree({
+    for (const { label, processCapture } of coreCleanupTargets) {
+      try {
+        await forceReapCapturedProcessTree({
           processCapture,
-          descendantPids: () => knownLiveFakePids(paths.logsDir),
+          verification: () => coreProcessVerification(
+            paths.logsDir,
+            processCapture
+          ),
           label,
           deadlineAt: cleanupDeadlineAt
-        })
-      )
-    );
-    cleanupErrors.push(...reapResults
-      .filter((result): result is PromiseRejectedResult =>
-        result.status === "rejected"
-      )
-      .map(({ reason }) => reason));
+        });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     if (failure !== undefined) {
       if (cleanupErrors.length > 0) {
         console.error(formatErrorTree(new AggregateError(

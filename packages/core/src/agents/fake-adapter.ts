@@ -3,6 +3,7 @@ import {
   type SpawnOptionsWithoutStdio,
   type ChildProcessWithoutNullStreams
 } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   access,
   appendFileSync,
@@ -49,6 +50,7 @@ interface LiveFakeSession {
   logFileDescriptor: number;
   logFileClosed: boolean;
   processExitLogged: boolean;
+  processInstanceId: string;
   lifecycleErrors: Error[];
   stopping: Promise<void> | null;
 }
@@ -399,6 +401,7 @@ export class FakeAgentAdapter implements AgentAdapter {
       logFileDescriptor,
       logFileClosed: false,
       processExitLogged: false,
+      processInstanceId: randomUUID(),
       lifecycleErrors: [],
       stopping: null
     };
@@ -430,7 +433,8 @@ export class FakeAgentAdapter implements AgentAdapter {
       this.#writeProcessDiagnostic(live, {
         type: "adapter.process.started",
         employeeId: input.employeeId,
-        pid: childPid as number
+        pid: childPid as number,
+        processInstanceId: live.processInstanceId
       });
     } catch (error) {
       return this.#abortFailedStart(live, error);
@@ -540,6 +544,7 @@ export class FakeAgentAdapter implements AgentAdapter {
       type: "adapter.process.exited",
       employeeId: live.handle.employeeId,
       pid: live.child.pid,
+      processInstanceId: live.processInstanceId,
       exitCode,
       signal
     });
