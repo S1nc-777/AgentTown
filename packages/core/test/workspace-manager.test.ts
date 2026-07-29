@@ -32,6 +32,54 @@ let repo: GitFixture;
 let baseline: RepositoryBaseline;
 let manager: WorkspaceManager;
 
+function createCompany(target: CoreStore, id: string): void {
+  target.createCompany({
+    id,
+    definition: companyDefinitionFixture(),
+    event: {
+      id: crypto.randomUUID(),
+      type: "company.created",
+      actorId: "owner",
+      taskId: null,
+      causationEventId: null,
+      payload: { companyId: id }
+    }
+  });
+}
+
+class RemovalCompletionFaultStore extends CoreStore {
+  failCompletion = false;
+  failCreation = false;
+  failRunCreation = false;
+
+  override commitGitRunCreation(
+    input: Parameters<CoreStore["commitGitRunCreation"]>[0]
+  ): void {
+    if (this.failRunCreation) {
+      throw new Error("injected run creation commit failure");
+    }
+    super.commitGitRunCreation(input);
+  }
+
+  override commitGitWorkspace(
+    input: Parameters<CoreStore["commitGitWorkspace"]>[0]
+  ): void {
+    if (
+      this.failCompletion
+      && input.event.type === "git.workspace.removed"
+    ) {
+      throw new Error("injected removal completion failure");
+    }
+    if (
+      this.failCreation
+      && input.event.type === "git.workspace.created"
+    ) {
+      throw new Error("injected workspace creation commit failure");
+    }
+    super.commitGitWorkspace(input);
+  }
+}
+
 async function setupRepository(usePreflight = false): Promise<void> {
   repo = await createGitFixture();
   fixtures.push(repo);
@@ -87,18 +135,7 @@ async function createTaskWorkspace() {
 beforeEach(async () => {
   store = new CoreStore(":memory:");
   store.initialize();
-  store.createCompany({
-    id: "company",
-    definition: companyDefinitionFixture(),
-    event: {
-      id: crypto.randomUUID(),
-      type: "company.created",
-      actorId: "owner",
-      taskId: null,
-      causationEventId: null,
-      payload: { companyId: "company" }
-    }
-  });
+  createCompany(store, "company");
   manager = new WorkspaceManager({
     store,
     companyId: "company"
@@ -115,13 +152,26 @@ describe("workspace ref builders", () => {
     expect(integrationRef("run-1"))
       .toBe("refs/heads/agenttown/run-1/integration");
     expect(taskRef("run-1", "developer-a", "task-a"))
-      .toBe("refs/heads/agenttown/run-1/developer-a/task-a");
+      .toBe("refs/heads/agenttown/run-1/tasks/developer-a/task-a");
     expect(candidateRef("run-1", "attempt-a"))
-      .toBe("refs/heads/agenttown/run-1/candidate/attempt-a");
+      .toBe("refs/heads/agenttown/run-1/candidates/attempt-a");
 
     expect(() => integrationRef("../escape")).toThrow("run id");
     expect(() => taskRef("run-1", "../escape", "task-a")).toThrow("employee id");
     expect(() => candidateRef("run-1", "refs/heads/main")).toThrow("attempt id");
+  });
+
+  it("uses injective domain-separated task and candidate namespaces", () => {
+    const taskLeft = taskRef("run-1", "a-b", "c");
+    const taskRight = taskRef("run-1", "a", "b-c");
+    expect(taskLeft).not.toBe(taskRight);
+    expect(taskLeft).toBe("refs/heads/agenttown/run-1/tasks/a-b/c");
+    expect(taskRight).toBe("refs/heads/agenttown/run-1/tasks/a/b-c");
+
+    expect(taskRef("run-1", "candidate", "attempt-a"))
+      .not.toBe(candidateRef("run-1", "attempt-a"));
+    expect(taskRef("run-1", "integration", "task-a"))
+      .not.toBe(integrationRef("run-1"));
   });
 });
 
@@ -144,7 +194,7 @@ describe("WorkspaceManager", () => {
     expect(await currentBranch()).toBe(beforeBranch);
     expect(await status()).toBe(beforeStatus);
     expect(task.branchRef)
-      .toBe("refs/heads/agenttown/run-1/developer-a/task-a");
+      .toBe("refs/heads/agenttown/run-1/tasks/developer-a/task-a");
     expect(await head(task.path)).toBe(beforeHead);
     expect(store.getGitRun("run-1")).toEqual(run);
     expect(store.getGitWorkspace(task.workspaceId)).toEqual(task);
@@ -163,13 +213,69 @@ describe("WorkspaceManager", () => {
 
     expect(candidate.kind).toBe("candidate");
     expect(candidate.branchRef)
-      .toBe("refs/heads/agenttown/run-1/candidate/attempt-a");
+      .toBe("refs/heads/agenttown/run-1/candidates/attempt-a");
     expect(await head(candidate.path)).toBe(run.integrationCommit);
     await expect(manager.createCandidateWorkspace({
       runId: run.runId,
       attemptId: "../escape",
       baseCommit: run.integrationCommit
     })).rejects.toThrow("attempt id");
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("creates distinct domain-separated worktree paths for lookalike ids", async () => {
+    await setupRepository();
+    const run = await manager.createRun("run-1", baseline);
+    const workspaces = [
+      await manager.createTaskWorkspace({
+        runId: run.runId,
+        employeeId: "a-b",
+        taskId: "c",
+        baseCommit: run.integrationCommit
+      }),
+      await manager.createTaskWorkspace({
+        runId: run.runId,
+        employeeId: "a",
+        taskId: "b-c",
+        baseCommit: run.integrationCommit
+      }),
+      await manager.createTaskWorkspace({
+        runId: run.runId,
+        employeeId: "candidate",
+        taskId: "attempt-a",
+        baseCommit: run.integrationCommit
+      }),
+      await manager.createTaskWorkspace({
+        runId: run.runId,
+        employeeId: "integration",
+        taskId: "task-a",
+        baseCommit: run.integrationCommit
+      }),
+      await manager.createCandidateWorkspace({
+        runId: run.runId,
+        attemptId: "attempt-a",
+        baseCommit: run.integrationCommit
+      })
+    ];
+
+    expect(new Set(workspaces.map(({ path }) => path))).toHaveLength(5);
+    expect(new Set(workspaces.map(({ branchRef }) => branchRef))).toHaveLength(5);
+    expect(workspaces[0]?.path).toBe(join(
+      repo.root,
+      ".agenttown",
+      "worktrees",
+      "run-1",
+      "tasks",
+      "a-b",
+      "c"
+    ));
+    expect(workspaces[4]?.path).toBe(join(
+      repo.root,
+      ".agenttown",
+      "worktrees",
+      "run-1",
+      "candidates",
+      "attempt-a"
+    ));
   }, GIT_TEST_TIMEOUT_MS);
 
   it("rejects a task path that resolves outside the run root", async () => {
@@ -215,7 +321,15 @@ describe("WorkspaceManager", () => {
 
     await manager.pauseRun("run-1");
     await repo.write(
-      join(".agenttown", "worktrees", "run-1", "task-developer-a-task-a", "dirty.txt"),
+      join(
+        ".agenttown",
+        "worktrees",
+        "run-1",
+        "tasks",
+        "developer-a",
+        "task-a",
+        "dirty.txt"
+      ),
       "dirty\n"
     );
 
@@ -247,6 +361,181 @@ describe("WorkspaceManager", () => {
 
     expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("tampered");
     await expect(access(task.path)).resolves.toBeUndefined();
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("durably prepares removal before Git mutation and retries after Git failure", async () => {
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    const delegate = new GitCommandRunner();
+    let statusObservedByRemove: string | undefined;
+    let preparedEventObserved = false;
+    const failingGit = {
+      async run(
+        args: readonly string[],
+        options: GitCommandOptions
+      ): Promise<GitCommandResult> {
+        if (args[0] === "worktree" && args[1] === "remove") {
+          statusObservedByRemove =
+            store.getGitWorkspace(task.workspaceId)?.status;
+          preparedEventObserved = store.listEvents(0).some(
+            ({ type }) => type === "git.workspace.removal_prepared"
+          );
+          throw new Error("injected worktree removal failure");
+        }
+        return delegate.run(args, options);
+      }
+    };
+    manager = new WorkspaceManager({
+      store,
+      companyId: "company",
+      git: failingGit
+    });
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow("injected worktree removal failure");
+    expect(statusObservedByRemove).toBe("removing");
+    expect(preparedEventObserved).toBe(true);
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("removing");
+    await expect(access(task.path)).resolves.toBeUndefined();
+
+    manager = new WorkspaceManager({ store, companyId: "company" });
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .resolves.toBeUndefined();
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("missing");
+    await expect(access(task.path)).rejects.toThrow();
+    expect(await refExists(task.branchRef)).toBe(true);
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("recovers removing state after final store failure and clears stale metadata", async () => {
+    store.close();
+    const faultStore = new RemovalCompletionFaultStore(":memory:");
+    store = faultStore;
+    store.initialize();
+    createCompany(store, "company");
+    manager = new WorkspaceManager({ store, companyId: "company" });
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    faultStore.failCompletion = true;
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow("injected removal completion failure");
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("removing");
+    await expect(access(task.path)).rejects.toThrow();
+    expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
+      .not.toContain(task.path);
+    expect(await refExists(task.branchRef)).toBe(true);
+
+    faultStore.failCompletion = false;
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .resolves.toBeUndefined();
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("missing");
+    expect(store.listEvents(0).at(-1)?.type).toBe("git.workspace.removed");
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("cleans exact stale worktree metadata when a registered path disappears", async () => {
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    await rm(task.path, { recursive: true, force: true });
+    expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
+      .toContain(task.path.replaceAll("\\", "/"));
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .resolves.toBeUndefined();
+
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("missing");
+    expect(store.listEvents(0).at(-1)?.type).toBe("git.workspace.removed");
+    expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
+      .not.toContain(task.path);
+    expect(await refExists(task.branchRef)).toBe(true);
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("marks a missing registered path tampered when its ref ownership contradicts facts", async () => {
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    const tree = (await repo.git([
+      "rev-parse",
+      `${task.headCommit}^{tree}`
+    ])).stdout.trim();
+    const changedHead = (await repo.git([
+      "commit-tree",
+      tree,
+      "-p",
+      task.headCommit,
+      "-m",
+      "external ref change"
+    ])).stdout.trim();
+    await repo.git(["update-ref", task.branchRef, changedHead]);
+    await rm(task.path, { recursive: true, force: true });
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow(/branch ref|recorded head|persisted facts/u);
+
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("tampered");
+    expect(await refExists(task.branchRef)).toBe(true);
+    expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
+      .toContain(task.path.replaceAll("\\", "/"));
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("rejects a missing persisted path outside the exact run root as tampered", async () => {
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    await rm(task.path, { recursive: true, force: true });
+    store.putGitWorkspace({
+      ...store.getGitWorkspace(task.workspaceId)!,
+      path: join(dirname(repo.root), "outside", "missing")
+    });
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow(/escaped|run worktree root/u);
+
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("tampered");
+    expect(await refExists(task.branchRef)).toBe(true);
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("enforces company ownership before every run workspace Git operation", async () => {
+    await setupRepository();
+    createCompany(store, "company-b");
+    const task = await createTaskWorkspace();
+    const otherCompanyManager = new WorkspaceManager({
+      store,
+      companyId: "company-b"
+    });
+    const gitBefore = async () => ({
+      worktrees: (await repo.git(["worktree", "list", "--porcelain"])).stdout,
+      refs: (await repo.git(["show-ref"])).stdout
+    });
+    const factsBefore = {
+      run: store.getGitRun("run-1"),
+      workspaces: store.listGitWorkspaces("run-1"),
+      events: store.listEvents(0),
+      git: await gitBefore()
+    };
+
+    await expect(otherCompanyManager.createTaskWorkspace({
+      runId: "run-1",
+      employeeId: "developer-b",
+      taskId: "task-b",
+      baseCommit: baseline.baseCommit
+    })).rejects.toThrow(/company|ownership/u);
+    await expect(otherCompanyManager.createCandidateWorkspace({
+      runId: "run-1",
+      attemptId: "attempt-b",
+      baseCommit: baseline.baseCommit
+    })).rejects.toThrow(/company|ownership/u);
+    await expect(otherCompanyManager.pauseRun("run-1"))
+      .rejects.toThrow(/company|ownership/u);
+    await expect(otherCompanyManager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow(/company|ownership/u);
+
+    expect(store.getGitRun("run-1")).toEqual(factsBefore.run);
+    expect(store.listGitWorkspaces("run-1")).toEqual(factsBefore.workspaces);
+    expect(store.listEvents(0)).toEqual(factsBefore.events);
+    expect(await gitBefore()).toEqual(factsBefore.git);
   }, GIT_TEST_TIMEOUT_MS);
 
   it("never removes a pre-existing exact worktree during failed creation", async () => {
@@ -309,21 +598,142 @@ describe("WorkspaceManager", () => {
       .toContain("agenttown");
   }, GIT_TEST_TIMEOUT_MS);
 
-  it("does not roll back Git after facts commit when event publication throws", async () => {
+  it("does not clean a worktree when command completion ownership is unproven", async () => {
+    await setupRepository();
+    const delegate = new GitCommandRunner();
+    let createdPath: string | undefined;
+    let createdRef: string | undefined;
+    const ambiguousGit = {
+      async run(
+        args: readonly string[],
+        options: GitCommandOptions
+      ): Promise<GitCommandResult> {
+        const result = await delegate.run(args, options);
+        if (args[0] === "worktree" && args[1] === "add") {
+          createdPath = args[5];
+          const name = args[3];
+          createdRef = name === undefined ? undefined : `refs/heads/${name}`;
+          throw new Error("transport failed after Git completed");
+        }
+        return result;
+      }
+    };
+    manager = new WorkspaceManager({
+      store,
+      companyId: "company",
+      git: ambiguousGit
+    });
+
+    await expect(manager.createRun("run-1", baseline))
+      .rejects.toThrow("transport failed after Git completed");
+
+    expect(createdPath).toBeDefined();
+    await expect(access(createdPath ?? "")).resolves.toBeUndefined();
+    expect(createdRef === undefined ? false : await refExists(createdRef))
+      .toBe(true);
+    expect(store.getGitRun("run-1")?.status).toBe("tampered");
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("durably records missing and removed after an owned creation rollback", async () => {
+    store.close();
+    const faultStore = new RemovalCompletionFaultStore(":memory:");
+    store = faultStore;
+    store.initialize();
+    createCompany(store, "company");
+    manager = new WorkspaceManager({ store, companyId: "company" });
+    await setupRepository();
+    const run = await manager.createRun("run-1", baseline);
+    faultStore.failCreation = true;
+    const expectedPath = join(
+      repo.root,
+      ".agenttown",
+      "worktrees",
+      "run-1",
+      "tasks",
+      "developer-a",
+      "task-a"
+    );
+    const expectedRef = taskRef("run-1", "developer-a", "task-a");
+
+    await expect(manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "developer-a",
+      taskId: "task-a",
+      baseCommit: run.integrationCommit
+    })).rejects.toThrow("injected workspace creation commit failure");
+
+    expect(store.getGitWorkspace(
+      "run-1:task:developer-a:task-a"
+    )?.status).toBe("missing");
+    expect(store.listEvents(0).at(-1)?.type).toBe("git.workspace.removed");
+    await expect(access(expectedPath)).rejects.toThrow();
+    expect(await refExists(expectedRef)).toBe(false);
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("durably records a missing integration after an owned run rollback", async () => {
+    store.close();
+    const faultStore = new RemovalCompletionFaultStore(":memory:");
+    store = faultStore;
+    store.initialize();
+    createCompany(store, "company");
+    manager = new WorkspaceManager({ store, companyId: "company" });
+    await setupRepository();
+    faultStore.failRunCreation = true;
+    const expectedPath = join(
+      repo.root,
+      ".agenttown",
+      "worktrees",
+      "run-1",
+      "integration"
+    );
+    const expectedRef = integrationRef("run-1");
+
+    await expect(manager.createRun("run-1", baseline))
+      .rejects.toThrow("injected run creation commit failure");
+
+    expect(store.getGitWorkspace("run-1:integration")?.status)
+      .toBe("missing");
+    expect(store.listEvents(0).at(-1)?.type).toBe("git.workspace.removed");
+    await expect(access(expectedPath)).rejects.toThrow();
+    expect(await refExists(expectedRef)).toBe(false);
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("treats exact durable lifecycle facts as success when publication throws", async () => {
     await setupRepository();
     const unsubscribe = store.subscribeEvents(() => {
       throw new Error("listener failure");
     });
 
-    await expect(manager.createRun("run-1", baseline))
-      .rejects.toThrow("listener failure");
+    const run = await manager.createRun("run-1", baseline);
+    const task = await manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "developer-a",
+      taskId: "task-a",
+      baseCommit: run.integrationCommit
+    });
+    const candidate = await manager.createCandidateWorkspace({
+      runId: run.runId,
+      attemptId: "attempt-a",
+      baseCommit: run.integrationCommit
+    });
+    await expect(manager.pauseRun(run.runId)).resolves.toBeUndefined();
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .resolves.toBeUndefined();
     unsubscribe();
 
-    const run = store.getGitRun("run-1");
-    expect(run?.status).toBe("active");
+    expect(store.getGitRun("run-1")?.status).toBe("paused");
     const integration = store.getGitWorkspace("run-1:integration");
-    expect(integration?.status).toBe("active");
+    expect(integration?.status).toBe("paused");
     await expect(access(integration?.path ?? "")).resolves.toBeUndefined();
-    expect(store.listEvents(0).at(-1)?.type).toBe("git.run.created");
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("missing");
+    expect(store.getGitWorkspace(candidate.workspaceId)?.status).toBe("paused");
+    expect(store.listEvents(0).map(({ type }) => type)).toEqual(
+      expect.arrayContaining([
+        "git.run.created",
+        "git.workspace.created",
+        "git.run.paused",
+        "git.workspace.removed"
+      ])
+    );
   }, GIT_TEST_TIMEOUT_MS);
 });

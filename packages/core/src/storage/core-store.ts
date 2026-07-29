@@ -325,7 +325,7 @@ function parseGitWorkspaceRow(row: DatabaseRow): GitWorkspaceRecord {
     headCommit: readString(row, "head_commit"),
     status: readEnum(
       readString(row, "status"),
-      ["active", "paused", "completed", "missing", "tampered"],
+      ["active", "paused", "completed", "removing", "missing", "tampered"],
       "Git workspace status"
     )
   };

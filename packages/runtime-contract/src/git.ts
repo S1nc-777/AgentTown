@@ -1,7 +1,13 @@
 import { z } from "zod";
 
 export type GitWorkspaceKind = "integration" | "task" | "candidate";
-export type GitWorkspaceStatus = "active" | "paused" | "completed" | "missing" | "tampered";
+export type GitWorkspaceStatus =
+  | "active"
+  | "paused"
+  | "completed"
+  | "removing"
+  | "missing"
+  | "tampered";
 export type SubmissionStatus =
   | "received" | "validated" | "rejected" | "in_review"
   | "approved" | "changes_requested" | "queued" | "integrated";

@@ -703,6 +703,20 @@ describe("typed Git fact storage", () => {
     }
   });
 
+  it("round-trips a workspace removal intent", () => {
+    const store = initializedStore();
+    try {
+      const workspace: GitWorkspaceRecord = {
+        ...gitWorkspace(),
+        status: "removing"
+      };
+      store.putGitWorkspace(workspace);
+      expect(store.getGitWorkspace(workspace.workspaceId)).toEqual(workspace);
+    } finally {
+      store.close();
+    }
+  });
+
   it("round-trips and lists parser-validated submissions", () => {
     const store = initializedStore();
     try {

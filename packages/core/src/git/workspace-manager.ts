@@ -93,6 +93,7 @@ export function taskRef(
   return [
     "refs/heads/agenttown",
     identifier(runId, "run id"),
+    "tasks",
     identifier(employeeId, "employee id"),
     identifier(taskId, "task id")
   ].join("/");
@@ -102,7 +103,7 @@ export function candidateRef(runId: string, attemptId: string): string {
   return [
     "refs/heads/agenttown",
     identifier(runId, "run id"),
-    "candidate",
+    "candidates",
     identifier(attemptId, "attempt id")
   ].join("/");
 }
@@ -185,7 +186,7 @@ async function assertNoPathRedirect(
   }
 }
 
-async function assertWorkspacePath(
+async function assertWorkspaceLocation(
   projectRoot: string,
   runRoot: string,
   workspacePath: string
@@ -201,6 +202,16 @@ async function assertWorkspacePath(
     );
   }
   await assertNoPathRedirect(projectRoot, resolvedWorkspacePath);
+}
+
+async function assertWorkspacePath(
+  projectRoot: string,
+  runRoot: string,
+  workspacePath: string
+): Promise<void> {
+  await assertWorkspaceLocation(projectRoot, runRoot, workspacePath);
+  const resolvedRunRoot = resolve(runRoot);
+  const resolvedWorkspacePath = resolve(workspacePath);
   const runRootRealPath = await realpath(resolvedRunRoot);
   const workspaceRealPath = await realpath(resolvedWorkspacePath);
   if (!isWithin(runRootRealPath, workspaceRealPath)) {
@@ -289,6 +300,16 @@ function sameWorkspace(
     && left.status === right.status;
 }
 
+function sameEvent(left: NewEvent | undefined, right: NewEvent): boolean {
+  return left !== undefined
+    && left.id === right.id
+    && left.type === right.type
+    && left.actorId === right.actorId
+    && left.taskId === right.taskId
+    && left.causationEventId === right.causationEventId
+    && JSON.stringify(left.payload) === JSON.stringify(right.payload);
+}
+
 export class WorkspaceManager {
   readonly #store: CoreStore;
   readonly #companyId: string;
@@ -336,17 +357,26 @@ export class WorkspaceManager {
       createdAt: now,
       updatedAt: now
     };
+    const integrationIntent: GitWorkspaceRecord = {
+      workspaceId: `${validatedRunId}:integration`,
+      runId: validatedRunId,
+      taskId: null,
+      employeeId: null,
+      kind: "integration",
+      path: workspacePath,
+      branchRef: ref,
+      baseCommit: baseline.baseCommit,
+      headCommit: baseline.baseCommit,
+      status: "missing"
+    };
     this.#store.putGitRun(intent);
 
-    let pathWasAbsent = false;
-    let refWasAbsent = false;
-    let durableCreation = false;
+    let pathOwned = false;
+    let refOwned = false;
     try {
       await assertNoPathRedirect(projectRoot, workspacePath);
       await this.#assertPathAbsent(workspacePath);
-      pathWasAbsent = true;
       await this.#assertRefAbsent(projectRoot, ref);
-      refWasAbsent = true;
       await this.#assertCommit(projectRoot, baseline.baseCommit);
       await mkdir(runRoot, { recursive: true });
       await assertNoPathRedirect(projectRoot, workspacePath);
@@ -359,17 +389,11 @@ export class WorkspaceManager {
         workspacePath,
         baseline.baseCommit
       ], { cwd: projectRoot });
+      pathOwned = true;
+      refOwned = true;
 
       const integrationWorkspace: GitWorkspaceRecord = {
-        workspaceId: `${validatedRunId}:integration`,
-        runId: validatedRunId,
-        taskId: null,
-        employeeId: null,
-        kind: "integration",
-        path: workspacePath,
-        branchRef: ref,
-        baseCommit: baseline.baseCommit,
-        headCommit: baseline.baseCommit,
+        ...integrationIntent,
         status: "active"
       };
       await assertWorkspacePath(projectRoot, runRoot, workspacePath);
@@ -393,40 +417,40 @@ export class WorkspaceManager {
           workspaceId: integrationWorkspace.workspaceId
         }
       };
-      try {
-        this.#store.commitGitRunCreation({
-          run: activeRun,
-          workspace: integrationWorkspace,
-          event: createdEvent
-        });
-        durableCreation = true;
-      } catch (error) {
-        durableCreation = this.#creationIsDurable(
-          activeRun,
-          integrationWorkspace,
-          createdEvent.id
-        );
-        throw error;
-      }
+      this.#commitRunCreationDurably(
+        activeRun,
+        integrationWorkspace,
+        createdEvent
+      );
       return activeRun;
     } catch (error) {
-      if (durableCreation) throw error;
       const cleaned = await this.#cleanupPartial({
         projectRoot,
         runRoot,
         path: workspacePath,
         ref,
         head: baseline.baseCommit,
-        pathWasAbsent,
-        refWasAbsent
+        pathOwned,
+        refOwned
       });
-      this.#store.putGitRun({
+      const failedRun: GitRunRecord = {
         ...intent,
         status: error instanceof WorkspaceTamperError || !cleaned
           ? "tampered"
           : "creating",
         updatedAt: new Date().toISOString()
-      });
+      };
+      this.#store.putGitRun(failedRun);
+      if (cleaned) {
+        this.#commitWorkspaceDurably(
+          integrationIntent,
+          workspaceEvent(
+            "git.workspace.removed",
+            this.#actorId,
+            integrationIntent
+          )
+        );
+      }
       throw error;
     }
   }
@@ -443,7 +467,7 @@ export class WorkspaceManager {
       employeeId,
       kind: "task",
       workspaceId: `${runId}:task:${employeeId}:${taskId}`,
-      directoryName: `task-${employeeId}-${taskId}`,
+      pathSegments: ["tasks", employeeId, taskId],
       ref: taskRef(runId, employeeId, taskId),
       baseCommit: input.baseCommit
     });
@@ -460,7 +484,7 @@ export class WorkspaceManager {
       employeeId: null,
       kind: "candidate",
       workspaceId: `${runId}:candidate:${attemptId}`,
-      directoryName: `candidate-${attemptId}`,
+      pathSegments: ["candidates", attemptId],
       ref: candidateRef(runId, attemptId),
       baseCommit: input.baseCommit
     });
@@ -484,18 +508,25 @@ export class WorkspaceManager {
         ? { ...workspace, status: "paused" }
         : workspace
     );
-    this.#store.commitGitRunPause({
-      run: pausedRun,
-      workspaces: pausedWorkspaces,
-      event: {
-        id: randomUUID(),
-        type: "git.run.paused",
-        actorId: this.#actorId,
-        taskId: null,
-        causationEventId: null,
-        payload: { runId: validatedRunId }
+    const pausedEvent: NewEvent = {
+      id: randomUUID(),
+      type: "git.run.paused",
+      actorId: this.#actorId,
+      taskId: null,
+      causationEventId: null,
+      payload: { runId: validatedRunId }
+    };
+    try {
+      this.#store.commitGitRunPause({
+        run: pausedRun,
+        workspaces: pausedWorkspaces,
+        event: pausedEvent
+      });
+    } catch (error) {
+      if (!this.#pauseIsDurable(pausedRun, pausedWorkspaces, pausedEvent)) {
+        throw error;
       }
-    });
+    }
   }
 
   async removeVerifiedWorkspace(workspaceId: string): Promise<void> {
@@ -506,11 +537,32 @@ export class WorkspaceManager {
     if (workspace === null) {
       throw new Error(`Git workspace not found: ${workspaceId}`);
     }
-    if (workspace.status !== "completed" && workspace.status !== "paused") {
+    const run = this.#requiredRun(workspace.runId);
+    if (workspace.status === "missing") return;
+    if (
+      workspace.status !== "completed"
+      && workspace.status !== "paused"
+      && workspace.status !== "removing"
+    ) {
       throw new Error("Git workspace must be completed or paused before cleanup");
     }
-    const run = this.#requiredRun(workspace.runId);
     const runRoot = this.#runRoot(run.projectRoot, run.runId);
+    if (!await pathExists(workspace.path)) {
+      try {
+        await assertWorkspaceLocation(
+          run.projectRoot,
+          runRoot,
+          workspace.path
+        );
+      } catch (error) {
+        if (error instanceof WorkspaceTamperError) {
+          this.#persistWorkspaceTampered(workspace);
+        }
+        throw error;
+      }
+      await this.#removeMissingWorkspace(run, workspace);
+      return;
+    }
     try {
       await assertWorkspacePath(run.projectRoot, runRoot, workspace.path);
       await this.#verifyWorkspace(run.projectRoot, workspace);
@@ -529,6 +581,7 @@ export class WorkspaceManager {
       throw new Error("Git workspace has uncommitted changes");
     }
 
+    const removingWorkspace = this.#prepareWorkspaceRemoval(workspace);
     await this.#git.run(
       ["worktree", "remove", "--", workspace.path],
       { cwd: run.projectRoot }
@@ -548,22 +601,22 @@ export class WorkspaceManager {
       }
     } catch (error) {
       if (error instanceof WorkspaceTamperError) {
-        this.#persistWorkspaceTampered(workspace);
+        this.#persistWorkspaceTampered(removingWorkspace);
       }
       throw error;
     }
     const removedWorkspace: GitWorkspaceRecord = {
-      ...workspace,
+      ...removingWorkspace,
       status: "missing"
     };
-    this.#store.commitGitWorkspace({
-      workspace: removedWorkspace,
-      event: workspaceEvent(
+    this.#commitWorkspaceDurably(
+      removedWorkspace,
+      workspaceEvent(
         "git.workspace.removed",
         this.#actorId,
         removedWorkspace
       )
-    });
+    );
   }
 
   async #createWorkspace(input: {
@@ -572,7 +625,7 @@ export class WorkspaceManager {
     employeeId: string | null;
     kind: "task" | "candidate";
     workspaceId: string;
-    directoryName: string;
+    pathSegments: readonly string[];
     ref: string;
     baseCommit: string;
   }): Promise<GitWorkspaceRecord> {
@@ -585,7 +638,7 @@ export class WorkspaceManager {
     }
     objectId(input.baseCommit, run.baseCommit.length, "workspace base commit");
     const runRoot = this.#runRoot(run.projectRoot, run.runId);
-    const workspacePath = resolve(runRoot, input.directoryName);
+    const workspacePath = resolve(runRoot, ...input.pathSegments);
     const intent: GitWorkspaceRecord = {
       workspaceId: input.workspaceId,
       runId: input.runId,
@@ -600,15 +653,12 @@ export class WorkspaceManager {
     };
     this.#store.putGitWorkspace(intent);
 
-    let pathWasAbsent = false;
-    let refWasAbsent = false;
-    let durableCreation = false;
+    let pathOwned = false;
+    let refOwned = false;
     try {
       await assertNoPathRedirect(run.projectRoot, workspacePath);
       await this.#assertPathAbsent(workspacePath);
-      pathWasAbsent = true;
       await this.#assertRefAbsent(run.projectRoot, input.ref);
-      refWasAbsent = true;
       await this.#assertCommit(run.projectRoot, input.baseCommit);
       await mkdir(runRoot, { recursive: true });
       await assertNoPathRedirect(run.projectRoot, workspacePath);
@@ -621,6 +671,8 @@ export class WorkspaceManager {
         workspacePath,
         input.baseCommit
       ], { cwd: run.projectRoot });
+      pathOwned = true;
+      refOwned = true;
 
       const active: GitWorkspaceRecord = {
         ...intent,
@@ -633,36 +685,35 @@ export class WorkspaceManager {
         this.#actorId,
         active
       );
-      try {
-        this.#store.commitGitWorkspace({
-          workspace: active,
-          event: createdEvent
-        });
-        durableCreation = true;
-      } catch (error) {
-        durableCreation = this.#workspaceCreationIsDurable(
-          active,
-          createdEvent.id
-        );
-        throw error;
-      }
+      this.#commitWorkspaceDurably(active, createdEvent);
       return active;
     } catch (error) {
-      if (durableCreation) throw error;
       const cleaned = await this.#cleanupPartial({
         projectRoot: run.projectRoot,
         runRoot,
         path: workspacePath,
         ref: input.ref,
         head: input.baseCommit,
-        pathWasAbsent,
-        refWasAbsent
+        pathOwned,
+        refOwned
       });
       const status: GitWorkspaceStatus =
         error instanceof WorkspaceTamperError || !cleaned
           ? "tampered"
           : "missing";
-      this.#store.putGitWorkspace({ ...intent, status });
+      const rolledBack = { ...intent, status };
+      if (cleaned) {
+        this.#commitWorkspaceDurably(
+          rolledBack,
+          workspaceEvent(
+            "git.workspace.removed",
+            this.#actorId,
+            rolledBack
+          )
+        );
+      } else {
+        this.#store.putGitWorkspace(rolledBack);
+      }
       throw error;
     }
   }
@@ -670,7 +721,95 @@ export class WorkspaceManager {
   #requiredRun(runId: string): GitRunRecord {
     const run = this.#store.getGitRun(runId);
     if (run === null) throw new Error(`Git run not found: ${runId}`);
+    if (run.companyId !== this.#companyId) {
+      throw new Error(
+        `Git run company ownership mismatch: ${runId}`
+      );
+    }
     return run;
+  }
+
+  #prepareWorkspaceRemoval(
+    workspace: GitWorkspaceRecord
+  ): GitWorkspaceRecord {
+    if (workspace.status === "removing") return workspace;
+    const removing: GitWorkspaceRecord = {
+      ...workspace,
+      status: "removing"
+    };
+    this.#commitWorkspaceDurably(
+      removing,
+      workspaceEvent(
+        "git.workspace.removal_prepared",
+        this.#actorId,
+        removing
+      )
+    );
+    return removing;
+  }
+
+  async #removeMissingWorkspace(
+    run: GitRunRecord,
+    workspace: GitWorkspaceRecord
+  ): Promise<void> {
+    const entries = await this.#listWorktrees(run.projectRoot);
+    const matching = entries.filter(
+      (entry) => pathKey(entry.path) === pathKey(workspace.path)
+    );
+    const branchHead = await this.#readRef(
+      run.projectRoot,
+      workspace.branchRef
+    );
+    const exactEntry = matching.length === 1
+      && matching[0]?.branchRef === workspace.branchRef
+      && matching[0]?.head === workspace.headCommit;
+    if (
+      matching.length > 1
+      || (matching.length === 1 && !exactEntry)
+      || branchHead !== workspace.headCommit
+    ) {
+      const error = new WorkspaceTamperError(
+        "missing workspace metadata contradicted persisted branch ref or head facts"
+      );
+      this.#persistWorkspaceTampered(workspace);
+      throw error;
+    }
+
+    const removing = this.#prepareWorkspaceRemoval(workspace);
+    if (exactEntry) {
+      await this.#git.run(
+        ["worktree", "remove", "--force", "--", workspace.path],
+        { cwd: run.projectRoot }
+      );
+    }
+    const entriesAfter = await this.#listWorktrees(run.projectRoot);
+    if (entriesAfter.some(
+      (entry) => pathKey(entry.path) === pathKey(workspace.path)
+    )) {
+      const error = new WorkspaceTamperError(
+        "stale Git worktree metadata removal could not be verified"
+      );
+      this.#persistWorkspaceTampered(removing);
+      throw error;
+    }
+    if (
+      await this.#readRef(run.projectRoot, workspace.branchRef)
+      !== workspace.headCommit
+    ) {
+      const error = new WorkspaceTamperError(
+        "workspace branch ref changed during stale metadata cleanup"
+      );
+      this.#persistWorkspaceTampered(removing);
+      throw error;
+    }
+    const removed: GitWorkspaceRecord = {
+      ...removing,
+      status: "missing"
+    };
+    this.#commitWorkspaceDurably(
+      removed,
+      workspaceEvent("git.workspace.removed", this.#actorId, removed)
+    );
   }
 
   #persistWorkspaceTampered(workspace: GitWorkspaceRecord): void {
@@ -678,37 +817,75 @@ export class WorkspaceManager {
       ...workspace,
       status: "tampered"
     };
-    this.#store.commitGitWorkspace({
-      workspace: tampered,
-      event: workspaceEvent(
+    this.#commitWorkspaceDurably(
+      tampered,
+      workspaceEvent(
         "git.workspace.tampered",
         this.#actorId,
         tampered
       )
-    });
+    );
   }
 
-  #creationIsDurable(
+  #commitRunCreationDurably(
     run: GitRunRecord,
     workspace: GitWorkspaceRecord,
-    eventId: string
-  ): boolean {
-    return sameRun(this.#store.getGitRun(run.runId), run)
+    event: NewEvent
+  ): void {
+    try {
+      this.#store.commitGitRunCreation({ run, workspace, event });
+    } catch (error) {
+      const durable = sameRun(this.#store.getGitRun(run.runId), run)
       && sameWorkspace(
         this.#store.getGitWorkspace(workspace.workspaceId),
         workspace
       )
-      && this.#store.listEvents(0).some((event) => event.id === eventId);
+      && this.#eventIsDurable(event);
+      if (!durable) throw error;
+    }
   }
 
-  #workspaceCreationIsDurable(
+  #commitWorkspaceDurably(
     workspace: GitWorkspaceRecord,
-    eventId: string
+    event: NewEvent
+  ): void {
+    try {
+      this.#store.commitGitWorkspace({ workspace, event });
+    } catch (error) {
+      if (
+        !sameWorkspace(
+          this.#store.getGitWorkspace(workspace.workspaceId),
+          workspace
+        )
+        || !this.#eventIsDurable(event)
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  #pauseIsDurable(
+    run: GitRunRecord,
+    workspaces: readonly GitWorkspaceRecord[],
+    event: NewEvent
   ): boolean {
-    return sameWorkspace(
-      this.#store.getGitWorkspace(workspace.workspaceId),
-      workspace
-    ) && this.#store.listEvents(0).some((event) => event.id === eventId);
+    const persisted = this.#store.listGitWorkspaces(run.runId);
+    return sameRun(this.#store.getGitRun(run.runId), run)
+      && persisted.length === workspaces.length
+      && workspaces.every((workspace) => sameWorkspace(
+        persisted.find(({ workspaceId }) =>
+          workspaceId === workspace.workspaceId
+        ) ?? null,
+        workspace
+      ))
+      && this.#eventIsDurable(event);
+  }
+
+  #eventIsDurable(event: NewEvent): boolean {
+    return sameEvent(
+      this.#store.listEvents(0).find(({ id }) => id === event.id),
+      event
+    );
   }
 
   #runRoot(projectRoot: string, runId: string): string {
@@ -804,11 +981,11 @@ export class WorkspaceManager {
     path: string;
     ref: string;
     head: string;
-    pathWasAbsent: boolean;
-    refWasAbsent: boolean;
+    pathOwned: boolean;
+    refOwned: boolean;
   }): Promise<boolean> {
     try {
-      if (!input.pathWasAbsent) return false;
+      if (!input.pathOwned || !input.refOwned) return false;
       const pathPresent = await pathExists(input.path);
       const entries = await this.#listWorktrees(input.projectRoot);
       const matchingEntries = entries.filter(
@@ -839,7 +1016,7 @@ export class WorkspaceManager {
 
       const currentHead = await this.#readRef(input.projectRoot, input.ref);
       if (currentHead === null) return true;
-      if (!input.refWasAbsent || currentHead !== input.head) return false;
+      if (currentHead !== input.head) return false;
       await this.#git.run(
         ["update-ref", "-d", input.ref, input.head],
         { cwd: input.projectRoot }
