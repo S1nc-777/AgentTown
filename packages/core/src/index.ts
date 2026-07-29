@@ -31,3 +31,16 @@ export {
   type PauseReason,
   type RecoveryResult
 } from "./lifecycle/checkpoint-service.js";
+export {
+  GitCommandError,
+  GitCommandRunner,
+  GitCommandTimeoutError,
+  GitOutputOverflowError,
+  type GitCommandOptions,
+  type GitCommandResult,
+  type GitCommandRunnerOptions
+} from "./git/git-command.js";
+export {
+  RepositoryPreflight,
+  type RepositoryBaseline
+} from "./git/repository-preflight.js";
