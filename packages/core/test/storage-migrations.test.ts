@@ -15,6 +15,7 @@ import type {
   ValidationRunRecord
 } from "@agenttown/runtime-contract";
 import { CoreStore, type NewEvent } from "../src/storage/core-store.js";
+import { CORE_SCHEMA_SQL } from "../src/storage/schema.js";
 import { companyDefinitionFixture } from "./helpers.js";
 
 const temporaryPaths: string[] = [];
@@ -193,6 +194,33 @@ function createMalformedV2Database(): string {
   return path;
 }
 
+function createConstraintDriftVersionZeroDatabase(): string {
+  const path = temporaryDatabasePath();
+  const database = new DatabaseSync(path);
+  database.exec(P1A_SCHEMA_SQL.replace(
+    "id TEXT PRIMARY KEY,\n  definition_json",
+    "id TEXT,\n  definition_json"
+  ));
+  database.prepare(`
+    INSERT INTO companies (id, definition_json, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run("company", "{}", "active", "created", "updated");
+  database.close();
+  return path;
+}
+
+function createConstraintDriftV2Database(): string {
+  const path = temporaryDatabasePath();
+  const database = new DatabaseSync(path);
+  database.exec(CORE_SCHEMA_SQL.replace(
+    "integration_ref TEXT NOT NULL UNIQUE",
+    "integration_ref TEXT NOT NULL"
+  ));
+  database.exec("PRAGMA user_version = 2");
+  database.close();
+  return path;
+}
+
 function readUserVersion(path: string): number {
   const database = new DatabaseSync(path);
   try {
@@ -215,6 +243,33 @@ function listTableNames(path: string): string[] {
       ORDER BY name
     `).all() as Array<{ name: string }>;
     return rows.map(({ name }) => name);
+  } finally {
+    database.close();
+  }
+}
+
+function readSchemaLayout(path: string): unknown[] {
+  const database = new DatabaseSync(path);
+  try {
+    return database.prepare(`
+      SELECT type, name, tbl_name, sql
+      FROM sqlite_schema
+      WHERE name NOT LIKE 'sqlite_%'
+      ORDER BY type, name
+    `).all() as unknown[];
+  } finally {
+    database.close();
+  }
+}
+
+function countCompanies(path: string): number {
+  const database = new DatabaseSync(path);
+  try {
+    const row = database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM companies
+    `).get() as { count: number };
+    return row.count;
   } finally {
     database.close();
   }
@@ -493,6 +548,20 @@ describe("Core schema migrations", () => {
     }
   });
 
+  it("rejects a version-zero P1A lookalike with primary-key drift without mutation", () => {
+    const databasePath = createConstraintDriftVersionZeroDatabase();
+    const before = readSchemaLayout(databasePath);
+    const store = new CoreStore(databasePath);
+    try {
+      expect(() => store.initialize()).toThrow("schema migration");
+      expect(readUserVersion(databasePath)).toBe(0);
+      expect(readSchemaLayout(databasePath)).toEqual(before);
+      expect(countCompanies(databasePath)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it("rejects a future schema version without mutating it", () => {
     const databasePath = createFutureDatabase();
     const store = new CoreStore(databasePath);
@@ -513,6 +582,19 @@ describe("Core schema migrations", () => {
       expect(() => store.initialize()).toThrow("schema migration");
       expect(readUserVersion(databasePath)).toBe(2);
       expect(listTableNames(databasePath)).toEqual(before);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a v2 lookalike with required-unique-index drift without mutation", () => {
+    const databasePath = createConstraintDriftV2Database();
+    const before = readSchemaLayout(databasePath);
+    const store = new CoreStore(databasePath);
+    try {
+      expect(() => store.initialize()).toThrow("schema migration");
+      expect(readUserVersion(databasePath)).toBe(2);
+      expect(readSchemaLayout(databasePath)).toEqual(before);
     } finally {
       store.close();
     }
@@ -742,6 +824,115 @@ describe("typed Git fact storage", () => {
     }
   });
 
+  it("rejects reparenting an existing prepared attempt and preserves linked facts", () => {
+    const store = initializedStore();
+    try {
+      const originalAttempt = preparedAttempt();
+      const originalSubmission = gitSubmission();
+      const linkedValidation = {
+        ...validationRun(),
+        integrationAttemptId: "attempt-1"
+      };
+      store.putIntegrationAttempt(originalAttempt);
+      store.putGitSubmission(originalSubmission);
+      store.putValidationRun(linkedValidation);
+
+      const reparentedAttempt = {
+        ...originalAttempt,
+        taskId: "task-2"
+      };
+      expect(() => store.commitPreparedIntegration({
+        attempt: reparentedAttempt,
+        submission: gitSubmission({ taskId: "task-2" }),
+        event: {
+          ...event("reparented-attempt", "git.integration.prepared"),
+          taskId: "task-2"
+        }
+      })).toThrow("immutable");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(originalAttempt);
+      expect(store.getGitSubmission("run-1", "task-1", 1))
+        .toEqual(originalSubmission);
+      expect(store.getGitSubmission("run-1", "task-2", 1)).toBeNull();
+      expect(store.getValidationRun("validation-1")).toEqual(linkedValidation);
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual(["company-created"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects changing the submission revision of an existing prepared attempt", () => {
+    const store = initializedStore();
+    try {
+      const originalAttempt = preparedAttempt();
+      store.putIntegrationAttempt(originalAttempt);
+      store.putGitSubmission(gitSubmission());
+
+      expect(() => store.commitPreparedIntegration({
+        attempt: {
+          ...originalAttempt,
+          submissionRevision: 2
+        },
+        submission: gitSubmission({ revision: 2 }),
+        event: event("revised-attempt", "git.integration.prepared")
+      })).toThrow("immutable");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(originalAttempt);
+      expect(store.getGitSubmission("run-1", "task-1", 2)).toBeNull();
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual(["company-created"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a prepared integration event outside the bundle task", () => {
+    const store = initializedStore();
+    try {
+      expect(() => store.commitPreparedIntegration({
+        attempt: preparedAttempt(),
+        submission: gitSubmission(),
+        event: {
+          ...event("wrong-task-event", "git.integration.prepared"),
+          taskId: null
+        }
+      })).toThrow("event taskId");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toBeNull();
+      expect(store.listGitSubmissions("run-1")).toEqual([]);
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual(["company-created"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects writing linked validation ownership that contradicts an attempt", () => {
+    const store = initializedStore();
+    try {
+      store.putGitRun(gitRun({
+        runId: "run-2",
+        projectRoot: "C:\\project-2",
+        integrationRef: "refs/agenttown/runs/run-2/integration"
+      }));
+      const attempt = preparedAttempt();
+      const contradictoryValidation = {
+        ...validationRun(),
+        runId: "run-2",
+        taskId: "task-2",
+        integrationAttemptId: "attempt-1"
+      };
+      store.putIntegrationAttempt(attempt);
+      expect(() => store.putValidationRun(contradictoryValidation))
+        .toThrow("linked validation");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(attempt);
+      expect(store.getGitSubmission("run-1", "task-1", 1)).toBeNull();
+      expect(store.getValidationRun("validation-1")).toBeNull();
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual(["company-created"]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("commits an integrated task, attempt, submission and events atomically", () => {
     const store = initializedStore();
     try {
@@ -772,6 +963,132 @@ describe("typed Git fact storage", () => {
         "task-running",
         "integration-committed",
         "task-completed"
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects reparenting an existing attempt through the integrated bundle", () => {
+    const store = initializedStore();
+    try {
+      const originalAttempt = preparedAttempt();
+      const originalSubmission = gitSubmission({ status: "queued" });
+      const runningTask = task("running");
+      store.putTask("company", runningTask, [event("task-running", "task.running")]);
+      store.putIntegrationAttempt(originalAttempt);
+      store.putGitSubmission(originalSubmission);
+
+      expect(() => store.commitIntegratedTask({
+        attempt: {
+          ...originalAttempt,
+          taskId: "task-2",
+          status: "committed"
+        },
+        submission: gitSubmission({
+          taskId: "task-2",
+          status: "integrated"
+        }),
+        task: {
+          ...task("completed"),
+          id: "task-2"
+        },
+        events: [{
+          ...event("reparented-commit", "git.integration.committed"),
+          taskId: "task-2"
+        }]
+      })).toThrow("immutable");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(originalAttempt);
+      expect(store.getGitSubmission("run-1", "task-1", 1))
+        .toEqual(originalSubmission);
+      expect(store.getGitSubmission("run-1", "task-2", 1)).toBeNull();
+      expect(store.getTask("company", "task-1")).toEqual(runningTask);
+      expect(store.getTask("company", "task-2")).toBeNull();
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual([
+        "company-created",
+        "task-running"
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects changing an existing attempt revision through the integrated bundle", () => {
+    const store = initializedStore();
+    try {
+      const originalAttempt = preparedAttempt();
+      const runningTask = task("running");
+      store.putTask("company", runningTask, [event("task-running", "task.running")]);
+      store.putIntegrationAttempt(originalAttempt);
+      store.putGitSubmission(gitSubmission({ status: "queued" }));
+
+      expect(() => store.commitIntegratedTask({
+        attempt: {
+          ...originalAttempt,
+          submissionRevision: 2,
+          status: "committed"
+        },
+        submission: gitSubmission({
+          revision: 2,
+          status: "integrated"
+        }),
+        task: task("completed"),
+        events: [event("revised-commit", "git.integration.committed")]
+      })).toThrow("immutable");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(originalAttempt);
+      expect(store.getGitSubmission("run-1", "task-1", 2)).toBeNull();
+      expect(store.getTask("company", "task-1")).toEqual(runningTask);
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual([
+        "company-created",
+        "task-running"
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects an integrated bundle when any event targets another task", () => {
+    const store = initializedStore();
+    try {
+      const originalAttempt = preparedAttempt();
+      const originalSubmission = gitSubmission({ status: "queued" });
+      const runningTask = task("running");
+      const linkedValidation = {
+        ...validationRun(),
+        integrationAttemptId: "attempt-1"
+      };
+      store.putTask("company", runningTask, [event("task-running", "task.running")]);
+      store.putIntegrationAttempt(originalAttempt);
+      store.putGitSubmission(originalSubmission);
+      store.putValidationRun(linkedValidation);
+
+      expect(() => store.commitIntegratedTask({
+        attempt: {
+          ...originalAttempt,
+          status: "committed",
+          candidateCommit: "c".repeat(40)
+        },
+        submission: gitSubmission({ status: "integrated" }),
+        task: task("completed"),
+        events: [
+          event("integration-commit", "git.integration.committed"),
+          {
+            ...event("wrong-task-completion", "task.completed"),
+            taskId: null
+          }
+        ]
+      })).toThrow("event taskId");
+
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(originalAttempt);
+      expect(store.getGitSubmission("run-1", "task-1", 1))
+        .toEqual(originalSubmission);
+      expect(store.getTask("company", "task-1")).toEqual(runningTask);
+      expect(store.getValidationRun("validation-1")).toEqual(linkedValidation);
+      expect(store.listEvents(0).map(({ id }) => id)).toEqual([
+        "company-created",
+        "task-running"
       ]);
     } finally {
       store.close();

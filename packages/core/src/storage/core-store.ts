@@ -278,6 +278,17 @@ function assertIntegrationFactsMatch(
   }
 }
 
+function assertTaskScopedEvents(
+  taskId: string,
+  events: readonly NewEvent[]
+): void {
+  for (const event of events) {
+    if (event.taskId !== taskId) {
+      throw new Error(`integration event taskId must match bundle taskId: ${taskId}`);
+    }
+  }
+}
+
 function parseGitRunRow(row: DatabaseRow): GitRunRecord {
   return {
     runId: readString(row, "run_id"),
@@ -758,6 +769,19 @@ export class CoreStore {
 
   putValidationRun(validation: ValidationRunRecord): void {
     this.inTransaction(() => {
+      if (validation.integrationAttemptId !== null) {
+        const attempt = this.getIntegrationAttempt(validation.integrationAttemptId);
+        if (
+          attempt === null
+          || validation.runId !== attempt.runId
+          || validation.taskId !== attempt.taskId
+        ) {
+          throw new Error(
+            `linked validation ownership must match integration attempt: `
+            + validation.integrationAttemptId
+          );
+        }
+      }
       this.#database.prepare(`
         INSERT INTO validation_runs (
           validation_id,
@@ -978,6 +1002,7 @@ export class CoreStore {
     event: NewEvent;
   }): void {
     assertIntegrationFactsMatch(input.attempt, input.submission);
+    assertTaskScopedEvents(input.attempt.taskId, [input.event]);
     const insertedEvent = this.inTransaction(() => {
       this.#putIntegrationAttemptRow(input.attempt);
       this.#putGitSubmissionRow(input.submission);
@@ -996,6 +1021,7 @@ export class CoreStore {
       throw new Error("commitIntegratedTask requires at least one event");
     }
     assertIntegrationFactsMatch(input.attempt, input.submission, input.task);
+    assertTaskScopedEvents(input.attempt.taskId, input.events);
     const insertedEvents = this.inTransaction(() => {
       const run = this.getGitRun(input.attempt.runId);
       if (run === null) {
@@ -1398,6 +1424,32 @@ export class CoreStore {
   }
 
   #putIntegrationAttemptRow(attempt: IntegrationAttemptRecord): void {
+    const existing = this.getIntegrationAttempt(attempt.attemptId);
+    if (
+      existing !== null
+      && (
+        existing.runId !== attempt.runId
+        || existing.taskId !== attempt.taskId
+        || existing.submissionRevision !== attempt.submissionRevision
+      )
+    ) {
+      throw new Error(
+        `integration attempt immutable identity cannot change: ${attempt.attemptId}`
+      );
+    }
+    const linkedValidations = this.#database.prepare(`
+      SELECT run_id, task_id
+      FROM validation_runs
+      WHERE integration_attempt_id = ?
+    `).all(attempt.attemptId) as DatabaseRow[];
+    if (linkedValidations.some((row) =>
+      readString(row, "run_id") !== attempt.runId
+      || readNullableString(row, "task_id") !== attempt.taskId
+    )) {
+      throw new Error(
+        `linked validation ownership must match integration attempt: ${attempt.attemptId}`
+      );
+    }
     this.#database.prepare(`
       INSERT INTO integration_attempts (
         attempt_id,
