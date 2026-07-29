@@ -56,12 +56,18 @@ interface RunningCore extends ProcessCapture {
   ownedProcessInstanceIds: Set<string>;
 }
 
-function fakeOnlyEnv(): NodeJS.ProcessEnv {
+function fakeOnlyEnv(
+  startupScenarios?: Readonly<Record<string, string>>
+): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    AGENTTOWN_E2E_MODE: "1",
     AGENTTOWN_FORBID_REAL_PROBES: "1",
     AGENTTOWN_REAL_CODEX: "0",
-    AGENTTOWN_REAL_CLAUDE: "0"
+    AGENTTOWN_REAL_CLAUDE: "0",
+    AGENTTOWN_E2E_STARTUP_SCENARIOS: startupScenarios === undefined
+      ? undefined
+      : JSON.stringify(startupScenarios)
   };
 }
 
@@ -108,7 +114,10 @@ async function runCli(
   });
 }
 
-async function startCore(projectRoot: string): Promise<RunningCore> {
+async function startCore(
+  projectRoot: string,
+  startupScenarios?: Readonly<Record<string, string>>
+): Promise<RunningCore> {
   const paths = resolveAgentTownPaths(projectRoot);
   const pipeName = pipeNameForProject(projectRoot);
   const priorDiagnostics = await processDiagnostics(
@@ -138,7 +147,7 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
     detached: ownsProcessGroup,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: fakeOnlyEnv()
+    env: fakeOnlyEnv(startupScenarios)
   }), { ownsProcessGroup });
   const deadline = Date.now() + PHASE_TIMEOUT_MS;
   const readyDeadline = deadline - CLEANUP_RESERVE_MS;
@@ -437,13 +446,11 @@ describe("P1A real Fake Company lifecycle", () => {
     try {
       await initializeTemporaryGitRepository(projectRoot);
       await runCli(projectRoot, ["init", "--template", "parallel-software"]);
-      firstCore = await startCore(projectRoot);
-      await coreRequest(firstCore.client, "company.start", {
-        scenarios: {
-          "developer-a": "silent",
-          "developer-b": "silent"
-        }
+      firstCore = await startCore(projectRoot, {
+        "developer-a": "silent",
+        "developer-b": "silent"
       });
+      await coreRequest(firstCore.client, "company.start", {});
       await recordCoreProcessInstances(paths.logsDir, firstCore);
 
       lastEvents = await listEvents(firstCore.client);

@@ -48,6 +48,52 @@ export interface CoreRunHooks {
   beforeStoreOpen?(): Promise<void>;
 }
 
+export function parseE2EStartupScenarios(
+  company: CompanyDefinition,
+  env: NodeJS.ProcessEnv
+): Readonly<Record<string, string>> {
+  const raw = env.AGENTTOWN_E2E_STARTUP_SCENARIOS;
+  if (raw === undefined) return {};
+  if (
+    env.AGENTTOWN_E2E_MODE !== "1"
+    || env.AGENTTOWN_FORBID_REAL_PROBES !== "1"
+  ) {
+    throw new Error(
+      "AGENTTOWN_E2E_STARTUP_SCENARIOS requires fake-only E2E mode"
+    );
+  }
+  if (company.employees.some(({ agent }) => agent !== "fake")) {
+    throw new Error("E2E startup scenarios require an all-fake company");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error("AGENTTOWN_E2E_STARTUP_SCENARIOS must be valid JSON", {
+      cause: error
+    });
+  }
+  if (
+    parsed === null
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+  ) {
+    throw new Error("AGENTTOWN_E2E_STARTUP_SCENARIOS must be an object");
+  }
+  const roster = new Set(company.employees.map(({ id }) => id));
+  const scenarios: Record<string, string> = {};
+  for (const [employeeId, scenario] of Object.entries(parsed)) {
+    if (!roster.has(employeeId)) {
+      throw new Error(`E2E startup scenario references unknown employee: ${employeeId}`);
+    }
+    if (typeof scenario !== "string" || scenario.length === 0) {
+      throw new Error(`E2E startup scenario must be a non-empty string: ${employeeId}`);
+    }
+    scenarios[employeeId] = scenario;
+  }
+  return scenarios;
+}
+
 export function createShutdownCoordinator(options: {
   timeoutMs: number;
   pause: () => Promise<void>;
@@ -334,6 +380,10 @@ export async function runCore(
           ? "complete"
           : "idle"
     ]));
+    const startupScenarios = {
+      ...scenarios,
+      ...parseE2EStartupScenarios(company, process.env)
+    };
     const lifecycle = new CheckpointService({
       companyId: DEFAULT_COMPANY_ID,
       company,
@@ -356,10 +406,7 @@ export async function runCore(
       store,
       orchestrator: {
         dispatch: (action) => orchestrator.dispatch(action),
-        start: (overrides) => orchestrator.start({
-          ...scenarios,
-          ...overrides
-        }),
+        start: () => orchestrator.start(startupScenarios),
         stopDispatching: () => orchestrator.stopDispatching()
       },
       leases,

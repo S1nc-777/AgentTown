@@ -4,6 +4,7 @@ import {
   type ChildProcess
 } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { LIVE_ONLY_AFTER_SEQUENCE } from "@agenttown/runtime-contract";
 import { AgentTownClient } from "./client.js";
 import type { AgentTownPaths } from "./paths.js";
 
@@ -177,7 +178,7 @@ export async function startCore(input: {
     const client = await AgentTownClient.connect(
       input.pipeName,
       `cli-${randomUUID()}`,
-      Number.MAX_SAFE_INTEGER,
+      LIVE_ONLY_AFTER_SEQUENCE,
       connectBudgetMs
     );
     child.stderr?.off("data", onStderr);

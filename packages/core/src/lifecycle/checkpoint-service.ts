@@ -326,15 +326,20 @@ export class CheckpointService {
 
       const failed = await this.#cleanupWithinDeadline(deadline);
       if (failed.length > 0) {
-        this.#commitPauseFailure(failed, "cleanup_failed");
+        this.#commitSuspensionFailure(
+          failed,
+          terminalStatus,
+          "cleanup_failed"
+        );
         throw new PauseFailedError(failed);
       }
       return checkpoint;
     } catch (error) {
       if (error instanceof PauseFailedError) throw error;
       const cleanup = await this.#cleanupWithinDeadline(deadline);
-      this.#commitPauseFailure(
+      this.#commitSuspensionFailure(
         cleanup,
+        terminalStatus,
         cleanup.length === 0 ? "pause_failed" : "cleanup_failed",
         error
       );
@@ -456,11 +461,13 @@ export class CheckpointService {
     }
   }
 
-  #commitPauseFailure(
+  #commitSuspensionFailure(
     outcomes: readonly StopOutcome[],
+    terminalStatus: "paused" | "stopped",
     approvalReason: "pause_failed" | "cleanup_failed",
     cause?: unknown
   ): void {
+    const stopping = terminalStatus === "stopped";
     this.#store.commitCompanyStatusWithEvents(this.#companyId, "blocked", [
       ...outcomes.map((outcome) => this.#event(
         "session.stop_failed",
@@ -472,13 +479,25 @@ export class CheckpointService {
           error: outcome.error
         }
       )),
-      this.#event("company.pause_failed", "core", null, {
+      this.#event(
+        stopping ? "company.stop_failed" : "company.pause_failed",
+        "core",
+        null,
+        {
         employees: outcomes.map(({ employeeId }) => employeeId),
         error: cause === undefined ? null : errorMessage(cause)
-      }),
-      this.#pauseApprovalEvent(approvalReason, {
-        employees: outcomes.map(({ employeeId }) => employeeId)
-      })
+        }
+      ),
+      stopping
+        ? this.#stopApprovalEvent(
+            approvalReason === "cleanup_failed"
+              ? "stop_cleanup_failed"
+              : "stop_failed",
+            { employees: outcomes.map(({ employeeId }) => employeeId) }
+          )
+        : this.#pauseApprovalEvent(approvalReason, {
+            employees: outcomes.map(({ employeeId }) => employeeId)
+          })
     ]);
   }
 
@@ -668,6 +687,24 @@ export class CheckpointService {
       consequenceOfNonApproval: "The company remains blocked.",
       question: "How should AgentTown resolve the lifecycle cleanup failure?",
       options: ["retry_cleanup", "inspect_processes", "keep_blocked"]
+    });
+  }
+
+  #stopApprovalEvent(
+    reason: "stop_failed" | "stop_cleanup_failed",
+    payload: Record<string, unknown>
+  ): NewEvent {
+    return this.#event("user.approval.requested", "core", null, {
+      ...payload,
+      reason,
+      operation: "complete company stop",
+      impact: reason === "stop_failed"
+        ? "AgentTown could not complete the stop safely."
+        : "AgentTown cannot prove all processes stopped after the stop request.",
+      alternatives: ["retry_stop", "inspect_processes", "keep_blocked"],
+      consequenceOfNonApproval: "The company remains blocked.",
+      question: "How should AgentTown resolve the company stop failure?",
+      options: ["retry_stop", "inspect_processes", "keep_blocked"]
     });
   }
 

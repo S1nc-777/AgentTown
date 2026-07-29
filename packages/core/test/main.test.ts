@@ -10,9 +10,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { parseCompanyYaml } from "@agenttown/runtime-contract";
 import {
   assertCorePathWithinProject,
   createShutdownCoordinator,
+  parseE2EStartupScenarios,
   parseCoreArguments,
   runCore,
   validateCoreStateLayout
@@ -40,6 +42,33 @@ limits:
   max_review_loops: 1
   max_parallel_tasks: 1
 `;
+
+describe("Core-owned startup scenarios", () => {
+  const company = parseCompanyYaml(fakeCompany);
+
+  it("accepts roster-validated overrides only through the fake-only E2E seam", () => {
+    expect(parseE2EStartupScenarios(company, {
+      AGENTTOWN_E2E_MODE: "1",
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_E2E_STARTUP_SCENARIOS: JSON.stringify({
+        leader: "silent"
+      })
+    })).toEqual({ leader: "silent" });
+
+    expect(() => parseE2EStartupScenarios(company, {
+      AGENTTOWN_E2E_STARTUP_SCENARIOS: JSON.stringify({
+        leader: "silent"
+      })
+    })).toThrow("E2E mode");
+    expect(() => parseE2EStartupScenarios(company, {
+      AGENTTOWN_E2E_MODE: "1",
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_E2E_STARTUP_SCENARIOS: JSON.stringify({
+        invented: "silent"
+      })
+    })).toThrow("unknown employee");
+  });
+});
 
 describe("Core entrypoint arguments", () => {
   const valid = [

@@ -228,7 +228,9 @@ class RecordingOrchestrator {
   readonly actions: ActionProposal[] = [];
   stopDispatchingCalls = 0;
 
-  async start(scenarios: Readonly<Record<string, string>>): Promise<void> {
+  async start(
+    scenarios: Readonly<Record<string, string>> = {}
+  ): Promise<void> {
     this.starts.push(scenarios);
   }
 
@@ -290,7 +292,7 @@ class BlockingOrchestrator extends RecordingOrchestrator {
   }
 
   override async start(
-    scenarios: Readonly<Record<string, string>>
+    scenarios: Readonly<Record<string, string>> = {}
   ): Promise<void> {
     this.starts.push(scenarios);
     this.#resolveStarted?.();
@@ -321,7 +323,7 @@ class SharedGateOrchestrator extends RecordingOrchestrator {
   }
 
   override async start(
-    scenarios: Readonly<Record<string, string>>
+    scenarios: Readonly<Record<string, string>> = {}
   ): Promise<void> {
     this.starts.push(scenarios);
     this.#resolveStarted?.();
@@ -335,7 +337,7 @@ class SharedGateOrchestrator extends RecordingOrchestrator {
 
 class FailingStartOrchestrator extends RecordingOrchestrator {
   override async start(
-    scenarios: Readonly<Record<string, string>>
+    scenarios: Readonly<Record<string, string>> = {}
   ): Promise<void> {
     this.starts.push(scenarios);
     throw new Error("injected start failure");
@@ -432,6 +434,42 @@ afterEach(async () => {
 });
 
 describe.runIf(process.platform === "win32")("CoreServer", () => {
+  it("uses live-only handshake as a captured cursor and streams future events", async () => {
+    const { pipeName, store } = await createServer();
+    for (let index = 0; index < 301; index += 1) {
+      storeTestEvent(store, `history-${index}`);
+    }
+    const client = await connectClient(pipeName);
+
+    await expect(client.handshake(
+      "live-only-client",
+      Number.MAX_SAFE_INTEGER
+    )).resolves.toMatchObject({ ok: true });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    expect(client.eventCount).toBe(0);
+
+    storeTestEvent(store, "future-event");
+    await expect(client.nextEvent()).resolves.toMatchObject({
+      type: "future-event",
+      sequence: 302
+    });
+  });
+
+  it("does not pass client-controlled scenarios into company startup", async () => {
+    const orchestrator = new RecordingOrchestrator();
+    const { pipeName } = await createServer({ orchestrator });
+    const client = await connectClient(pipeName);
+    await client.handshake("scenario-injection-client");
+
+    await expect(client.request("company.start", {
+      scenarios: {
+        leader: "crash",
+        developer: "malformed-once"
+      }
+    })).resolves.toMatchObject({ ok: true });
+    expect(orchestrator.starts).toEqual([{}]);
+  });
+
   it("never reexecutes an evicted mutation after 1025 later mutations", async () => {
     const orchestrator = new RecordingOrchestrator();
     const { pipeName } = await createServer({ orchestrator });
@@ -955,10 +993,7 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     await expect(client.request("company.stop", {})).resolves.toMatchObject({
       ok: true
     });
-    expect(orchestrator.starts).toEqual([
-      { leader: "idle" },
-      { leader: "resume" }
-    ]);
+    expect(orchestrator.starts).toEqual([{}, {}]);
     expect(orchestrator.stopDispatchingCalls).toBe(2);
 
     await expect(client.request("action.dispatch", {
@@ -1202,7 +1237,7 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
 
     await expect(first).resolves.toMatchObject({ ok: true });
     await expect(closing).resolves.toBeUndefined();
-    expect(orchestrator.starts).toEqual([{ first: "scenario" }]);
+    expect(orchestrator.starts).toEqual([{}]);
   });
 
   it("hard close escalates a graceful drain blocked by a request", async () => {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const IPC_PROTOCOL_VERSION = 1 as const;
+export const LIVE_ONLY_AFTER_SEQUENCE = Number.MAX_SAFE_INTEGER;
 
 export type IpcRequest = {
   protocolVersion: 1;

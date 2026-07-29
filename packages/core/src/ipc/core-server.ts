@@ -6,6 +6,7 @@ import {
 import { createHash } from "node:crypto";
 import {
   IPC_PROTOCOL_VERSION,
+  LIVE_ONLY_AFTER_SEQUENCE,
   parseActionProposal,
   parseIpcMessage,
   type IpcEvent,
@@ -31,8 +32,10 @@ const PIPE_NAME_PATTERN = /^agenttown-[A-Za-z0-9-]+$/u;
 
 type CoreServerOrchestrator = Pick<
   CompanyOrchestrator,
-  "dispatch" | "start" | "stopDispatching"
->;
+  "dispatch" | "stopDispatching"
+> & {
+  start(): Promise<void>;
+};
 type CoreServerLifecycle = Pick<
   CheckpointService,
   "pause" | "recoverLatest" | "stop"
@@ -180,22 +183,6 @@ function nonnegativeInteger(
     );
   }
   return value as number;
-}
-
-function stringRecord(
-  value: unknown,
-  label: string
-): Readonly<Record<string, string>> {
-  if (
-    !isRecord(value) ||
-    Object.values(value).some((item) => typeof item !== "string")
-  ) {
-    throw new RequestError(
-      "invalid_params",
-      `${label} must be an object of strings`
-    );
-  }
-  return value as Record<string, string>;
 }
 
 function successResponse(requestId: string, result: unknown): IpcResponse {
@@ -911,9 +898,7 @@ export class CoreServer {
             );
           }
         }
-        await this.#orchestrator.start(
-          stringRecord(request.params.scenarios ?? {}, "scenarios")
-        );
+        await this.#orchestrator.start();
         return { status: "running" };
       case "company.pause":
         if (this.#lifecycle === undefined) {
@@ -929,9 +914,7 @@ export class CoreServer {
         return { status: "paused" };
       case "company.resume":
         if (this.#lifecycle === undefined) {
-          await this.#orchestrator.start(
-            stringRecord(request.params.scenarios ?? {}, "scenarios")
-          );
+          await this.#orchestrator.start();
           return { status: "running" };
         }
         const recovery = await this.#lifecycle.recoverLatest();
@@ -1074,7 +1057,9 @@ export class CoreServer {
       );
       connection.clientId = clientId;
     }
-    connection.afterSequence = afterSequence;
+    connection.afterSequence = afterSequence === LIVE_ONLY_AFTER_SEQUENCE
+      ? this.#store.getLatestEventSequence()
+      : afterSequence;
     this.#leases.heartbeat(clientId);
     return {
       protocolVersion: IPC_PROTOCOL_VERSION,

@@ -151,4 +151,3 @@ Vitest.
   continuation, live-only CLI history behavior, durable tombstones, and fresh
   counts.
 - [ ] Hand off to the root agent for diff review and Git operations.
-

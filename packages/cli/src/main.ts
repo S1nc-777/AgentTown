@@ -12,6 +12,7 @@ import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import {
+  LIVE_ONLY_AFTER_SEQUENCE,
   parseCompanyYaml,
   type RecoveryDecision,
   type TaskRecord
@@ -191,7 +192,7 @@ async function connectExisting(pipeName: string): Promise<AgentTownClient> {
   return AgentTownClient.connect(
     pipeName,
     `cli-${randomUUID()}`,
-    Number.MAX_SAFE_INTEGER
+    LIVE_ONLY_AFTER_SEQUENCE
   );
 }
 

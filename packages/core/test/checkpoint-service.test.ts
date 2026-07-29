@@ -203,6 +203,27 @@ describe("CheckpointService", () => {
     expect(() => paused.sessions.get("leader")).toThrow("session not started");
   });
 
+  it("audits stop cleanup failure as stop_failed with stop-specific approval semantics", async () => {
+    const { lifecycle, store } = await createHarness({
+      pauseTimeoutMs: 30,
+      stop: async () => await new Promise<never>(() => undefined),
+      forceStop: async () => await new Promise<never>(() => undefined)
+    });
+
+    await expect(lifecycle.stop()).rejects.toThrow("pause failed");
+
+    const events = store.listEvents(0);
+    expect(store.getCompany(companyId)?.status).toBe("blocked");
+    expect(events.filter(({ type }) => type === "company.stop_failed")).toHaveLength(1);
+    expect(events.filter(({ type }) => type === "company.pause_failed")).toHaveLength(0);
+    expect(events.find(({ type }) => type === "user.approval.requested")?.payload)
+      .toMatchObject({
+        reason: "stop_cleanup_failed",
+        operation: "complete company stop",
+        options: ["retry_stop", "inspect_processes", "keep_blocked"]
+      });
+  });
+
   it("checkpoints active work before stopping real Fake Agent sessions", async () => {
     const { lifecycle, store, sessions, tasks } = await (async () => {
       const harness = await createHarness();
