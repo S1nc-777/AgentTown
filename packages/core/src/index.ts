@@ -2,8 +2,10 @@ export {
   CoreStore,
   type EventRecord,
   type NewEvent,
-  type StoredCheckpoint
+  type StoredCheckpoint,
+  type StoredReviewDecision
 } from "./storage/core-store.js";
+export { migrateCoreSchema } from "./storage/migrations.js";
 export { ActionPolicy } from "./policy/action-policy.js";
 export {
   FakeAgentAdapter,

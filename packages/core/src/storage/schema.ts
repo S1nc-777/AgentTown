@@ -1,4 +1,4 @@
-export const CORE_SCHEMA_SQL = `
+export const CORE_SCHEMA_V1_SQL = `
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS companies (
@@ -120,3 +120,96 @@ CREATE TABLE IF NOT EXISTS events (
   payload_json TEXT NOT NULL
 );
 `;
+
+export const CORE_SCHEMA_V2_SQL = `
+CREATE TABLE git_runs (
+  run_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL,
+  project_root TEXT NOT NULL,
+  original_branch TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  integration_ref TEXT NOT NULL UNIQUE,
+  integration_commit TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE git_workspaces (
+  workspace_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  task_id TEXT,
+  employee_id TEXT,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL UNIQUE,
+  branch_ref TEXT NOT NULL UNIQUE,
+  base_commit TEXT NOT NULL,
+  head_commit TEXT NOT NULL,
+  status TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id)
+);
+
+CREATE TABLE git_submissions (
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  record_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  PRIMARY KEY (run_id, task_id, revision),
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id)
+);
+
+CREATE TABLE validation_runs (
+  validation_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  task_id TEXT,
+  integration_attempt_id TEXT,
+  record_json TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id),
+  FOREIGN KEY (integration_attempt_id) REFERENCES integration_attempts(attempt_id)
+);
+
+CREATE TABLE validation_command_grants (
+  grant_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  command_fingerprint TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  UNIQUE (run_id, task_id, workspace_id, command_fingerprint),
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id),
+  FOREIGN KEY (workspace_id) REFERENCES git_workspaces(workspace_id)
+);
+
+CREATE TABLE review_packages (
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  record_json TEXT NOT NULL,
+  PRIMARY KEY (run_id, task_id, revision),
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id)
+);
+
+CREATE TABLE review_decisions (
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  record_json TEXT NOT NULL,
+  PRIMARY KEY (run_id, task_id, revision),
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id)
+);
+
+CREATE TABLE integration_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  order_key TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES git_runs(run_id)
+);
+`;
+
+export const CORE_SCHEMA_SQL = `${CORE_SCHEMA_V1_SQL}\n${CORE_SCHEMA_V2_SQL}`;
