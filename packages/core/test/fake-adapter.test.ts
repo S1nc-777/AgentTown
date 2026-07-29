@@ -121,7 +121,15 @@ describe("FakeAgentAdapter", () => {
       await expect(readFile(
         join(project.root, ".agenttown", "logs", "developer.jsonl"),
         "utf8"
-      )).resolves.toContain("\"type\":\"action.proposed\"");
+      )).resolves.toEqual(expect.stringContaining(
+        "\"type\":\"adapter.process.started\""
+      ));
+      await expect(readFile(
+        join(project.root, ".agenttown", "logs", "developer.jsonl"),
+        "utf8"
+      )).resolves.toEqual(expect.stringContaining(
+        "\"type\":\"adapter.process.exited\""
+      ));
     } finally {
       await Promise.all(handles.map(async (handle) => {
         await adapter.stop(handle).catch(() => undefined);

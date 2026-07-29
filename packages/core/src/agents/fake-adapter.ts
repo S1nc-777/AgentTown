@@ -47,6 +47,7 @@ interface LiveFakeSession {
   interruptWaiters: Array<(interrupted: boolean) => void>;
   logFileDescriptor: number;
   logFileClosed: boolean;
+  processExitLogged: boolean;
   stopping: Promise<void> | null;
 }
 
@@ -377,8 +378,20 @@ export class FakeAgentAdapter implements AgentAdapter {
       interruptWaiters: [],
       logFileDescriptor,
       logFileClosed: false,
+      processExitLogged: false,
       stopping: null
     };
+    const childPid = child.pid;
+    if (!Number.isSafeInteger(childPid) || (childPid as number) <= 0) {
+      child.kill();
+      closeSync(logFileDescriptor);
+      throw new Error(`Fake Agent ${input.employeeId} did not expose a child PID`);
+    }
+    this.#writeProcessDiagnostic(live, {
+      type: "adapter.process.started",
+      employeeId: input.employeeId,
+      pid: childPid as number
+    });
     child.stdin.on("error", () => undefined);
 
     let stdoutBuffer = "";
@@ -427,11 +440,13 @@ export class FakeAgentAdapter implements AgentAdapter {
 
     live.closed = new Promise<void>((resolvePromise, reject) => {
       child.once("error", (error) => {
+        this.#writeProcessExitDiagnostic(live, null, null);
         this.#closeLogFile(live);
         lines.close(error);
         reject(error);
       });
-      child.once("close", (exitCode) => {
+      child.once("close", (exitCode, signal) => {
+        this.#writeProcessExitDiagnostic(live, exitCode, signal);
         this.#closeLogFile(live);
         for (const resolveInterrupt of live.interruptWaiters.splice(0)) {
           resolveInterrupt(false);
@@ -477,5 +492,33 @@ export class FakeAgentAdapter implements AgentAdapter {
     if (live.logFileClosed) return;
     live.logFileClosed = true;
     closeSync(live.logFileDescriptor);
+  }
+
+  #writeProcessDiagnostic(
+    live: LiveFakeSession,
+    diagnostic: Record<string, unknown>
+  ): void {
+    if (live.logFileClosed) return;
+    appendFileSync(
+      live.logFileDescriptor,
+      `${new Date().toISOString()} ${JSON.stringify(diagnostic)}\n`,
+      "utf8"
+    );
+  }
+
+  #writeProcessExitDiagnostic(
+    live: LiveFakeSession,
+    exitCode: number | null,
+    signal: NodeJS.Signals | null
+  ): void {
+    if (live.processExitLogged) return;
+    live.processExitLogged = true;
+    this.#writeProcessDiagnostic(live, {
+      type: "adapter.process.exited",
+      employeeId: live.handle.employeeId,
+      pid: live.child.pid,
+      exitCode,
+      signal
+    });
   }
 }

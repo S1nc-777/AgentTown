@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   mkdtemp,
   readdir,
@@ -15,25 +15,28 @@ import type {
   RecoveryDecision,
   TaskRecord
 } from "../../runtime-contract/src/index.js";
-import type { EventRecord } from "../../core/src/index.js";
+import { CoreStore, type EventRecord } from "../../core/src/index.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentTownClient } from "../../cli/src/client.js";
 import {
   pipeNameForProject,
   resolveAgentTownPaths
 } from "../../cli/src/paths.js";
+import {
+  CapturedProcessError,
+  capture,
+  connectOrTerminateCapturedProcess,
+  runCapturedCommand,
+  terminateCapturedProcess,
+  waitForClose,
+  type ProcessCapture
+} from "../src/process-helpers.js";
 
 const PHASE_TIMEOUT_MS = 15_000;
 const tsxImport = import.meta.resolve("tsx");
 const cliMain = fileURLToPath(new URL("../../cli/src/main.ts", import.meta.url));
 const coreMain = fileURLToPath(new URL("../../core/src/main.ts", import.meta.url));
 const roots: string[] = [];
-
-interface ProcessCapture {
-  child: ChildProcess;
-  stdout: string;
-  stderr: string;
-}
 
 interface RunningCore extends ProcessCapture {
   client: AgentTownClient;
@@ -55,51 +58,16 @@ function cliCommand(args: readonly string[]): { file: string; args: string[] } {
   };
 }
 
-function capture(child: ChildProcess): ProcessCapture {
-  const result: ProcessCapture = { child, stdout: "", stderr: "" };
-  child.stdout?.setEncoding("utf8");
-  child.stderr?.setEncoding("utf8");
-  child.stdout?.on("data", (chunk: string) => {
-    result.stdout += chunk;
-  });
-  child.stderr?.on("data", (chunk: string) => {
-    result.stderr += chunk;
-  });
-  return result;
-}
-
 async function waitForExit(
   processCapture: ProcessCapture,
   label: string,
   timeoutMs = PHASE_TIMEOUT_MS
 ): Promise<number> {
-  const existing = processCapture.child.exitCode;
-  if (existing !== null) return existing;
-  return await new Promise<number>((resolvePromise, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      processCapture.child.off("error", onError);
-      processCapture.child.off("exit", onExit);
-    };
-    const onError = (error: Error) => {
-      cleanup();
-      reject(error);
-    };
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      cleanup();
-      if (code === null) {
-        reject(new Error(`${label} exited by ${String(signal)}`));
-      } else {
-        resolvePromise(code);
-      }
-    };
-    processCapture.child.once("error", onError);
-    processCapture.child.once("exit", onExit);
-  });
+  const exit = await waitForClose(processCapture, label, timeoutMs);
+  if (exit.code === null) {
+    throw new Error(`${label} exited by ${String(exit.signal)}`);
+  }
+  return exit.code;
 }
 
 async function runCli(
@@ -107,20 +75,18 @@ async function runCli(
   args: readonly string[]
 ): Promise<ProcessCapture> {
   const command = cliCommand(args);
-  const processCapture = capture(spawn(command.file, command.args, {
-    cwd: projectRoot,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: fakeOnlyEnv()
-  }));
-  const code = await waitForExit(processCapture, `CLI ${args[0] ?? "command"}`);
-  if (code !== 0) {
-    throw new Error(
-      `CLI ${args.join(" ")} exited ${code}\n`
-      + `stdout:\n${processCapture.stdout}\nstderr:\n${processCapture.stderr}`
-    );
-  }
-  return processCapture;
+  return runCapturedCommand({
+    file: command.file,
+    args: command.args,
+    options: {
+      cwd: projectRoot,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: fakeOnlyEnv()
+    },
+    label: `CLI ${args.join(" ")}`,
+    timeoutMs: PHASE_TIMEOUT_MS
+  });
 }
 
 async function startCore(projectRoot: string): Promise<RunningCore> {
@@ -147,29 +113,63 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
     env: fakeOnlyEnv()
   }));
   const deadline = Date.now() + PHASE_TIMEOUT_MS;
-  while (!processCapture.stdout.includes("\"type\":\"core.ready\"")) {
-    if (processCapture.child.exitCode !== null) {
-      throw new Error(
-        `Core exited before ready (${processCapture.child.exitCode})\n`
-        + `stdout:\n${processCapture.stdout}\nstderr:\n${processCapture.stderr}`
-      );
+  try {
+    while (!processCapture.stdout.includes("\"type\":\"core.ready\"")) {
+      if (
+        processCapture.child.exitCode !== null
+        || processCapture.child.signalCode !== null
+      ) {
+        throw new Error(
+          `Core exited before ready (code=${String(processCapture.child.exitCode)}, `
+          + `signal=${String(processCapture.child.signalCode)})`
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Core readiness timed out after ${PHASE_TIMEOUT_MS}ms`);
+      }
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
     }
-    if (Date.now() >= deadline) {
-      processCapture.child.kill("SIGKILL");
-      throw new Error(
-        `Core readiness timed out\nstdout:\n${processCapture.stdout}\n`
-        + `stderr:\n${processCapture.stderr}`
+    const client = await connectOrTerminateCapturedProcess({
+      processCapture,
+      connect: () => AgentTownClient.connect(
+        pipeName,
+        `e2e-${randomUUID()}`,
+        0,
+        Math.max(1, deadline - Date.now())
+      ),
+      label: "Core after readiness",
+      timeoutMs: Math.max(1, deadline - Date.now())
+    });
+    return { ...processCapture, client };
+  } catch (error) {
+    if (error instanceof CapturedProcessError) throw error;
+    let cleanupError: unknown;
+    try {
+      await terminateCapturedProcess(
+        processCapture,
+        "Core startup failure",
+        PHASE_TIMEOUT_MS
       );
+    } catch (terminationError) {
+      cleanupError = terminationError;
     }
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+    throw new CapturedProcessError(
+      [
+        "Core startup failed",
+        "stdout:",
+        processCapture.stdout,
+        "stderr:",
+        processCapture.stderr
+      ].join("\n"),
+      processCapture,
+      {
+        cause: new AggregateError(
+          cleanupError === undefined ? [error] : [error, cleanupError],
+          "Core startup and cleanup failed"
+        )
+      }
+    );
   }
-  const client = await AgentTownClient.connect(
-    pipeName,
-    `e2e-${randomUUID()}`,
-    0,
-    Math.max(1, deadline - Date.now())
-  );
-  return { ...processCapture, client };
 }
 
 function action(input: {
@@ -213,6 +213,70 @@ async function listEvents(client: AgentTownClient): Promise<EventRecord[]> {
   ) as EventRecord[];
 }
 
+function readDatabaseEvents(databasePath: string): EventRecord[] {
+  const store = new CoreStore(databasePath);
+  try {
+    return store.listEvents(0);
+  } finally {
+    store.close();
+  }
+}
+
+function readDatabaseTasks(databasePath: string): TaskRecord[] {
+  const store = new CoreStore(databasePath);
+  try {
+    return store.listTasks("company");
+  } finally {
+    store.close();
+  }
+}
+
+interface ProcessDiagnostic {
+  type: "adapter.process.started" | "adapter.process.exited";
+  employeeId: string;
+  pid: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+}
+
+async function processDiagnostics(
+  logsDir: string,
+  employeeIds: readonly string[]
+): Promise<ProcessDiagnostic[]> {
+  const diagnostics: ProcessDiagnostic[] = [];
+  for (const employeeId of employeeIds) {
+    const log = await readFile(join(logsDir, `${employeeId}.jsonl`), "utf8");
+    for (const line of log.split(/\r?\n/u)) {
+      const jsonStart = line.indexOf("{");
+      if (jsonStart < 0) continue;
+      const parsed = JSON.parse(line.slice(jsonStart)) as Partial<ProcessDiagnostic>;
+      if (
+        parsed.type === "adapter.process.started"
+        || parsed.type === "adapter.process.exited"
+      ) {
+        diagnostics.push(parsed as ProcessDiagnostic);
+      }
+    }
+  }
+  return diagnostics;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error
+      && "code" in error
+      && (error as NodeJS.ErrnoException).code === "ESRCH"
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 async function coreRequest(
   client: AgentTownClient,
   method: string,
@@ -251,25 +315,17 @@ async function waitUntil(
 
 async function initializeTemporaryGitRepository(root: string): Promise<void> {
   const command = process.platform === "win32" ? "git.exe" : "git";
-  const processCapture = capture(spawn(command, ["init", "--quiet"], {
-    cwd: root,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  }));
-  const code = await waitForExit(processCapture, "git init");
-  if (code !== 0) throw new Error(`git init failed: ${processCapture.stderr}`);
-}
-
-async function terminateIfRunning(processCapture: ProcessCapture | undefined): Promise<void> {
-  if (
-    processCapture === undefined
-    || processCapture.child.exitCode !== null
-    || processCapture.child.signalCode !== null
-  ) {
-    return;
-  }
-  processCapture.child.kill("SIGKILL");
-  await waitForExit(processCapture, "forced cleanup").catch(() => undefined);
+  await runCapturedCommand({
+    file: command,
+    args: ["init", "--quiet"],
+    options: {
+      cwd: root,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    },
+    label: "git init",
+    timeoutMs: PHASE_TIMEOUT_MS
+  });
 }
 
 afterEach(async () => {
@@ -286,6 +342,7 @@ describe("P1A real Fake Company lifecycle", () => {
     let firstCore: RunningCore | undefined;
     let secondCore: RunningCore | undefined;
     let lastEvents: EventRecord[] = [];
+    let failure: unknown;
     try {
       await initializeTemporaryGitRepository(projectRoot);
       await runCli(projectRoot, ["init", "--template", "parallel-software"]);
@@ -351,11 +408,22 @@ describe("P1A real Fake Company lifecycle", () => {
           .filter(({ status }) => status === "completed").length === 2
       );
       const completed = await listTasks(firstCore.client);
-      expect(completed).toHaveLength(2);
-      expect(completed.every(({ status }) => status === "completed")).toBe(true);
-      expect(completed.every(({ artifacts, evidence }) =>
-        artifacts.length > 0 && evidence.length > 0
-      )).toBe(true);
+      expect(completed).toEqual([
+        expect.objectContaining({
+          id: "task-a",
+          status: "completed",
+          ownerEmployeeId: "developer-a",
+          artifacts: ["artifact:task-a"],
+          evidence: ["fake:test:pass"]
+        }),
+        expect.objectContaining({
+          id: "task-b",
+          status: "completed",
+          ownerEmployeeId: "developer-b",
+          artifacts: ["artifact:task-b"],
+          evidence: ["fake:test:pass"]
+        })
+      ]);
 
       lastEvents = await listEvents(firstCore.client);
       const startedSequences = lastEvents
@@ -375,6 +443,36 @@ describe("P1A real Fake Company lifecycle", () => {
         .resolves.toBe(0);
       const retainedAfterPause = await stat(paths.databasePath);
       expect(retainedAfterPause.isFile()).toBe(true);
+      const pausedEvents = readDatabaseEvents(paths.databasePath);
+      expect(pausedEvents.filter(({ type, payload }) =>
+        type === "company.checkpointed"
+        && payload.reason === "last_client_exited"
+        && payload.sessionCount === 4
+      )).toHaveLength(1);
+      const stoppedEmployees = pausedEvents
+        .filter(({ type }) => type === "session.stopped")
+        .map(({ actorId }) => actorId);
+      expect(stoppedEmployees).toHaveLength(4);
+      expect(new Set(stoppedEmployees)).toEqual(new Set([
+        "leader",
+        "developer-a",
+        "developer-b",
+        "reviewer"
+      ]));
+      const firstStopDiagnostics = await processDiagnostics(paths.logsDir, [
+        "leader",
+        "developer-a",
+        "developer-b",
+        "reviewer"
+      ]);
+      const firstStartedPids = firstStopDiagnostics
+        .filter(({ type }) => type === "adapter.process.started")
+        .map(({ pid }) => pid);
+      expect(firstStartedPids).toHaveLength(4);
+      expect(firstStopDiagnostics.filter(({ type }) =>
+        type === "adapter.process.exited"
+      )).toHaveLength(4);
+      expect(firstStartedPids.every((pid) => !isProcessAlive(pid))).toBe(true);
 
       secondCore = await startCore(projectRoot);
       const paused = await coreRequest(secondCore.client, "company.status", {
@@ -388,9 +486,22 @@ describe("P1A real Fake Company lifecycle", () => {
       expect(resumed.status).toBe("running");
       expect(resumed.decisions).toHaveLength(4);
       expect(resumed.decisions.every(({ mode }) => mode === "native")).toBe(true);
-      expect((await listTasks(secondCore.client)).every(
-        ({ status }) => status === "completed"
-      )).toBe(true);
+      expect(await listTasks(secondCore.client)).toEqual([
+        expect.objectContaining({
+          id: "task-a",
+          status: "completed",
+          ownerEmployeeId: "developer-a",
+          artifacts: ["artifact:task-a"],
+          evidence: ["fake:test:pass"]
+        }),
+        expect.objectContaining({
+          id: "task-b",
+          status: "completed",
+          ownerEmployeeId: "developer-b",
+          artifacts: ["artifact:task-b"],
+          evidence: ["fake:test:pass"]
+        })
+      ]);
       lastEvents = await listEvents(secondCore.client);
       expect(lastEvents.at(-1)!.sequence).toBeGreaterThan(preRestartSequence);
       expect(lastEvents.every((event, index) =>
@@ -406,6 +517,25 @@ describe("P1A real Fake Company lifecycle", () => {
       await runCli(projectRoot, ["stop", "--yes"]);
       await secondCore.client.close();
       await expect(waitForExit(secondCore, "second Core stop")).resolves.toBe(0);
+      expect(readDatabaseTasks(paths.databasePath)).toEqual([
+        expect.objectContaining({ id: "task-a", status: "completed" }),
+        expect.objectContaining({ id: "task-b", status: "completed" })
+      ]);
+      const allProcessDiagnostics = await processDiagnostics(paths.logsDir, [
+        "leader",
+        "developer-a",
+        "developer-b",
+        "reviewer"
+      ]);
+      const allStartedPids = allProcessDiagnostics
+        .filter(({ type }) => type === "adapter.process.started")
+        .map(({ pid }) => pid);
+      const allExitedPids = new Set(allProcessDiagnostics
+        .filter(({ type }) => type === "adapter.process.exited")
+        .map(({ pid }) => pid));
+      expect(allStartedPids).toHaveLength(8);
+      expect(allStartedPids.every((pid) => allExitedPids.has(pid))).toBe(true);
+      expect(allStartedPids.every((pid) => !isProcessAlive(pid))).toBe(true);
       await expect(readFile(paths.companyPath, "utf8"))
         .resolves.toContain("parallel-software");
       expect((await stat(paths.databasePath)).isFile()).toBe(true);
@@ -414,8 +544,21 @@ describe("P1A real Fake Company lifecycle", () => {
         ".git"
       ]);
     } catch (error) {
+      failure = error;
+      try {
+        if ((await stat(paths.databasePath)).isFile()) {
+          lastEvents = readDatabaseEvents(paths.databasePath);
+        }
+      } catch (refreshError) {
+        failure = new AggregateError(
+          [error, refreshError],
+          "E2E failed and refreshing persisted diagnostics also failed"
+        );
+      }
       console.error([
-        error instanceof Error ? error.stack ?? error.message : String(error),
+        failure instanceof Error
+          ? failure.stack ?? failure.message
+          : String(failure),
         "first Core stdout:",
         firstCore?.stdout ?? "",
         "first Core stderr:",
@@ -427,12 +570,47 @@ describe("P1A real Fake Company lifecycle", () => {
         "last 30 events:",
         JSON.stringify(lastEvents.slice(-30), null, 2)
       ].join("\n"));
-      throw error;
-    } finally {
-      await firstCore?.client.close().catch(() => undefined);
-      await secondCore?.client.close().catch(() => undefined);
-      await terminateIfRunning(firstCore);
-      await terminateIfRunning(secondCore);
+    }
+    const cleanupErrors: unknown[] = [];
+    for (const client of [firstCore?.client, secondCore?.client]) {
+      if (client === undefined) continue;
+      try {
+        await client.close();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    for (const [label, processCapture] of [
+      ["first Core cleanup", firstCore],
+      ["second Core cleanup", secondCore]
+    ] as const) {
+      if (processCapture === undefined) continue;
+      try {
+        await waitForClose(processCapture, label, PHASE_TIMEOUT_MS);
+      } catch (error) {
+        cleanupErrors.push(error);
+        try {
+          await terminateCapturedProcess(
+            processCapture,
+            label,
+            PHASE_TIMEOUT_MS
+          );
+        } catch (terminationError) {
+          cleanupErrors.push(terminationError);
+        }
+      }
+    }
+    if (failure !== undefined) {
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [failure, ...cleanupErrors],
+          "E2E failed and process cleanup was incomplete"
+        );
+      }
+      throw failure;
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, "E2E process cleanup failed");
     }
   }, 90_000);
 });
