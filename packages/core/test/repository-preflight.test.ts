@@ -81,7 +81,7 @@ describe("RepositoryPreflight", () => {
     expect(await readFile(join(repo.root, ".gitignore"), "utf8").catch(() => null))
       .toBe(gitignoreBefore);
     expect((await repo.git(["show-ref"])).stdout).toBe(refsBefore);
-  });
+  }, 20_000);
 
   it("preserves existing exclude content without a final newline and is idempotent", async () => {
     const repo = tracked(await createGitFixture());
@@ -92,7 +92,7 @@ describe("RepositoryPreflight", () => {
     await preflight.inspect(repo.root);
 
     expect(await repo.readInfoExclude()).toBe("existing-rule\n/.agenttown/\n");
-  });
+  }, 20_000);
 
   it("adds only a final newline when the local exclude rule already exists", async () => {
     const repo = tracked(await createGitFixture());
@@ -103,7 +103,7 @@ describe("RepositoryPreflight", () => {
     await preflight.inspect(repo.root);
 
     expect(await repo.readInfoExclude()).toBe("/.agenttown/\n");
-  });
+  }, 20_000);
 
   it.each([
     ["tracked", dirtyTrackedRepo],

@@ -494,43 +494,21 @@ export class CoreStore {
 
   putGitRun(run: GitRunRecord): void {
     this.inTransaction(() => {
-      this.#database.prepare(`
-        INSERT INTO git_runs (
-          run_id,
-          company_id,
-          project_root,
-          original_branch,
-          base_commit,
-          integration_ref,
-          integration_commit,
-          status,
-          created_at,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(run_id) DO UPDATE SET
-          company_id = excluded.company_id,
-          project_root = excluded.project_root,
-          original_branch = excluded.original_branch,
-          base_commit = excluded.base_commit,
-          integration_ref = excluded.integration_ref,
-          integration_commit = excluded.integration_commit,
-          status = excluded.status,
-          created_at = excluded.created_at,
-          updated_at = excluded.updated_at
-      `).run(
-        run.runId,
-        run.companyId,
-        run.projectRoot,
-        run.originalBranch,
-        run.baseCommit,
-        run.integrationRef,
-        run.integrationCommit,
-        run.status,
-        run.createdAt,
-        run.updatedAt
-      );
+      this.#putGitRunRow(run);
     });
+  }
+
+  commitGitRunCreation(input: {
+    run: GitRunRecord;
+    workspace: GitWorkspaceRecord;
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      this.#putGitRunRow(input.run);
+      this.#putGitWorkspaceRow(input.workspace);
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
   }
 
   getGitRun(runId: string): GitRunRecord | null {
@@ -575,43 +553,34 @@ export class CoreStore {
 
   putGitWorkspace(workspace: GitWorkspaceRecord): void {
     this.inTransaction(() => {
-      this.#database.prepare(`
-        INSERT INTO git_workspaces (
-          workspace_id,
-          run_id,
-          task_id,
-          employee_id,
-          kind,
-          path,
-          branch_ref,
-          base_commit,
-          head_commit,
-          status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(workspace_id) DO UPDATE SET
-          run_id = excluded.run_id,
-          task_id = excluded.task_id,
-          employee_id = excluded.employee_id,
-          kind = excluded.kind,
-          path = excluded.path,
-          branch_ref = excluded.branch_ref,
-          base_commit = excluded.base_commit,
-          head_commit = excluded.head_commit,
-          status = excluded.status
-      `).run(
-        workspace.workspaceId,
-        workspace.runId,
-        workspace.taskId,
-        workspace.employeeId,
-        workspace.kind,
-        workspace.path,
-        workspace.branchRef,
-        workspace.baseCommit,
-        workspace.headCommit,
-        workspace.status
-      );
+      this.#putGitWorkspaceRow(workspace);
     });
+  }
+
+  commitGitWorkspace(input: {
+    workspace: GitWorkspaceRecord;
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      this.#putGitWorkspaceRow(input.workspace);
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
+  }
+
+  commitGitRunPause(input: {
+    run: GitRunRecord;
+    workspaces: readonly GitWorkspaceRecord[];
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      this.#putGitRunRow(input.run);
+      for (const workspace of input.workspaces) {
+        this.#putGitWorkspaceRow(workspace);
+      }
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
   }
 
   getGitWorkspace(workspaceId: string): GitWorkspaceRecord | null {
@@ -1421,6 +1390,84 @@ export class CoreStore {
       sequence: Number(result.lastInsertRowid),
       occurredAt
     };
+  }
+
+  #putGitRunRow(run: GitRunRecord): void {
+    this.#database.prepare(`
+      INSERT INTO git_runs (
+        run_id,
+        company_id,
+        project_root,
+        original_branch,
+        base_commit,
+        integration_ref,
+        integration_commit,
+        status,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET
+        company_id = excluded.company_id,
+        project_root = excluded.project_root,
+        original_branch = excluded.original_branch,
+        base_commit = excluded.base_commit,
+        integration_ref = excluded.integration_ref,
+        integration_commit = excluded.integration_commit,
+        status = excluded.status,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at
+    `).run(
+      run.runId,
+      run.companyId,
+      run.projectRoot,
+      run.originalBranch,
+      run.baseCommit,
+      run.integrationRef,
+      run.integrationCommit,
+      run.status,
+      run.createdAt,
+      run.updatedAt
+    );
+  }
+
+  #putGitWorkspaceRow(workspace: GitWorkspaceRecord): void {
+    this.#database.prepare(`
+      INSERT INTO git_workspaces (
+        workspace_id,
+        run_id,
+        task_id,
+        employee_id,
+        kind,
+        path,
+        branch_ref,
+        base_commit,
+        head_commit,
+        status
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        task_id = excluded.task_id,
+        employee_id = excluded.employee_id,
+        kind = excluded.kind,
+        path = excluded.path,
+        branch_ref = excluded.branch_ref,
+        base_commit = excluded.base_commit,
+        head_commit = excluded.head_commit,
+        status = excluded.status
+    `).run(
+      workspace.workspaceId,
+      workspace.runId,
+      workspace.taskId,
+      workspace.employeeId,
+      workspace.kind,
+      workspace.path,
+      workspace.branchRef,
+      workspace.baseCommit,
+      workspace.headCommit,
+      workspace.status
+    );
   }
 
   #putIntegrationAttemptRow(attempt: IntegrationAttemptRecord): void {

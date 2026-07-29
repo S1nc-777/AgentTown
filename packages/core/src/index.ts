@@ -44,3 +44,12 @@ export {
   RepositoryPreflight,
   type RepositoryBaseline
 } from "./git/repository-preflight.js";
+export {
+  WorkspaceManager,
+  candidateRef,
+  integrationRef,
+  taskRef,
+  type CreateCandidateWorkspaceInput,
+  type CreateTaskWorkspaceInput,
+  type WorkspaceManagerOptions
+} from "./git/workspace-manager.js";
