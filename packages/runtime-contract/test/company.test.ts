@@ -70,4 +70,15 @@ describe("parseCompanyYaml", () => {
   ])("rejects %s configuration", (_name, text) => {
     expect(() => parseCompanyYaml(text)).toThrow();
   });
+
+  it("accepts the 100 MiB hard evidence limit", () => {
+    expect(parseCompanyYaml(`${valid}\nevidence:\n  diff_warning_bytes: 20971520\n  diff_hard_limit_bytes: 104857600\n`).evidence).toEqual({
+      diffWarningBytes: 20 * 1024 * 1024,
+      diffHardLimitBytes: 100 * 1024 * 1024
+    });
+  });
+
+  it("rejects hard evidence limits above 100 MiB", () => {
+    expect(() => parseCompanyYaml(`${valid}\nevidence:\n  diff_warning_bytes: 20971520\n  diff_hard_limit_bytes: 104857601\n`)).toThrow();
+  });
 });

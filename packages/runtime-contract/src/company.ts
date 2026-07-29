@@ -54,8 +54,8 @@ const validationInputSchema = z.object({
   integration_command_ids: z.array(employeeId)
 }).default({ commands: [], integration_command_ids: [] });
 const evidenceInputSchema = z.object({
-  diff_warning_bytes: z.number().int().min(256 * 1024).max(10 * 1024 * 1024),
-  diff_hard_limit_bytes: z.number().int().min(1024 * 1024).max(20 * 1024 * 1024)
+  diff_warning_bytes: z.number().int().min(256 * 1024).max(20 * 1024 * 1024),
+  diff_hard_limit_bytes: z.number().int().min(1024 * 1024).max(100 * 1024 * 1024)
 }).default({
   diff_warning_bytes: 2 * 1024 * 1024,
   diff_hard_limit_bytes: 20 * 1024 * 1024

@@ -101,7 +101,26 @@ describe("P1B Git contract", () => {
     })).toThrow();
   });
 
-  it("rejects a suggested validation command that exceeds the timeout limit", () => {
+  it("accepts the 3600-second validation timeout boundary", () => {
+    expect(parseGitTaskSubmission({
+      schemaVersion: 1,
+      headCommit: commit,
+      commits: [commit],
+      changeSummary: "Add greeting",
+      validationCommandIds: [],
+      suggestedValidationCommands: [{
+        id: "unit-tests",
+        executable: "pnpm",
+        args: ["test"],
+        cwd: ".",
+        timeoutSeconds: 3600
+      }],
+      reportedResults: [],
+      knownRisks: []
+    }).suggestedValidationCommands[0]?.timeoutSeconds).toBe(3600);
+  });
+
+  it("rejects validation timeouts above 3600 seconds", () => {
     expect(() => parseGitTaskSubmission({
       schemaVersion: 1,
       headCommit: commit,
@@ -113,11 +132,49 @@ describe("P1B Git contract", () => {
         executable: "pnpm",
         args: ["test"],
         cwd: ".",
-        timeoutSeconds: 601
+        timeoutSeconds: 3601
       }],
       reportedResults: [],
       knownRisks: []
     })).toThrow();
+  });
+
+  it.each(["C:outside", "c:outside"])("rejects volume-qualified cwd %s", (cwd) => {
+    expect(() => parseGitTaskSubmission({
+      schemaVersion: 1,
+      headCommit: commit,
+      commits: [commit],
+      changeSummary: "Add greeting",
+      validationCommandIds: [],
+      suggestedValidationCommands: [{
+        id: "unit-tests",
+        executable: "pnpm",
+        args: ["test"],
+        cwd,
+        timeoutSeconds: 60
+      }],
+      reportedResults: [],
+      knownRisks: []
+    })).toThrow();
+  });
+
+  it("accepts a safe relative validation cwd", () => {
+    expect(parseGitTaskSubmission({
+      schemaVersion: 1,
+      headCommit: commit,
+      commits: [commit],
+      changeSummary: "Add greeting",
+      validationCommandIds: [],
+      suggestedValidationCommands: [{
+        id: "unit-tests",
+        executable: "pnpm",
+        args: ["test"],
+        cwd: "packages/runtime-contract",
+        timeoutSeconds: 60
+      }],
+      reportedResults: [],
+      knownRisks: []
+    }).suggestedValidationCommands[0]?.cwd).toBe("packages/runtime-contract");
   });
 
   it("rejects uppercase or incorrectly sized Git and manifest hashes", () => {

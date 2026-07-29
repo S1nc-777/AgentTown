@@ -165,7 +165,7 @@ const safeIdentifier = nonEmpty.regex(/^[a-z][a-z0-9_-]*$/u);
 const gitObjectId = z.string().regex(/^[0-9a-f]{40,64}$/u);
 const manifestHash = z.string().regex(/^[0-9a-f]{64}$/u);
 const relativeCwd = nonEmpty.superRefine((cwd, context) => {
-  if (/^(?:[A-Za-z]:[\\/]|[\\/])/u.test(cwd)) {
+  if (/^(?:[A-Za-z]:|[\\/])/u.test(cwd)) {
     context.addIssue({ code: "custom", message: "cwd must be relative" });
   }
   if (cwd.split(/[\\/]/u).includes("..")) {
@@ -178,7 +178,7 @@ export const validationCommandSchema = z.object({
   executable: nonEmpty,
   args: z.array(nonEmpty),
   cwd: relativeCwd,
-  timeoutSeconds: z.number().int().min(1).max(600)
+  timeoutSeconds: z.number().int().min(1).max(3600)
 });
 
 const gitTaskSubmissionSchema = z.object({
