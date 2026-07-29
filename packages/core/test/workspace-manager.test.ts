@@ -2,7 +2,8 @@ import {
   access,
   mkdir,
   rm,
-  symlink
+  symlink,
+  writeFile
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -152,26 +153,28 @@ describe("workspace ref builders", () => {
     expect(integrationRef("run-1"))
       .toBe("refs/heads/agenttown/run-1/integration");
     expect(taskRef("run-1", "developer-a", "task-a"))
-      .toBe("refs/heads/agenttown/run-1/tasks/developer-a/task-a");
+      .toBe("refs/heads/agenttown/run-1/developer-a/task-a");
     expect(candidateRef("run-1", "attempt-a"))
-      .toBe("refs/heads/agenttown/run-1/candidates/attempt-a");
+      .toBe("refs/heads/agenttown/run-1/candidate/attempt-a");
 
     expect(() => integrationRef("../escape")).toThrow("run id");
     expect(() => taskRef("run-1", "../escape", "task-a")).toThrow("employee id");
+    expect(() => taskRef("run-1", "candidate", "task-a"))
+      .toThrow(/reserved|employee/u);
+    expect(() => taskRef("run-1", "integration", "task-a"))
+      .toThrow(/reserved|employee/u);
     expect(() => candidateRef("run-1", "refs/heads/main")).toThrow("attempt id");
   });
 
-  it("uses injective domain-separated task and candidate namespaces", () => {
+  it("keeps the public task ref contract injective with reserved roots", () => {
     const taskLeft = taskRef("run-1", "a-b", "c");
     const taskRight = taskRef("run-1", "a", "b-c");
     expect(taskLeft).not.toBe(taskRight);
-    expect(taskLeft).toBe("refs/heads/agenttown/run-1/tasks/a-b/c");
-    expect(taskRight).toBe("refs/heads/agenttown/run-1/tasks/a/b-c");
+    expect(taskLeft).toBe("refs/heads/agenttown/run-1/a-b/c");
+    expect(taskRight).toBe("refs/heads/agenttown/run-1/a/b-c");
 
-    expect(taskRef("run-1", "candidate", "attempt-a"))
-      .not.toBe(candidateRef("run-1", "attempt-a"));
-    expect(taskRef("run-1", "integration", "task-a"))
-      .not.toBe(integrationRef("run-1"));
+    expect(() => taskRef("run-1", "candidate", "attempt-a")).toThrow();
+    expect(() => taskRef("run-1", "integration", "task-a")).toThrow();
   });
 });
 
@@ -194,7 +197,7 @@ describe("WorkspaceManager", () => {
     expect(await currentBranch()).toBe(beforeBranch);
     expect(await status()).toBe(beforeStatus);
     expect(task.branchRef)
-      .toBe("refs/heads/agenttown/run-1/tasks/developer-a/task-a");
+      .toBe("refs/heads/agenttown/run-1/developer-a/task-a");
     expect(await head(task.path)).toBe(beforeHead);
     expect(store.getGitRun("run-1")).toEqual(run);
     expect(store.getGitWorkspace(task.workspaceId)).toEqual(task);
@@ -213,7 +216,7 @@ describe("WorkspaceManager", () => {
 
     expect(candidate.kind).toBe("candidate");
     expect(candidate.branchRef)
-      .toBe("refs/heads/agenttown/run-1/candidates/attempt-a");
+      .toBe("refs/heads/agenttown/run-1/candidate/attempt-a");
     expect(await head(candidate.path)).toBe(run.integrationCommit);
     await expect(manager.createCandidateWorkspace({
       runId: run.runId,
@@ -238,18 +241,6 @@ describe("WorkspaceManager", () => {
         taskId: "b-c",
         baseCommit: run.integrationCommit
       }),
-      await manager.createTaskWorkspace({
-        runId: run.runId,
-        employeeId: "candidate",
-        taskId: "attempt-a",
-        baseCommit: run.integrationCommit
-      }),
-      await manager.createTaskWorkspace({
-        runId: run.runId,
-        employeeId: "integration",
-        taskId: "task-a",
-        baseCommit: run.integrationCommit
-      }),
       await manager.createCandidateWorkspace({
         runId: run.runId,
         attemptId: "attempt-a",
@@ -257,25 +248,36 @@ describe("WorkspaceManager", () => {
       })
     ];
 
-    expect(new Set(workspaces.map(({ path }) => path))).toHaveLength(5);
-    expect(new Set(workspaces.map(({ branchRef }) => branchRef))).toHaveLength(5);
+    expect(new Set(workspaces.map(({ path }) => path))).toHaveLength(3);
+    expect(new Set(workspaces.map(({ branchRef }) => branchRef))).toHaveLength(3);
     expect(workspaces[0]?.path).toBe(join(
       repo.root,
       ".agenttown",
       "worktrees",
       "run-1",
-      "tasks",
       "a-b",
       "c"
     ));
-    expect(workspaces[4]?.path).toBe(join(
+    expect(workspaces[2]?.path).toBe(join(
       repo.root,
       ".agenttown",
       "worktrees",
       "run-1",
-      "candidates",
+      "candidate",
       "attempt-a"
     ));
+    await expect(manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "candidate",
+      taskId: "attempt-a",
+      baseCommit: run.integrationCommit
+    })).rejects.toThrow(/reserved|employee/u);
+    await expect(manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "integration",
+      taskId: "task-a",
+      baseCommit: run.integrationCommit
+    })).rejects.toThrow(/reserved|employee/u);
   }, GIT_TEST_TIMEOUT_MS);
 
   it("rejects a task path that resolves outside the run root", async () => {
@@ -325,7 +327,6 @@ describe("WorkspaceManager", () => {
         ".agenttown",
         "worktrees",
         "run-1",
-        "tasks",
         "developer-a",
         "task-a",
         "dirty.txt"
@@ -452,6 +453,48 @@ describe("WorkspaceManager", () => {
     expect(await refExists(task.branchRef)).toBe(true);
   }, GIT_TEST_TIMEOUT_MS);
 
+  it("preserves a path reoccupied during stale metadata cleanup", async () => {
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    await rm(task.path, { recursive: true, force: true });
+    const delegate = new GitCommandRunner();
+    let reoccupied = false;
+    const racingGit = {
+      async run(
+        args: readonly string[],
+        options: GitCommandOptions
+      ): Promise<GitCommandResult> {
+        const result = await delegate.run(args, options);
+        if (
+          !reoccupied
+          && args[0] === "rev-parse"
+          && args.includes(task.branchRef)
+        ) {
+          reoccupied = true;
+          await mkdir(task.path, { recursive: true });
+          await writeFile(join(task.path, "ordinary.txt"), "preserve\n");
+        }
+        return result;
+      }
+    };
+    manager = new WorkspaceManager({
+      store,
+      companyId: "company",
+      git: racingGit
+    });
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow(/reappeared|tamper|occupied/u);
+
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("tampered");
+    await expect(access(join(task.path, "ordinary.txt")))
+      .resolves.toBeUndefined();
+    expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
+      .toContain(task.path.replaceAll("\\", "/"));
+    expect(await refExists(task.branchRef)).toBe(true);
+  }, GIT_TEST_TIMEOUT_MS);
+
   it("marks a missing registered path tampered when its ref ownership contradicts facts", async () => {
     await setupRepository();
     const task = await createTaskWorkspace();
@@ -478,6 +521,29 @@ describe("WorkspaceManager", () => {
     expect(await refExists(task.branchRef)).toBe(true);
     expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
       .toContain(task.path.replaceAll("\\", "/"));
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("marks a missing recorded path tampered when its branch moved elsewhere", async () => {
+    await setupRepository();
+    const task = await createTaskWorkspace();
+    await manager.pauseRun("run-1");
+    const movedPath = join(
+      repo.root,
+      ".agenttown",
+      "worktrees",
+      "run-1",
+      "moved-task"
+    );
+    await repo.git(["worktree", "move", task.path, movedPath]);
+
+    await expect(manager.removeVerifiedWorkspace(task.workspaceId))
+      .rejects.toThrow(/another path|branch|persisted/u);
+
+    expect(store.getGitWorkspace(task.workspaceId)?.status).toBe("tampered");
+    await expect(access(movedPath)).resolves.toBeUndefined();
+    expect(await refExists(task.branchRef)).toBe(true);
+    expect((await repo.git(["worktree", "list", "--porcelain"])).stdout)
+      .toContain(movedPath.replaceAll("\\", "/"));
   }, GIT_TEST_TIMEOUT_MS);
 
   it("rejects a missing persisted path outside the exact run root as tampered", async () => {
@@ -649,7 +715,6 @@ describe("WorkspaceManager", () => {
       ".agenttown",
       "worktrees",
       "run-1",
-      "tasks",
       "developer-a",
       "task-a"
     );

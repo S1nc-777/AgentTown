@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
-  realpath
+  readFile,
+  readdir,
+  realpath,
+  rm
 } from "node:fs/promises";
 import {
   isAbsolute,
@@ -70,6 +73,16 @@ function identifier(value: string, label: string): string {
   return value;
 }
 
+function employeeIdentifier(value: string): string {
+  const employeeId = identifier(value, "employee id");
+  if (employeeId === "candidate" || employeeId === "integration") {
+    throw new TypeError(
+      `employee id uses a reserved workspace root: ${employeeId}`
+    );
+  }
+  return employeeId;
+}
+
 function objectId(value: string, length: number, label: string): string {
   if (
     (length !== 40 && length !== 64)
@@ -93,8 +106,7 @@ export function taskRef(
   return [
     "refs/heads/agenttown",
     identifier(runId, "run id"),
-    "tasks",
-    identifier(employeeId, "employee id"),
+    employeeIdentifier(employeeId),
     identifier(taskId, "task id")
   ].join("/");
 }
@@ -103,7 +115,7 @@ export function candidateRef(runId: string, attemptId: string): string {
   return [
     "refs/heads/agenttown",
     identifier(runId, "run id"),
-    "candidates",
+    "candidate",
     identifier(attemptId, "attempt id")
   ].join("/");
 }
@@ -459,7 +471,7 @@ export class WorkspaceManager {
     input: CreateTaskWorkspaceInput
   ): Promise<GitWorkspaceRecord> {
     const runId = identifier(input.runId, "run id");
-    const employeeId = identifier(input.employeeId, "employee id");
+    const employeeId = employeeIdentifier(input.employeeId);
     const taskId = identifier(input.taskId, "task id");
     return this.#createWorkspace({
       runId,
@@ -467,7 +479,7 @@ export class WorkspaceManager {
       employeeId,
       kind: "task",
       workspaceId: `${runId}:task:${employeeId}:${taskId}`,
-      pathSegments: ["tasks", employeeId, taskId],
+      pathSegments: [employeeId, taskId],
       ref: taskRef(runId, employeeId, taskId),
       baseCommit: input.baseCommit
     });
@@ -484,7 +496,7 @@ export class WorkspaceManager {
       employeeId: null,
       kind: "candidate",
       workspaceId: `${runId}:candidate:${attemptId}`,
-      pathSegments: ["candidates", attemptId],
+      pathSegments: ["candidate", attemptId],
       ref: candidateRef(runId, attemptId),
       baseCommit: input.baseCommit
     });
@@ -753,54 +765,86 @@ export class WorkspaceManager {
     workspace: GitWorkspaceRecord
   ): Promise<void> {
     const entries = await this.#listWorktrees(run.projectRoot);
-    const matching = entries.filter(
-      (entry) => pathKey(entry.path) === pathKey(workspace.path)
-    );
+    const exactEntry = this.#exactMissingWorkspaceEntry(entries, workspace);
     const branchHead = await this.#readRef(
       run.projectRoot,
       workspace.branchRef
     );
-    const exactEntry = matching.length === 1
-      && matching[0]?.branchRef === workspace.branchRef
-      && matching[0]?.head === workspace.headCommit;
-    if (
-      matching.length > 1
-      || (matching.length === 1 && !exactEntry)
-      || branchHead !== workspace.headCommit
-    ) {
-      const error = new WorkspaceTamperError(
+    if (branchHead !== workspace.headCommit) {
+      this.#throwWorkspaceTampered(
+        workspace,
         "missing workspace metadata contradicted persisted branch ref or head facts"
       );
-      this.#persistWorkspaceTampered(workspace);
-      throw error;
     }
 
     const removing = this.#prepareWorkspaceRemoval(workspace);
-    if (exactEntry) {
-      await this.#git.run(
-        ["worktree", "remove", "--force", "--", workspace.path],
-        { cwd: run.projectRoot }
+    if (exactEntry !== null) {
+      let metadataPath: string;
+      try {
+        metadataPath = await this.#exactWorktreeMetadataPath(
+          run.projectRoot,
+          workspace
+        );
+      } catch (error) {
+        if (error instanceof WorkspaceTamperError) {
+          this.#persistWorkspaceTampered(removing);
+        }
+        throw error;
+      }
+      if (await pathExists(workspace.path)) {
+        this.#throwWorkspaceTampered(
+          removing,
+          "missing workspace path reappeared before stale metadata cleanup"
+        );
+      }
+      const entriesBeforeMutation = await this.#listWorktrees(run.projectRoot);
+      const reverifiedEntry = this.#exactMissingWorkspaceEntry(
+        entriesBeforeMutation,
+        workspace
       );
+      if (
+        reverifiedEntry === null
+        || await this.#readRef(run.projectRoot, workspace.branchRef)
+          !== workspace.headCommit
+      ) {
+        this.#throwWorkspaceTampered(
+          removing,
+          "stale workspace metadata changed before exact cleanup"
+        );
+      }
+      if (await pathExists(workspace.path)) {
+        this.#throwWorkspaceTampered(
+          removing,
+          "missing workspace path reappeared before stale metadata cleanup"
+        );
+      }
+      await rm(metadataPath, { recursive: true, force: false });
     }
     const entriesAfter = await this.#listWorktrees(run.projectRoot);
     if (entriesAfter.some(
-      (entry) => pathKey(entry.path) === pathKey(workspace.path)
+      (entry) =>
+        pathKey(entry.path) === pathKey(workspace.path)
+        || entry.branchRef === workspace.branchRef
     )) {
-      const error = new WorkspaceTamperError(
+      this.#throwWorkspaceTampered(
+        removing,
         "stale Git worktree metadata removal could not be verified"
       );
-      this.#persistWorkspaceTampered(removing);
-      throw error;
+    }
+    if (await pathExists(workspace.path)) {
+      this.#throwWorkspaceTampered(
+        removing,
+        "missing workspace path reappeared during stale metadata cleanup"
+      );
     }
     if (
       await this.#readRef(run.projectRoot, workspace.branchRef)
       !== workspace.headCommit
     ) {
-      const error = new WorkspaceTamperError(
+      this.#throwWorkspaceTampered(
+        removing,
         "workspace branch ref changed during stale metadata cleanup"
       );
-      this.#persistWorkspaceTampered(removing);
-      throw error;
     }
     const removed: GitWorkspaceRecord = {
       ...removing,
@@ -810,6 +854,137 @@ export class WorkspaceManager {
       removed,
       workspaceEvent("git.workspace.removed", this.#actorId, removed)
     );
+  }
+
+  #exactMissingWorkspaceEntry(
+    entries: readonly WorktreeEntry[],
+    workspace: GitWorkspaceRecord
+  ): WorktreeEntry | null {
+    const pathEntries = entries.filter(
+      (entry) => pathKey(entry.path) === pathKey(workspace.path)
+    );
+    const branchEntries = entries.filter(
+      (entry) => entry.branchRef === workspace.branchRef
+    );
+    if (pathEntries.length === 0 && branchEntries.length === 0) return null;
+    const entry = pathEntries[0];
+    if (
+      pathEntries.length !== 1
+      || branchEntries.length !== 1
+      || entry === undefined
+      || pathKey(branchEntries[0]?.path ?? "") !== pathKey(workspace.path)
+      || entry.branchRef !== workspace.branchRef
+      || entry.head !== workspace.headCommit
+    ) {
+      this.#throwWorkspaceTampered(
+        workspace,
+        "recorded workspace branch appears at another path or contradicts persisted facts"
+      );
+    }
+    return entry;
+  }
+
+  async #exactWorktreeMetadataPath(
+    projectRoot: string,
+    workspace: GitWorkspaceRecord
+  ): Promise<string> {
+    const commonResult = await this.#git.run(
+      ["rev-parse", "--git-common-dir"],
+      { cwd: projectRoot }
+    );
+    const commonDirectory = this.#resolveGitPath(
+      projectRoot,
+      commonResult.stdout,
+      "Git common directory"
+    );
+    const metadataResult = await this.#git.run(
+      ["rev-parse", "--git-path", "worktrees"],
+      { cwd: projectRoot }
+    );
+    const metadataRoot = this.#resolveGitPath(
+      projectRoot,
+      metadataResult.stdout,
+      "Git worktree metadata root"
+    );
+    if (pathKey(metadataRoot) !== pathKey(resolve(commonDirectory, "worktrees"))) {
+      throw new WorkspaceTamperError(
+        "Git returned an unexpected worktree metadata root"
+      );
+    }
+
+    let directoryEntries;
+    try {
+      directoryEntries = await readdir(metadataRoot, { withFileTypes: true });
+    } catch (error) {
+      if (isMissing(error)) {
+        throw new WorkspaceTamperError(
+          "exact stale worktree metadata directory was missing"
+        );
+      }
+      throw error;
+    }
+    const expectedGitFile = resolve(workspace.path, ".git");
+    const matching: string[] = [];
+    for (const directoryEntry of directoryEntries) {
+      if (
+        !directoryEntry.isDirectory()
+        || directoryEntry.isSymbolicLink()
+      ) {
+        continue;
+      }
+      const candidate = resolve(metadataRoot, directoryEntry.name);
+      if (!isWithin(metadataRoot, candidate)) continue;
+      const candidateMetadata = await lstat(candidate);
+      if (
+        !candidateMetadata.isDirectory()
+        || candidateMetadata.isSymbolicLink()
+      ) {
+        continue;
+      }
+      const gitdirFile = resolve(candidate, "gitdir");
+      let gitdirMetadata;
+      try {
+        gitdirMetadata = await lstat(gitdirFile);
+      } catch (error) {
+        if (isMissing(error)) continue;
+        throw error;
+      }
+      if (!gitdirMetadata.isFile() || gitdirMetadata.isSymbolicLink()) continue;
+      const pointerText = (await readFile(gitdirFile, "utf8")).trim();
+      if (pointerText.length === 0 || pointerText.includes("\n")) continue;
+      const pointer = isAbsolute(pointerText)
+        ? resolve(pointerText)
+        : resolve(candidate, pointerText);
+      if (pathKey(pointer) === pathKey(expectedGitFile)) {
+        matching.push(candidate);
+      }
+    }
+    if (matching.length !== 1) {
+      throw new WorkspaceTamperError(
+        "exact stale worktree metadata ownership could not be proven"
+      );
+    }
+    return matching[0]!;
+  }
+
+  #resolveGitPath(
+    projectRoot: string,
+    output: string,
+    label: string
+  ): string {
+    const value = output.trim();
+    if (value.length === 0 || value.includes("\n")) {
+      throw new WorkspaceTamperError(`${label} was invalid`);
+    }
+    return isAbsolute(value) ? resolve(value) : resolve(projectRoot, value);
+  }
+
+  #throwWorkspaceTampered(
+    workspace: GitWorkspaceRecord,
+    message: string
+  ): never {
+    this.#persistWorkspaceTampered(workspace);
+    throw new WorkspaceTamperError(message);
   }
 
   #persistWorkspaceTampered(workspace: GitWorkspaceRecord): void {
