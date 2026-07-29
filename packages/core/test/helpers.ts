@@ -60,6 +60,14 @@ export function companyDefinitionFixture(): CompanyDefinition {
       maxTaskRetry: 1,
       maxReviewLoops: 2,
       maxParallelTasks: 2
+    },
+    validation: {
+      commands: [],
+      integrationCommandIds: []
+    },
+    evidence: {
+      diffWarningBytes: 2 * 1024 * 1024,
+      diffHardLimitBytes: 20 * 1024 * 1024
     }
   };
 }

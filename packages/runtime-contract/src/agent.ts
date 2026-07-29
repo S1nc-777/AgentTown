@@ -1,4 +1,5 @@
 import type { ActionProposal } from "./task.js";
+import type { ReviewTaskContext, WritableTaskContext } from "./git.js";
 
 export type CapabilityState = "supported" | "unsupported" | "unknown";
 
@@ -26,6 +27,7 @@ export interface AgentMessage {
   taskId: string | null;
   text: string;
   actionRequest: ActionProposal | null;
+  taskContext: WritableTaskContext | ReviewTaskContext | null;
 }
 
 export type AgentEvent =

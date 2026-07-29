@@ -43,6 +43,14 @@ describe("parseCompanyYaml", () => {
       maxReviewLoops: 2,
       maxParallelTasks: 2
     });
+    expect(company.validation).toEqual({
+      commands: [],
+      integrationCommandIds: []
+    });
+    expect(company.evidence).toEqual({
+      diffWarningBytes: 2 * 1024 * 1024,
+      diffHardLimitBytes: 20 * 1024 * 1024
+    });
   });
 
   it.each([
@@ -52,6 +60,14 @@ describe("parseCompanyYaml", () => {
     ["retry above one", valid.replace("max_task_retry: 1", "max_task_retry: 2")],
     ["review loops above two", valid.replace("max_review_loops: 2", "max_review_loops: 3")]
   ])("rejects %s", (_name, text) => {
+    expect(() => parseCompanyYaml(text)).toThrow();
+  });
+
+  it.each([
+    ["unknown integration command", `${valid}\nvalidation:\n  commands: []\n  integration_command_ids: [unit-tests]`],
+    ["warning limit above hard limit", `${valid}\nevidence:\n  diff_warning_bytes: 20971520\n  diff_hard_limit_bytes: 2097152`],
+    ["absolute validation cwd", `${valid}\nvalidation:\n  commands:\n    - id: unit-tests\n      executable: pnpm\n      args: [test]\n      cwd: C:\\\\repo\n      timeout_seconds: 60\n  integration_command_ids: []`]
+  ])("rejects %s configuration", (_name, text) => {
     expect(() => parseCompanyYaml(text)).toThrow();
   });
 });

@@ -49,7 +49,8 @@ function message(taskId: string, messageId = "message-1"): AgentMessage {
     employeeId: "developer",
     taskId,
     text: "implement",
-    actionRequest: null
+    actionRequest: null,
+    taskContext: null
   };
 }
 

@@ -259,7 +259,8 @@ export class CompanyOrchestrator {
       employeeId: reviewer.id,
       taskId,
       text: `Review task ${taskId} and propose approval or rejection.`,
-      actionRequest: null
+      actionRequest: null,
+      taskContext: null
     }, signal)) {
       this.#assertEpoch(epoch);
       if (event.type === "action.proposed") {
@@ -488,7 +489,8 @@ export class CompanyOrchestrator {
       employeeId: recipient.id,
       taskId: action.taskId,
       text,
-      actionRequest: action
+      actionRequest: action,
+      taskContext: null
     }, this.#dispatchController.signal)) {
       if (event.type === "action.proposed") await this.dispatch(event.action);
     }
@@ -566,7 +568,8 @@ export class CompanyOrchestrator {
         task.objective,
         `Acceptance criteria: ${task.acceptanceCriteria.join("; ")}`
       ].join("\n"),
-      actionRequest: null
+      actionRequest: null,
+      taskContext: null
     };
   }
 

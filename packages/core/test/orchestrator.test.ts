@@ -286,6 +286,14 @@ function companyFixture(): CompanyDefinition {
       maxTaskRetry: 1,
       maxReviewLoops: 2,
       maxParallelTasks: 2
+    },
+    validation: {
+      commands: [],
+      integrationCommandIds: []
+    },
+    evidence: {
+      diffWarningBytes: 2 * 1024 * 1024,
+      diffHardLimitBytes: 20 * 1024 * 1024
     }
   };
 }
@@ -894,7 +902,8 @@ describe("SessionManager", () => {
       employeeId: employee.id,
       taskId: "task-a",
       text: "work",
-      actionRequest: null
+      actionRequest: null,
+      taskContext: null
     });
     const collect = async (events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> => {
       const result: AgentEvent[] = [];
