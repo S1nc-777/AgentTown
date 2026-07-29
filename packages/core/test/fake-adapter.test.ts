@@ -1,4 +1,9 @@
 import {
+  spawn,
+  type ChildProcessWithoutNullStreams
+} from "node:child_process";
+import { EventEmitter } from "node:events";
+import {
   mkdir,
   mkdtemp,
   readFile,
@@ -6,6 +11,7 @@ import {
   rm,
   symlink
 } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -68,17 +74,102 @@ async function bounded<T>(promise: Promise<T>, message: string): Promise<T> {
 }
 
 function createAdapter(
-  allowedEmployeeIds: readonly string[] = ["developer"]
+  allowedEmployeeIds: readonly string[] = ["developer"],
+  overrides: Partial<ConstructorParameters<typeof FakeAgentAdapter>[0]> = {}
 ): FakeAgentAdapter {
   const options = {
     executable: process.execPath,
     packageRoot: fakeRoot,
     allowedEmployeeIds: new Set(allowedEmployeeIds)
   };
-  return new FakeAgentAdapter(options);
+  return new FakeAgentAdapter({ ...options, ...overrides });
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error
+      && "code" in error
+      && (error as NodeJS.ErrnoException).code === "ESRCH"
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 describe("FakeAgentAdapter", () => {
+  it("owns an asynchronous spawn error before validating or logging the child", async () => {
+    const project = await createTemporaryProject();
+    const fakeChild = new EventEmitter() as ChildProcessWithoutNullStreams;
+    let fakeExitCode: number | null = null;
+    Object.assign(fakeChild, {
+      pid: 12_345,
+      signalCode: null,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: () => true
+    });
+    Object.defineProperty(fakeChild, "exitCode", {
+      get: () => fakeExitCode
+    });
+    const adapter = createAdapter(["developer"], {
+      spawnProcess: () => {
+        setImmediate(() => {
+          fakeChild.emit("error", new Error("async spawn marker"));
+          fakeExitCode = 1;
+          fakeChild.emit("close", 1, null);
+        });
+        return fakeChild;
+      }
+    });
+    try {
+      await expect(adapter.start(startInput(
+        "developer",
+        "complete",
+        project.root
+      ))).rejects.toThrow("async spawn marker");
+    } finally {
+      await project.cleanup();
+    }
+  });
+
+  it("reaps a spawned child when the start diagnostic cannot be written", async () => {
+    const project = await createTemporaryProject();
+    let child: ChildProcessWithoutNullStreams | undefined;
+    const adapter = createAdapter(["developer"], {
+      spawnProcess: (...args) => {
+        child = spawn(...args) as ChildProcessWithoutNullStreams;
+        return child;
+      },
+      writeDiagnostic: () => {
+        throw new Error("diagnostic write marker");
+      }
+    });
+    try {
+      await expect(adapter.start(startInput(
+        "developer",
+        "complete",
+        project.root
+      ))).rejects.toThrow("diagnostic write marker");
+      expect(child?.pid).toBeTypeOf("number");
+      expect(isProcessAlive(child!.pid!)).toBe(false);
+    } finally {
+      if (
+        child !== undefined
+        && child.exitCode === null
+        && child.signalCode === null
+      ) {
+        child.kill("SIGKILL");
+      }
+      await project.cleanup();
+    }
+  });
+
   it("starts, sends, reports usage, interrupts and resumes", async () => {
     const project = await createTemporaryProject();
     const adapter = createAdapter();

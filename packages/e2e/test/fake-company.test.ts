@@ -26,13 +26,21 @@ import {
   CapturedProcessError,
   capture,
   connectOrTerminateCapturedProcess,
+  forceReapCapturedProcessTree,
+  formatErrorTree,
   runCapturedCommand,
-  terminateCapturedProcess,
-  waitForClose,
+  waitForCapturedProcessTreeExit,
   type ProcessCapture
 } from "../src/process-helpers.js";
 
 const PHASE_TIMEOUT_MS = 15_000;
+const CLEANUP_RESERVE_MS = 1_000;
+const EMPLOYEE_IDS = [
+  "leader",
+  "developer-a",
+  "developer-b",
+  "reviewer"
+] as const;
 const tsxImport = import.meta.resolve("tsx");
 const cliMain = fileURLToPath(new URL("../../cli/src/main.ts", import.meta.url));
 const coreMain = fileURLToPath(new URL("../../core/src/main.ts", import.meta.url));
@@ -58,12 +66,17 @@ function cliCommand(args: readonly string[]): { file: string; args: string[] } {
   };
 }
 
-async function waitForExit(
+async function waitForCoreExit(
   processCapture: ProcessCapture,
   label: string,
-  timeoutMs = PHASE_TIMEOUT_MS
+  logsDir: string
 ): Promise<number> {
-  const exit = await waitForClose(processCapture, label, timeoutMs);
+  const exit = await waitForCapturedProcessTreeExit({
+    processCapture,
+    descendantPids: () => knownLiveFakePids(logsDir),
+    label,
+    totalBudgetMs: PHASE_TIMEOUT_MS
+  });
   if (exit.code === null) {
     throw new Error(`${label} exited by ${String(exit.signal)}`);
   }
@@ -113,6 +126,7 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
     env: fakeOnlyEnv()
   }));
   const deadline = Date.now() + PHASE_TIMEOUT_MS;
+  const readyDeadline = deadline - CLEANUP_RESERVE_MS;
   try {
     while (!processCapture.stdout.includes("\"type\":\"core.ready\"")) {
       if (
@@ -124,7 +138,7 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
           + `signal=${String(processCapture.child.signalCode)})`
         );
       }
-      if (Date.now() >= deadline) {
+      if (Date.now() >= readyDeadline) {
         throw new Error(`Core readiness timed out after ${PHASE_TIMEOUT_MS}ms`);
       }
       await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
@@ -145,11 +159,12 @@ async function startCore(projectRoot: string): Promise<RunningCore> {
     if (error instanceof CapturedProcessError) throw error;
     let cleanupError: unknown;
     try {
-      await terminateCapturedProcess(
+      await forceReapCapturedProcessTree({
         processCapture,
-        "Core startup failure",
-        PHASE_TIMEOUT_MS
-      );
+        descendantPids: () => knownLiveFakePids(paths.logsDir),
+        label: "Core startup failure",
+        deadlineAt: deadline
+      });
     } catch (terminationError) {
       cleanupError = terminationError;
     }
@@ -259,6 +274,31 @@ async function processDiagnostics(
     }
   }
   return diagnostics;
+}
+
+async function knownLiveFakePids(logsDir: string): Promise<number[]> {
+  const diagnostics: ProcessDiagnostic[] = [];
+  for (const employeeId of EMPLOYEE_IDS) {
+    try {
+      diagnostics.push(...await processDiagnostics(logsDir, [employeeId]));
+    } catch (error) {
+      if (
+        error instanceof Error
+        && "code" in error
+        && (error as NodeJS.ErrnoException).code === "ENOENT"
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  const exited = new Set(diagnostics
+    .filter(({ type }) => type === "adapter.process.exited")
+    .map(({ pid }) => pid));
+  return [...new Set(diagnostics
+    .filter(({ type }) => type === "adapter.process.started")
+    .map(({ pid }) => pid))]
+    .filter((pid) => !exited.has(pid) && isProcessAlive(pid));
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -439,7 +479,11 @@ describe("P1A real Fake Company lifecycle", () => {
       const preRestartSequence = lastEvents.at(-1)!.sequence;
 
       await firstCore.client.close();
-      await expect(waitForExit(firstCore, "first Core last-client shutdown"))
+      await expect(waitForCoreExit(
+        firstCore,
+        "first Core last-client shutdown",
+        paths.logsDir
+      ))
         .resolves.toBe(0);
       const retainedAfterPause = await stat(paths.databasePath);
       expect(retainedAfterPause.isFile()).toBe(true);
@@ -516,7 +560,11 @@ describe("P1A real Fake Company lifecycle", () => {
 
       await runCli(projectRoot, ["stop", "--yes"]);
       await secondCore.client.close();
-      await expect(waitForExit(secondCore, "second Core stop")).resolves.toBe(0);
+      await expect(waitForCoreExit(
+        secondCore,
+        "second Core stop",
+        paths.logsDir
+      )).resolves.toBe(0);
       expect(readDatabaseTasks(paths.databasePath)).toEqual([
         expect.objectContaining({ id: "task-a", status: "completed" }),
         expect.objectContaining({ id: "task-b", status: "completed" })
@@ -557,7 +605,7 @@ describe("P1A real Fake Company lifecycle", () => {
       }
       console.error([
         failure instanceof Error
-          ? failure.stack ?? failure.message
+          ? formatErrorTree(failure)
           : String(failure),
         "first Core stdout:",
         firstCore?.stdout ?? "",
@@ -572,36 +620,69 @@ describe("P1A real Fake Company lifecycle", () => {
       ].join("\n"));
     }
     const cleanupErrors: unknown[] = [];
-    for (const client of [firstCore?.client, secondCore?.client]) {
-      if (client === undefined) continue;
-      try {
-        await client.close();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
+    const cleanupDeadlineAt = Date.now() + PHASE_TIMEOUT_MS;
+    const closeResults = await Promise.allSettled(
+      [firstCore?.client, secondCore?.client]
+        .filter((client): client is AgentTownClient => client !== undefined)
+        .map(async (client) => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              client.close(),
+              new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error("Core client close exceeded cleanup deadline")),
+                  Math.max(0, cleanupDeadlineAt - Date.now())
+                );
+              })
+            ]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        })
+    );
+    cleanupErrors.push(...closeResults
+      .filter((result): result is PromiseRejectedResult =>
+        result.status === "rejected"
+      )
+      .map(({ reason }) => reason));
+    const coreCleanupTargets: Array<{
+      label: string;
+      processCapture: RunningCore;
+    }> = [];
+    if (firstCore !== undefined) {
+      coreCleanupTargets.push({
+        label: "first Core cleanup",
+        processCapture: firstCore
+      });
     }
-    for (const [label, processCapture] of [
-      ["first Core cleanup", firstCore],
-      ["second Core cleanup", secondCore]
-    ] as const) {
-      if (processCapture === undefined) continue;
-      try {
-        await waitForClose(processCapture, label, PHASE_TIMEOUT_MS);
-      } catch (error) {
-        cleanupErrors.push(error);
-        try {
-          await terminateCapturedProcess(
-            processCapture,
-            label,
-            PHASE_TIMEOUT_MS
-          );
-        } catch (terminationError) {
-          cleanupErrors.push(terminationError);
-        }
-      }
+    if (secondCore !== undefined) {
+      coreCleanupTargets.push({
+        label: "second Core cleanup",
+        processCapture: secondCore
+      });
     }
+    const reapResults = await Promise.allSettled(
+      coreCleanupTargets.map(({ label, processCapture }) =>
+        forceReapCapturedProcessTree({
+          processCapture,
+          descendantPids: () => knownLiveFakePids(paths.logsDir),
+          label,
+          deadlineAt: cleanupDeadlineAt
+        })
+      )
+    );
+    cleanupErrors.push(...reapResults
+      .filter((result): result is PromiseRejectedResult =>
+        result.status === "rejected"
+      )
+      .map(({ reason }) => reason));
     if (failure !== undefined) {
       if (cleanupErrors.length > 0) {
+        console.error(formatErrorTree(new AggregateError(
+          cleanupErrors,
+          "E2E cleanup diagnostics"
+        )));
         throw new AggregateError(
           [failure, ...cleanupErrors],
           "E2E failed and process cleanup was incomplete"
@@ -610,6 +691,10 @@ describe("P1A real Fake Company lifecycle", () => {
       throw failure;
     }
     if (cleanupErrors.length > 0) {
+      console.error(formatErrorTree(new AggregateError(
+        cleanupErrors,
+        "E2E cleanup diagnostics"
+      )));
       throw new AggregateError(cleanupErrors, "E2E process cleanup failed");
     }
   }, 90_000);

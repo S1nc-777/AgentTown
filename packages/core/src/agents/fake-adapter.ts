@@ -1,5 +1,6 @@
 import {
   spawn,
+  type SpawnOptionsWithoutStdio,
   type ChildProcessWithoutNullStreams
 } from "node:child_process";
 import {
@@ -48,6 +49,7 @@ interface LiveFakeSession {
   logFileDescriptor: number;
   logFileClosed: boolean;
   processExitLogged: boolean;
+  lifecycleErrors: Error[];
   stopping: Promise<void> | null;
 }
 
@@ -142,18 +144,36 @@ export interface FakeAgentAdapterOptions {
   executable: string;
   packageRoot: string;
   allowedEmployeeIds: ReadonlySet<string>;
+  spawnProcess?: (
+    executable: string,
+    args: string[],
+    options: SpawnOptionsWithoutStdio & {
+      stdio: ["pipe", "pipe", "pipe"];
+    }
+  ) => ChildProcessWithoutNullStreams;
+  writeDiagnostic?: (fileDescriptor: number, line: string) => void;
 }
 
 export class FakeAgentAdapter implements AgentAdapter {
   readonly #executable: string;
   readonly #packageRoot: string;
   readonly #allowedEmployeeIds: ReadonlySet<string>;
+  readonly #spawnProcess: NonNullable<FakeAgentAdapterOptions["spawnProcess"]>;
+  readonly #writeDiagnosticLine: NonNullable<
+    FakeAgentAdapterOptions["writeDiagnostic"]
+  >;
   readonly #sessions = new Map<string, LiveFakeSession>();
 
   constructor(options: FakeAgentAdapterOptions) {
     this.#executable = resolve(options.executable);
     this.#packageRoot = resolve(options.packageRoot);
     this.#allowedEmployeeIds = new Set(options.allowedEmployeeIds);
+    this.#spawnProcess = options.spawnProcess
+      ?? ((executable, args, spawnOptions) =>
+        spawn(executable, args, spawnOptions));
+    this.#writeDiagnosticLine = options.writeDiagnostic
+      ?? ((fileDescriptor, line) =>
+        appendFileSync(fileDescriptor, line, "utf8"));
   }
 
   async detect(): Promise<{ available: boolean; version: string }> {
@@ -347,7 +367,7 @@ export class FakeAgentAdapter implements AgentAdapter {
 
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawn(this.#executable, args, {
+      child = this.#spawnProcess(this.#executable, args, {
         cwd: this.#packageRoot,
         stdio: ["pipe", "pipe", "pipe"]
       });
@@ -379,19 +399,42 @@ export class FakeAgentAdapter implements AgentAdapter {
       logFileDescriptor,
       logFileClosed: false,
       processExitLogged: false,
+      lifecycleErrors: [],
       stopping: null
     };
+    live.closed = new Promise<void>((resolvePromise) => {
+      child.once("error", (error) => {
+        live.lifecycleErrors.push(error);
+        this.#tryWriteProcessExitDiagnostic(live, null, null);
+        lines.close(error);
+      });
+      child.once("close", (exitCode, signal) => {
+        this.#tryWriteProcessExitDiagnostic(live, exitCode, signal);
+        this.#closeLogFile(live);
+        for (const resolveInterrupt of live.interruptWaiters.splice(0)) {
+          resolveInterrupt(false);
+        }
+        lines.push({ type: "session.exited", exitCode });
+        lines.close();
+        resolvePromise();
+      });
+    });
     const childPid = child.pid;
     if (!Number.isSafeInteger(childPid) || (childPid as number) <= 0) {
-      child.kill();
-      closeSync(logFileDescriptor);
-      throw new Error(`Fake Agent ${input.employeeId} did not expose a child PID`);
+      return this.#abortFailedStart(
+        live,
+        new Error(`Fake Agent ${input.employeeId} did not expose a child PID`)
+      );
     }
-    this.#writeProcessDiagnostic(live, {
-      type: "adapter.process.started",
-      employeeId: input.employeeId,
-      pid: childPid as number
-    });
+    try {
+      this.#writeProcessDiagnostic(live, {
+        type: "adapter.process.started",
+        employeeId: input.employeeId,
+        pid: childPid as number
+      });
+    } catch (error) {
+      return this.#abortFailedStart(live, error);
+    }
     child.stdin.on("error", () => undefined);
 
     let stdoutBuffer = "";
@@ -438,25 +481,6 @@ export class FakeAgentAdapter implements AgentAdapter {
     });
     child.stderr.resume();
 
-    live.closed = new Promise<void>((resolvePromise, reject) => {
-      child.once("error", (error) => {
-        this.#writeProcessExitDiagnostic(live, null, null);
-        this.#closeLogFile(live);
-        lines.close(error);
-        reject(error);
-      });
-      child.once("close", (exitCode, signal) => {
-        this.#writeProcessExitDiagnostic(live, exitCode, signal);
-        this.#closeLogFile(live);
-        for (const resolveInterrupt of live.interruptWaiters.splice(0)) {
-          resolveInterrupt(false);
-        }
-        lines.push({ type: "session.exited", exitCode });
-        lines.close();
-        resolvePromise();
-      });
-    });
-
     let first: IteratorResult<AgentEvent>;
     try {
       first = await nextWithTimeout(
@@ -499,10 +523,9 @@ export class FakeAgentAdapter implements AgentAdapter {
     diagnostic: Record<string, unknown>
   ): void {
     if (live.logFileClosed) return;
-    appendFileSync(
+    this.#writeDiagnosticLine(
       live.logFileDescriptor,
-      `${new Date().toISOString()} ${JSON.stringify(diagnostic)}\n`,
-      "utf8"
+      `${new Date().toISOString()} ${JSON.stringify(diagnostic)}\n`
     );
   }
 
@@ -519,6 +542,63 @@ export class FakeAgentAdapter implements AgentAdapter {
       pid: live.child.pid,
       exitCode,
       signal
+    });
+  }
+
+  #tryWriteProcessExitDiagnostic(
+    live: LiveFakeSession,
+    exitCode: number | null,
+    signal: NodeJS.Signals | null
+  ): void {
+    try {
+      this.#writeProcessExitDiagnostic(live, exitCode, signal);
+    } catch (error) {
+      live.lifecycleErrors.push(
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+  }
+
+  async #abortFailedStart(
+    live: LiveFakeSession,
+    cause: unknown
+  ): Promise<never> {
+    const failure = cause instanceof Error ? cause : new Error(String(cause));
+    const cleanupErrors: Error[] = [];
+    live.child.stdin.destroy();
+    if (live.child.exitCode === null && live.child.signalCode === null) {
+      if (!live.child.kill("SIGKILL")) {
+        cleanupErrors.push(new Error(
+          `failed to terminate Fake Agent after start failure: ${live.handle.employeeId}`
+        ));
+      }
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        live.closed,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(
+              `Fake Agent ${live.handle.employeeId} cleanup timed out`
+            )),
+            STOP_TIMEOUT_MS
+          );
+        })
+      ]);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      this.#closeLogFile(live);
+    }
+    cleanupErrors.push(...live.lifecycleErrors.filter((error) => error !== failure));
+    if (cleanupErrors.length === 0) throw failure;
+    throw new Error(failure.message, {
+      cause: new AggregateError(
+        [failure, ...cleanupErrors],
+        `Fake Agent ${live.handle.employeeId} start cleanup failed`
+      )
     });
   }
 }

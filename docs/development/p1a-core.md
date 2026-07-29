@@ -67,6 +67,12 @@ node --import $tsx $cli start
 In another terminal, from the same disposable repository:
 
 ```powershell
+$demo = Join-Path $env:TEMP "agenttown-p1a-demo"
+$repo = "C:\path\to\AgentTown"
+$tsx = Join-Path $repo "node_modules\tsx\dist\loader.mjs"
+$cli = Join-Path $repo "packages\cli\src\main.ts"
+Set-Location $demo
+
 node --import $tsx $cli status
 node --import $tsx $cli tasks
 node --import $tsx $cli timeline
