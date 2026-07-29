@@ -177,7 +177,7 @@ export async function startCore(input: {
     const client = await AgentTownClient.connect(
       input.pipeName,
       `cli-${randomUUID()}`,
-      0,
+      Number.MAX_SAFE_INTEGER,
       connectBudgetMs
     );
     child.stderr?.off("data", onStderr);

@@ -91,6 +91,17 @@ CREATE TABLE IF NOT EXISTS client_leases (
   expires_at_ms INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ipc_mutation_requests (
+  client_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  state TEXT NOT NULL,
+  response_json TEXT,
+  claimed_at TEXT NOT NULL,
+  completed_at TEXT,
+  PRIMARY KEY (client_id, request_id)
+);
+
 CREATE TABLE IF NOT EXISTS checkpoints (
   id TEXT PRIMARY KEY,
   company_id TEXT NOT NULL,

@@ -33,7 +33,10 @@ type CoreServerOrchestrator = Pick<
   CompanyOrchestrator,
   "dispatch" | "start" | "stopDispatching"
 >;
-type CoreServerLifecycle = Pick<CheckpointService, "pause" | "recoverLatest">;
+type CoreServerLifecycle = Pick<
+  CheckpointService,
+  "pause" | "recoverLatest" | "stop"
+>;
 
 export interface CoreServerOptions {
   pipeName: string;
@@ -137,8 +140,20 @@ function requestFingerprint(request: IpcRequest): string {
     .digest("hex");
 }
 
-function requestKey(requestId: string): string {
-  return createHash("sha256").update(requestId).digest("hex");
+function requestKey(clientId: string, requestId: string): string {
+  return createHash("sha256")
+    .update(clientId)
+    .update("\0")
+    .update(requestId)
+    .digest("hex");
+}
+
+function isMutatingMethod(method: string): boolean {
+  return method === "company.start"
+    || method === "company.pause"
+    || method === "company.resume"
+    || method === "company.stop"
+    || method === "action.dispatch";
 }
 
 function requiredString(
@@ -685,7 +700,14 @@ export class CoreServer {
       return;
     }
     const fingerprint = requestFingerprint(request);
-    const cacheKey = requestKey(request.requestId);
+    const requestClientId = connection.clientId
+      ?? (
+        request.method === "handshake"
+        && typeof request.params.clientId === "string"
+          ? request.params.clientId
+          : "pre-handshake"
+      );
+    const cacheKey = requestKey(requestClientId, request.requestId);
     const cached = this.#requestCache.get(cacheKey);
     if (cached !== undefined) {
       if (cached.fingerprint !== fingerprint) {
@@ -759,6 +781,36 @@ export class CoreServer {
       return;
     }
 
+    if (isMutatingMethod(request.method)) {
+      if (connection.clientId === null) {
+        this.#send(connection, errorResponse(
+          request.requestId,
+          "handshake_required",
+          "mutation requires an authenticated client identity"
+        ));
+        return;
+      }
+      const claim = this.#store.claimMutationRequest(
+        connection.clientId,
+        request.requestId,
+        fingerprint
+      );
+      if (claim !== "claimed") {
+        this.#send(connection, claim === "duplicate"
+          ? errorResponse(
+              request.requestId,
+              "replay_unavailable",
+              "mutation was already claimed and will not be reexecuted"
+            )
+          : errorResponse(
+              request.requestId,
+              "request_id_conflict",
+              "request ID was already used for a different mutation"
+            ));
+        return;
+      }
+    }
+
     const responsePromise = this.#respond(connection, request)
       .then((response) => this.#boundedResponse(response));
     const requestFlight = { fingerprint, response: responsePromise };
@@ -769,6 +821,16 @@ export class CoreServer {
     } finally {
       if (this.#pendingRequests.get(cacheKey) === requestFlight) {
         this.#pendingRequests.delete(cacheKey);
+      }
+    }
+    if (isMutatingMethod(request.method) && connection.clientId !== null) {
+      try {
+        this.#store.completeMutationRequest(
+          connection.clientId,
+          request.requestId
+        );
+      } catch (error) {
+        this.#recordBackgroundError(error);
       }
     }
     this.#cache(cacheKey, { fingerprint, response });
@@ -828,6 +890,27 @@ export class CoreServer {
         return this.#statusSnapshot(requiredString(request.params, "companyId"));
       }
       case "company.start":
+        {
+          const status = this.#store.getOnlyCompanyStatus();
+          if (status === "paused") {
+            throw new RequestError(
+              "invalid_lifecycle_state",
+              "company is paused; use company.resume"
+            );
+          }
+          if (status === "running") return { status: "running" };
+          if (
+            status === "pausing"
+            || status === "stopping"
+            || status === "starting"
+            || status === "blocked"
+          ) {
+            throw new RequestError(
+              "invalid_lifecycle_state",
+              `company cannot start while ${status}`
+            );
+          }
+        }
         await this.#orchestrator.start(
           stringRecord(request.params.scenarios ?? {}, "scenarios")
         );
@@ -858,7 +941,7 @@ export class CoreServer {
         };
       case "company.stop":
         if (this.#lifecycle !== undefined) {
-          await this.#lifecycle.pause("shutdown");
+          await this.#lifecycle.stop();
           setImmediate(() => {
             void this.closeTransportAfterResponses().catch((error: unknown) => {
               this.#recordBackgroundError(error);
@@ -871,11 +954,31 @@ export class CoreServer {
       case "tasks.list":
         return this.#store.listTasks(requiredString(request.params, "companyId"));
       case "events.list":
-        return this.#store.listEvents(nonnegativeInteger(
-          request.params.afterSequence,
-          "afterSequence",
-          0
-        ));
+        {
+          const afterSequence = nonnegativeInteger(
+            request.params.afterSequence,
+            "afterSequence",
+            0
+          );
+          const rawLimit = request.params.limit;
+          if (
+            rawLimit !== undefined
+            && (
+              !Number.isSafeInteger(rawLimit)
+              || (rawLimit as number) <= 0
+              || (rawLimit as number) > 256
+            )
+          ) {
+            throw new RequestError(
+              "invalid_params",
+              "limit must be an integer from 1 to 256"
+            );
+          }
+          return this.#store.listEvents(
+            afterSequence,
+            rawLimit as number | undefined
+          );
+        }
       case "action.dispatch": {
         let action;
         try {

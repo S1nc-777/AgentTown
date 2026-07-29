@@ -188,7 +188,11 @@ function employeeStatus(value: unknown): EmployeeStatusView {
 }
 
 async function connectExisting(pipeName: string): Promise<AgentTownClient> {
-  return AgentTownClient.connect(pipeName, `cli-${randomUUID()}`, 0);
+  return AgentTownClient.connect(
+    pipeName,
+    `cli-${randomUUID()}`,
+    Number.MAX_SAFE_INTEGER
+  );
 }
 
 async function connectOrStart(
@@ -374,10 +378,20 @@ async function tasks(projectRoot: string, runtime: CliRuntime): Promise<void> {
 async function timeline(projectRoot: string, runtime: CliRuntime): Promise<void> {
   const client = await runtime.connectOrStart(projectRoot, false);
   try {
-    const result = await client.request("events.list", { afterSequence: 0 });
+    const result: EventRecord[] = [];
+    let afterSequence = 0;
+    while (true) {
+      const page = await client.request("events.list", {
+        afterSequence,
+        limit: 32
+      }) as EventRecord[];
+      result.push(...page);
+      if (page.length < 32) break;
+      afterSequence = page.at(-1)!.sequence;
+    }
     await writeWithBackpressure(
       runtime.stdout,
-      `${renderTimeline(result as EventRecord[])}\n`
+      `${renderTimeline(result)}\n`
     );
   } finally {
     await client.close();

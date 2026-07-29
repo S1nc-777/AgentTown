@@ -28,7 +28,7 @@ export interface CheckpointServiceOptions {
   store: CoreStore;
   orchestrator: Pick<
     CompanyOrchestrator,
-    "stopDispatching" | "resumeDispatching" | "quiesce"
+    "stopDispatching" | "resumeDispatching" | "recoverWork" | "quiesce"
   >;
   sessions: Pick<
     SessionManager,
@@ -41,6 +41,7 @@ export interface CheckpointServiceOptions {
     | "rebuildOne"
   >;
   adapterFor: (agentName: string) => AgentAdapter;
+  scenarios?: Readonly<Record<string, string>>;
   pauseTimeoutMs?: number;
 }
 
@@ -83,6 +84,18 @@ function readNullableString(value: unknown, label: string): string | null {
   return readString(value, label);
 }
 
+function readHandoff(value: unknown): string {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.length > 4_096
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+  ) {
+    throw new TypeError("checkpoint handoff must be well-formed text");
+  }
+  return value;
+}
+
 function parseHandle(value: unknown): SessionHandle {
   if (!isRecord(value)) throw new TypeError("checkpoint handle must be an object");
   return {
@@ -122,14 +135,14 @@ export function parseCompanyCheckpoint(value: unknown): CompanyCheckpoint {
         employeeId,
         handle,
         activeTaskId: readNullableString(raw.activeTaskId, "checkpoint activeTaskId"),
-        handoff: readString(raw.handoff, "checkpoint handoff")
+        handoff: readHandoff(raw.handoff)
       };
     })
   };
 }
 
 interface ActiveOperation {
-  kind: "pause" | "recover";
+  kind: "pause" | "stop" | "recover";
   promise: Promise<unknown>;
 }
 
@@ -146,6 +159,7 @@ export class CheckpointService {
   readonly #orchestrator: CheckpointServiceOptions["orchestrator"];
   readonly #sessions: CheckpointServiceOptions["sessions"];
   readonly #adapterFor: CheckpointServiceOptions["adapterFor"];
+  readonly #scenarios: Readonly<Record<string, string>>;
   readonly #pauseTimeoutMs: number;
   #operation: ActiveOperation | null = null;
 
@@ -156,6 +170,7 @@ export class CheckpointService {
     this.#orchestrator = options.orchestrator;
     this.#sessions = options.sessions;
     this.#adapterFor = options.adapterFor;
+    this.#scenarios = options.scenarios ?? {};
     this.#pauseTimeoutMs = options.pauseTimeoutMs ?? 10_000;
     if (!Number.isSafeInteger(this.#pauseTimeoutMs) || this.#pauseTimeoutMs <= 0) {
       throw new RangeError("pauseTimeoutMs must be a positive integer");
@@ -174,12 +189,33 @@ export class CheckpointService {
     return this.#runOperation("pause", () => this.#pause(reason));
   }
 
+  stop(): Promise<void> {
+    if (this.#operation !== null) {
+      if (this.#operation.kind !== "stop") {
+        return Promise.reject(new Error("company lifecycle operation is in progress"));
+      }
+      return this.#operation.promise as Promise<void>;
+    }
+    if (this.#store.getCompany(this.#companyId)?.status === "stopped") {
+      return Promise.resolve();
+    }
+    return this.#runOperation("stop", async () => {
+      await this.#suspend("shutdown", "stopped");
+    });
+  }
+
   recoverLatest(): Promise<RecoveryResult> {
     if (this.#operation !== null) {
       if (this.#operation.kind !== "recover") {
         return Promise.reject(new Error("company lifecycle pause is in progress"));
       }
       return this.#operation.promise as Promise<RecoveryResult>;
+    }
+    const persistedStatus = this.#store.getCompany(this.#companyId)?.status;
+    if (persistedStatus !== "paused") {
+      return Promise.reject(new Error(
+        `company is not eligible for recovery: ${persistedStatus ?? "missing"}`
+      ));
     }
     return this.#runOperation("recover", async () => {
       const stored = this.#store.latestCheckpoint(this.#companyId);
@@ -218,11 +254,22 @@ export class CheckpointService {
   }
 
   async #pause(reason: PauseReason): Promise<CompanyCheckpoint> {
+    return this.#suspend(reason, "paused");
+  }
+
+  async #suspend(
+    reason: PauseReason,
+    terminalStatus: "paused" | "stopped"
+  ): Promise<CompanyCheckpoint> {
     const deadline = this.#deadline(this.#pauseTimeoutMs);
     try {
       await this.#orchestrator.stopDispatching();
-      this.#store.commitCompanyStatusWithEvents(this.#companyId, "pausing", [
-        this.#event("company.pausing", "core", null, { reason })
+      const transitioningStatus = terminalStatus === "paused" ? "pausing" : "stopping";
+      const transitioningEvent = terminalStatus === "paused"
+        ? "company.pausing"
+        : "company.stopping";
+      this.#store.commitCompanyStatusWithEvents(this.#companyId, transitioningStatus, [
+        this.#event(transitioningEvent, "core", null, { reason })
       ]);
       const interruptSignal = this.#phaseSignal(
         deadline,
@@ -255,15 +302,27 @@ export class CheckpointService {
         createdAt: new Date().toISOString(),
         payload: checkpoint as unknown as Record<string, unknown>
       };
-      this.#store.commitPauseFacts(
-        stored,
-        this.#event("company.checkpointed", "core", null, {
-          reason,
-          lastEventSequence: checkpoint.lastEventSequence,
-          sessionCount: checkpoint.sessions.length
-        }),
-        this.#event("company.paused", "core", null, { reason })
+      const checkpointEvent = this.#event("company.checkpointed", "core", null, {
+        reason,
+        lastEventSequence: checkpoint.lastEventSequence,
+        sessionCount: checkpoint.sessions.length
+      });
+      const terminalEvent = this.#event(
+        terminalStatus === "paused" ? "company.paused" : "company.stopped",
+        "core",
+        null,
+        { reason }
       );
+      if (terminalStatus === "paused") {
+        this.#store.commitPauseFacts(stored, checkpointEvent, terminalEvent);
+      } else {
+        this.#store.commitSuspensionFacts(
+          stored,
+          checkpointEvent,
+          terminalStatus,
+          terminalEvent
+        );
+      }
 
       const failed = await this.#cleanupWithinDeadline(deadline);
       if (failed.length > 0) {
@@ -313,11 +372,17 @@ export class CheckpointService {
         const native = capabilities.nativeResume === "supported"
           && session.handle.nativeSessionId !== null;
         const handle = native
-          ? await this.#sessions.resumeOne(employee, session, attemptController.signal)
+          ? await this.#sessions.resumeOne(
+              employee,
+              session,
+              attemptController.signal,
+              this.#scenarios[employee.id] ?? "idle"
+            )
           : await this.#sessions.rebuildOne(
               employee,
               session.handoff,
-              attemptController.signal
+              attemptController.signal,
+              this.#scenarios[employee.id] ?? "idle"
             );
         const decision: RecoveryDecision = {
           employeeId: employee.id,
@@ -342,6 +407,7 @@ export class CheckpointService {
         this.#event("company.recovered", "core", null, { decisions })
       ]);
       this.#orchestrator.resumeDispatching();
+      this.#orchestrator.recoverWork();
       attemptController.abort();
       return { decisions };
     } catch (error) {

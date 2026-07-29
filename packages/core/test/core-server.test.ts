@@ -12,7 +12,10 @@ import {
 } from "../src/ipc/core-server.js";
 import { LeaseRegistry } from "../src/ipc/lease-registry.js";
 import { CoreStore } from "../src/storage/core-store.js";
-import { companyDefinitionFixture } from "./helpers.js";
+import {
+  companyDefinitionFixture,
+  createTemporaryProject
+} from "./helpers.js";
 
 type WireMessage = IpcEvent | IpcResponse;
 
@@ -240,6 +243,7 @@ class RecordingOrchestrator {
 
 class RecordingLifecycle {
   readonly pauses: string[] = [];
+  stopCalls = 0;
   recoverLatestCalls = 0;
 
   async pause(reason: "user_requested" | "last_client_exited" | "shutdown") {
@@ -257,6 +261,10 @@ class RecordingLifecycle {
     return {
       decisions: [{ employeeId: "leader", mode: "native" as const }]
     };
+  }
+
+  async stop() {
+    this.stopCalls += 1;
   }
 }
 
@@ -322,6 +330,15 @@ class SharedGateOrchestrator extends RecordingOrchestrator {
 
   release(): void {
     this.#release?.();
+  }
+}
+
+class FailingStartOrchestrator extends RecordingOrchestrator {
+  override async start(
+    scenarios: Readonly<Record<string, string>>
+  ): Promise<void> {
+    this.starts.push(scenarios);
+    throw new Error("injected start failure");
   }
 }
 
@@ -415,6 +432,187 @@ afterEach(async () => {
 });
 
 describe.runIf(process.platform === "win32")("CoreServer", () => {
+  it("never reexecutes an evicted mutation after 1025 later mutations", async () => {
+    const orchestrator = new RecordingOrchestrator();
+    const { pipeName } = await createServer({ orchestrator });
+    const client = await connectClient(pipeName);
+    await client.handshake("durable-eviction-client", Number.MAX_SAFE_INTEGER);
+
+    for (let index = 0; index < 1_026; index += 1) {
+      await expect(client.requestWithId(
+        `mutation-${index}`,
+        "company.start",
+        { scenarios: { leader: `scenario-${index}` } }
+      )).resolves.toMatchObject({ ok: true });
+    }
+    await expect(client.requestWithId(
+      "mutation-0",
+      "company.start",
+      { scenarios: { leader: "scenario-0" } }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "replay_unavailable" }
+    });
+    await expect(client.requestWithId(
+      "mutation-0",
+      "company.start",
+      { scenarios: { leader: "different" } }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "request_id_conflict" }
+    });
+    expect(orchestrator.starts).toHaveLength(1_026);
+  }, 30_000);
+
+  it("fails closed after a claimed mutation dispatch fails", async () => {
+    const orchestrator = new FailingStartOrchestrator();
+    const { pipeName } = await createServer({
+      orchestrator,
+      serverOptions: { requestCacheByteLimit: 1 }
+    });
+    const client = await connectClient(pipeName);
+    await client.handshake("failed-claim-client", Number.MAX_SAFE_INTEGER);
+
+    await expect(client.requestWithId(
+      "failed-claim",
+      "company.start",
+      { scenarios: { leader: "fail" } }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "request_failed" }
+    });
+    await expect(client.requestWithId(
+      "failed-claim",
+      "company.start",
+      { scenarios: { leader: "fail" } }
+    )).resolves.toMatchObject({
+      ok: false,
+      error: { code: "replay_unavailable" }
+    });
+    expect(orchestrator.starts).toHaveLength(1);
+  });
+
+  it("does not reexecute a claimed mutation after Core restart", async () => {
+    const project = await createTemporaryProject();
+    const firstStore = new CoreStore(project.databasePath);
+    firstStore.initialize();
+    const firstOrchestrator = new RecordingOrchestrator();
+    const first = await createServer({
+      store: firstStore,
+      orchestrator: firstOrchestrator
+    });
+    const firstClient = await connectClient(first.pipeName);
+    await firstClient.handshake("restart-client", Number.MAX_SAFE_INTEGER);
+    await expect(firstClient.requestWithId(
+      "restart-mutation",
+      "company.start",
+      { scenarios: { leader: "once" } }
+    )).resolves.toMatchObject({ ok: true });
+    expect(firstOrchestrator.starts).toHaveLength(1);
+    await firstClient.close();
+    await first.server.close();
+    firstStore.close();
+
+    const secondStore = new CoreStore(project.databasePath);
+    secondStore.initialize();
+    let secondServer: CoreServer | undefined;
+    try {
+      const secondOrchestrator = new RecordingOrchestrator();
+      const second = await createServer({
+        store: secondStore,
+        orchestrator: secondOrchestrator
+      });
+      secondServer = second.server;
+      const secondClient = await connectClient(second.pipeName);
+      await secondClient.handshake("restart-client", Number.MAX_SAFE_INTEGER);
+      await expect(secondClient.requestWithId(
+        "restart-mutation",
+        "company.start",
+        { scenarios: { leader: "once" } }
+      )).resolves.toMatchObject({
+        ok: false,
+        error: { code: "replay_unavailable" }
+      });
+      expect(secondOrchestrator.starts).toHaveLength(0);
+    } finally {
+      await secondServer?.close();
+      secondStore.close();
+      await project.cleanup();
+    }
+  });
+
+  it("guards start by persisted lifecycle state and stops explicitly", async () => {
+    const store = createStore();
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: {
+        id: randomUUID(),
+        type: "company.created",
+        actorId: "owner",
+        taskId: null,
+        causationEventId: null,
+        payload: {}
+      }
+    });
+    const orchestrator = new RecordingOrchestrator();
+    const lifecycle = new RecordingLifecycle();
+    const { pipeName } = await createServer({ store, orchestrator, lifecycle });
+    const client = await connectClient(pipeName);
+    await client.handshake("lifecycle-guard");
+
+    await expect(client.request("company.start", {})).resolves.toMatchObject({
+      ok: true,
+      result: { status: "running" }
+    });
+    store.setCompanyStatus("company-1", "paused", {
+      id: randomUUID(),
+      type: "test.paused",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: {}
+    });
+    await expect(client.request("company.start", {})).resolves.toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining("company.resume") }
+    });
+    store.setCompanyStatus("company-1", "running", {
+      id: randomUUID(),
+      type: "test.running",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: {}
+    });
+    await expect(client.request("company.start", {})).resolves.toMatchObject({
+      ok: true,
+      result: { status: "running" }
+    });
+    expect(orchestrator.starts).toHaveLength(1);
+
+    store.setCompanyStatus("company-1", "stopped", {
+      id: randomUUID(),
+      type: "test.stopped",
+      actorId: "test",
+      taskId: null,
+      causationEventId: null,
+      payload: {}
+    });
+    await expect(client.request("company.start", {})).resolves.toMatchObject({
+      ok: true,
+      result: { status: "running" }
+    });
+    expect(orchestrator.starts).toHaveLength(2);
+    expect(lifecycle.recoverLatestCalls).toBe(0);
+
+    await expect(client.request("company.stop", {})).resolves.toMatchObject({
+      ok: true,
+      result: { status: "stopped" }
+    });
+    expect(lifecycle.stopCalls).toBe(1);
+  });
+
   it("handshakes, replays and streams events, and replays duplicate requests", async () => {
     const { pipeName, store } = await createServer();
     storeTestEvent(store, "event-before-handshake");
@@ -649,8 +847,8 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
     const { pipeName } = await createServer({ orchestrator });
     const firstClient = await connectClient(pipeName);
     const secondClient = await connectClient(pipeName);
-    await firstClient.handshake("client-concurrent-a");
-    await secondClient.handshake("client-concurrent-b");
+    await firstClient.handshake("client-concurrent");
+    await secondClient.handshake("client-concurrent");
 
     const first = firstClient.requestWithId(
       "concurrent-id",

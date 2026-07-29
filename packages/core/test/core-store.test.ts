@@ -8,6 +8,40 @@ afterEach(async () => {
 });
 
 describe("CoreStore", () => {
+  it("persists atomic mutation request claims across reopen", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const first = new CoreStore(project.databasePath);
+    first.initialize();
+    try {
+      expect(first.claimMutationRequest("client-a", "request-1", "fingerprint-a"))
+        .toBe("claimed");
+      expect(first.claimMutationRequest("client-a", "request-1", "fingerprint-a"))
+        .toBe("duplicate");
+      expect(first.claimMutationRequest("client-a", "request-1", "fingerprint-b"))
+        .toBe("conflict");
+    } finally {
+      first.close();
+    }
+
+    const reopened = new CoreStore(project.databasePath);
+    reopened.initialize();
+    try {
+      expect(reopened.claimMutationRequest(
+        "client-a",
+        "request-1",
+        "fingerprint-a"
+      )).toBe("duplicate");
+      expect(reopened.claimMutationRequest(
+        "client-b",
+        "request-1",
+        "fingerprint-a"
+      )).toBe("claimed");
+    } finally {
+      reopened.close();
+    }
+  });
+
   it("persists a fact and its event in one transaction", async () => {
     const project = await createTemporaryProject();
     cleanups.push(project.cleanup);

@@ -438,7 +438,12 @@ describe("P1A real Fake Company lifecycle", () => {
       await initializeTemporaryGitRepository(projectRoot);
       await runCli(projectRoot, ["init", "--template", "parallel-software"]);
       firstCore = await startCore(projectRoot);
-      await coreRequest(firstCore.client, "company.start", {});
+      await coreRequest(firstCore.client, "company.start", {
+        scenarios: {
+          "developer-a": "silent",
+          "developer-b": "silent"
+        }
+      });
       await recordCoreProcessInstances(paths.logsDir, firstCore);
 
       lastEvents = await listEvents(firstCore.client);
@@ -495,39 +500,17 @@ describe("P1A real Fake Company lifecycle", () => {
         }))
       ]);
 
-      await waitUntil("both tasks completed through Fake reviewer", async () =>
+      await waitUntil("both tasks entered running before disconnect", async () =>
         (await listTasks(firstCore!.client))
-          .filter(({ status }) => status === "completed").length === 2
+          .filter(({ status }) => status === "running").length === 2
       );
-      const completed = await listTasks(firstCore.client);
-      expect(completed).toEqual([
-        expect.objectContaining({
-          id: "task-a",
-          status: "completed",
-          ownerEmployeeId: "developer-a",
-          artifacts: ["artifact:task-a"],
-          evidence: ["fake:test:pass"]
-        }),
-        expect.objectContaining({
-          id: "task-b",
-          status: "completed",
-          ownerEmployeeId: "developer-b",
-          artifacts: ["artifact:task-b"],
-          evidence: ["fake:test:pass"]
-        })
-      ]);
-
       lastEvents = await listEvents(firstCore.client);
       const startedSequences = lastEvents
         .filter(({ type }) => type === "task.started")
         .map(({ sequence }) => sequence);
-      const firstSubmission = lastEvents.find(({ type }) => type === "task.submitted");
       expect(startedSequences).toHaveLength(2);
-      expect(firstSubmission).toBeDefined();
-      expect(Math.max(...startedSequences)).toBeLessThan(firstSubmission!.sequence);
-      expect(lastEvents.filter(({ type, actorId }) =>
-        type === "task.completed" && actorId === "reviewer"
-      )).toHaveLength(2);
+      expect(lastEvents.filter(({ type }) => type === "task.submitted"))
+        .toHaveLength(0);
       const preRestartSequence = lastEvents.at(-1)!.sequence;
 
       await firstCore.client.close();
@@ -555,6 +538,20 @@ describe("P1A real Fake Company lifecycle", () => {
         "developer-b",
         "reviewer"
       ]));
+      expect(readDatabaseTasks(paths.databasePath)).toEqual([
+        expect.objectContaining({
+          id: "task-a",
+          status: "running",
+          retryCount: 0,
+          reviewLoopCount: 0
+        }),
+        expect.objectContaining({
+          id: "task-b",
+          status: "running",
+          retryCount: 0,
+          reviewLoopCount: 0
+        })
+      ]);
       const firstStopResult = await processDiagnostics(
         paths.logsDir,
         EMPLOYEE_IDS
@@ -589,6 +586,10 @@ describe("P1A real Fake Company lifecycle", () => {
       expect(resumed.decisions).toHaveLength(4);
       expect(resumed.decisions.every(({ mode }) => mode === "native")).toBe(true);
       await recordCoreProcessInstances(paths.logsDir, secondCore);
+      await waitUntil("recovered tasks completed through Fake reviewer", async () =>
+        (await listTasks(secondCore!.client))
+          .filter(({ status }) => status === "completed").length === 2
+      );
       expect(await listTasks(secondCore.client)).toEqual([
         expect.objectContaining({
           id: "task-a",
@@ -606,6 +607,12 @@ describe("P1A real Fake Company lifecycle", () => {
         })
       ]);
       lastEvents = await listEvents(secondCore.client);
+      const firstSubmission = lastEvents.find(({ type }) => type === "task.submitted");
+      expect(firstSubmission).toBeDefined();
+      expect(Math.max(...startedSequences)).toBeLessThan(firstSubmission!.sequence);
+      expect(lastEvents.filter(({ type, actorId }) =>
+        type === "task.completed" && actorId === "reviewer"
+      )).toHaveLength(2);
       expect(lastEvents.at(-1)!.sequence).toBeGreaterThan(preRestartSequence);
       expect(lastEvents.every((event, index) =>
         index === 0 || event.sequence > lastEvents[index - 1]!.sequence

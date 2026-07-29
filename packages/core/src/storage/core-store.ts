@@ -72,7 +72,10 @@ export class CoreStore {
   }
 
   initialize(): void {
-    this.#database.exec(CORE_SCHEMA_SQL);
+    this.#database.exec("PRAGMA foreign_keys = ON");
+    this.inTransaction(() => {
+      this.#database.exec(CORE_SCHEMA_SQL);
+    });
   }
 
   close(): void {
@@ -97,13 +100,21 @@ export class CoreStore {
     return inserted;
   }
 
-  listEvents(afterSequence: number): EventRecord[] {
-    const rows = this.#database.prepare(`
+  listEvents(afterSequence: number, limit?: number): EventRecord[] {
+    const rows = (limit === undefined
+      ? this.#database.prepare(`
       SELECT sequence, id, occurred_at, type, actor_id, task_id, causation_event_id, payload_json
       FROM events
       WHERE sequence > ?
       ORDER BY sequence ASC
-    `).all(afterSequence) as DatabaseRow[];
+    `).all(afterSequence)
+      : this.#database.prepare(`
+      SELECT sequence, id, occurred_at, type, actor_id, task_id, causation_event_id, payload_json
+      FROM events
+      WHERE sequence > ?
+      ORDER BY sequence ASC
+      LIMIT ?
+    `).all(afterSequence, limit)) as DatabaseRow[];
 
     return rows.map((row) => ({
       sequence: readNumber(row, "sequence"),
@@ -188,6 +199,16 @@ export class CoreStore {
       definitionJson: readString(row, "definition_json"),
       status: readString(row, "status")
     };
+  }
+
+  getOnlyCompanyStatus(): string | null {
+    const row = this.#database.prepare(`
+      SELECT status
+      FROM companies
+      ORDER BY created_at ASC, id ASC
+      LIMIT 1
+    `).get() as DatabaseRow | undefined;
+    return row === undefined ? null : readString(row, "status");
   }
 
   listEmployees(companyId: string): Array<{
@@ -441,6 +462,20 @@ export class CoreStore {
     checkpointEvent: NewEvent,
     pausedEvent: NewEvent
   ): void {
+    this.commitSuspensionFacts(
+      checkpoint,
+      checkpointEvent,
+      "paused",
+      pausedEvent
+    );
+  }
+
+  commitSuspensionFacts(
+    checkpoint: StoredCheckpoint,
+    checkpointEvent: NewEvent,
+    terminalStatus: "paused" | "stopped",
+    terminalEvent: NewEvent
+  ): void {
     const insertedEvents = this.inTransaction(() => {
       this.#database.prepare(`
         INSERT INTO checkpoints (id, company_id, created_at, payload_json)
@@ -453,15 +488,15 @@ export class CoreStore {
       );
       const updated = this.#database.prepare(`
         UPDATE companies
-        SET status = 'paused', updated_at = ?
+        SET status = ?, updated_at = ?
         WHERE id = ?
-      `).run(new Date().toISOString(), checkpoint.companyId);
+      `).run(terminalStatus, new Date().toISOString(), checkpoint.companyId);
       if (Number(updated.changes) !== 1) {
         throw new Error(`company not found: ${checkpoint.companyId}`);
       }
       return [
         this.#insertEventRow(checkpointEvent),
-        this.#insertEventRow(pausedEvent)
+        this.#insertEventRow(terminalEvent)
       ];
     });
     this.#publishEvents(insertedEvents);
@@ -505,6 +540,59 @@ export class CoreStore {
         "checkpoint payload"
       )
     };
+  }
+
+  claimMutationRequest(
+    clientId: string,
+    requestId: string,
+    fingerprint: string
+  ): "claimed" | "duplicate" | "conflict" {
+    return this.inTransaction(() => {
+      const inserted = this.#database.prepare(`
+        INSERT OR IGNORE INTO ipc_mutation_requests (
+          client_id,
+          request_id,
+          fingerprint,
+          state,
+          response_json,
+          claimed_at,
+          completed_at
+        )
+        VALUES (?, ?, ?, 'claimed', NULL, ?, NULL)
+      `).run(clientId, requestId, fingerprint, new Date().toISOString());
+      if (Number(inserted.changes) === 1) return "claimed";
+      const row = this.#database.prepare(`
+        SELECT fingerprint
+        FROM ipc_mutation_requests
+        WHERE client_id = ? AND request_id = ?
+      `).get(clientId, requestId) as DatabaseRow | undefined;
+      if (row === undefined) throw new Error("mutation request claim disappeared");
+      return readString(row, "fingerprint") === fingerprint
+        ? "duplicate"
+        : "conflict";
+    });
+  }
+
+  completeMutationRequest(
+    clientId: string,
+    requestId: string,
+    response: Record<string, unknown> | null = null
+  ): void {
+    this.inTransaction(() => {
+      const updated = this.#database.prepare(`
+        UPDATE ipc_mutation_requests
+        SET state = 'completed', response_json = ?, completed_at = ?
+        WHERE client_id = ? AND request_id = ?
+      `).run(
+        response === null ? null : JSON.stringify(response),
+        new Date().toISOString(),
+        clientId,
+        requestId
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error(`mutation request claim not found: ${clientId}/${requestId}`);
+      }
+    });
   }
 
   upsertLease(clientId: string, expiresAtMs: number): void {

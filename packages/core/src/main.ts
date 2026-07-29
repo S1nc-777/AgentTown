@@ -326,14 +326,6 @@ export async function runCore(
       leaderId,
       reviewerId
     );
-    const lifecycle = new CheckpointService({
-      companyId: DEFAULT_COMPANY_ID,
-      company,
-      store,
-      orchestrator,
-      sessions,
-      adapterFor: () => adapter
-    });
     const scenarios = Object.fromEntries(company.employees.map((employee) => [
       employee.id,
       employee.role === "reviewer"
@@ -342,6 +334,15 @@ export async function runCore(
           ? "complete"
           : "idle"
     ]));
+    const lifecycle = new CheckpointService({
+      companyId: DEFAULT_COMPANY_ID,
+      company,
+      store,
+      orchestrator,
+      sessions,
+      adapterFor: () => adapter,
+      scenarios
+    });
     const leases = new LeaseRegistry(store, {
       ttlMs: args.leaseTtlMs,
       now: Date.now,
@@ -355,7 +356,10 @@ export async function runCore(
       store,
       orchestrator: {
         dispatch: (action) => orchestrator.dispatch(action),
-        start: () => orchestrator.start(scenarios),
+        start: (overrides) => orchestrator.start({
+          ...scenarios,
+          ...overrides
+        }),
         stopDispatching: () => orchestrator.stopDispatching()
       },
       leases,

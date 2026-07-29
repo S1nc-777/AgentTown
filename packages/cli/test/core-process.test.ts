@@ -15,6 +15,7 @@ import {
   resolveAgentTownPaths
 } from "../src/paths.js";
 import { templateYaml } from "../src/templates.js";
+import { CoreStore } from "../../core/src/storage/core-store.js";
 
 const roots: string[] = [];
 
@@ -25,6 +26,57 @@ afterEach(async () => {
 });
 
 describe("Core process launcher", () => {
+  it("connects live-only when persisted history exceeds replay limits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttown-launch-history-"));
+    roots.push(root);
+    const paths = resolveAgentTownPaths(root);
+    await mkdir(paths.logsDir, { recursive: true });
+    await writeFile(paths.companyPath, templateYaml("minimal"), "utf8");
+    const store = new CoreStore(paths.databasePath);
+    store.initialize();
+    for (let index = 0; index < 300; index += 1) {
+      store.insertEvent({
+        id: `history-${index}`,
+        type: "history.large",
+        actorId: "test",
+        taskId: null,
+        causationEventId: null,
+        payload: { text: "x".repeat(16_000) }
+      });
+    }
+    store.close();
+
+    const { child, client } = await startCore({
+      projectRoot: root,
+      paths,
+      pipeName: pipeNameForProject(root),
+      leaseTtlMs: 2_000
+    });
+    try {
+      const history: unknown[] = [];
+      let afterSequence = 0;
+      while (true) {
+        const page = await client.request("events.list", {
+          afterSequence,
+          limit: 32
+        }) as Array<{ sequence: number }>;
+        history.push(...page);
+        if (page.length < 32) break;
+        afterSequence = page.at(-1)!.sequence;
+      }
+      expect(history.length).toBeGreaterThanOrEqual(300);
+      await expect(client.request("status.snapshot", { companyId: "company" }))
+        .resolves.toMatchObject({ companyId: "company" });
+      await expect(client.request("tasks.list", { companyId: "company" }))
+        .resolves.toEqual([]);
+    } finally {
+      await client.close();
+      if (child.exitCode === null && child.signalCode === null) {
+        await terminateChild(child);
+      }
+    }
+  }, 30_000);
+
   it("waits boundedly after SIGKILL and surfaces a child that remains live", async () => {
     const child = new EventEmitter() as EventEmitter & {
       exitCode: number | null;

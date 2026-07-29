@@ -384,7 +384,8 @@ export class SessionManager {
   async resumeOne(
     employee: EmployeeDefinition,
     checkpoint: SessionCheckpoint,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    scenario = "idle"
   ): Promise<SessionHandle> {
     if (checkpoint.employeeId !== employee.id) {
       throw new Error(`checkpoint employee mismatch: ${checkpoint.employeeId}`);
@@ -399,7 +400,7 @@ export class SessionManager {
           employeeId: employee.id,
           role: employee.role,
           projectRoot: this.projectRoot,
-          scenario: "idle",
+          scenario,
           previous: checkpoint.handle,
           handoff: checkpoint.handoff
         });
@@ -427,7 +428,8 @@ export class SessionManager {
   async rebuildOne(
     employee: EmployeeDefinition,
     handoff: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    scenario = "idle"
   ): Promise<SessionHandle> {
     const release = await this.#acquire(employee.id);
     try {
@@ -439,7 +441,7 @@ export class SessionManager {
           employeeId: employee.id,
           role: employee.role,
           projectRoot: this.projectRoot,
-          scenario: "idle"
+          scenario
         });
       } catch (error) {
         this.#finishReplacement(pending.id);

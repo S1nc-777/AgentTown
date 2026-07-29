@@ -180,6 +180,29 @@ async function createHarness(options: {
 }
 
 describe("CheckpointService", () => {
+  it("stops running or paused companies as an explicit terminal state", async () => {
+    const running = await createHarness();
+    await running.lifecycle.stop();
+    expect(running.store.getCompany(companyId)?.status).toBe("stopped");
+    expect(running.store.listEvents(0).map(({ type }) => type))
+      .toEqual(expect.arrayContaining([
+        "company.stopping",
+        "company.checkpointed",
+        "company.stopped"
+      ]));
+    expect(running.store.listEvents(0).filter(({ type }) =>
+      type === "company.paused"
+    )).toHaveLength(0);
+
+    const paused = await createHarness();
+    await paused.lifecycle.pause("user_requested");
+    await paused.lifecycle.stop();
+    expect(paused.store.getCompany(companyId)?.status).toBe("stopped");
+    await expect(paused.lifecycle.recoverLatest())
+      .rejects.toThrow("not eligible for recovery: stopped");
+    expect(() => paused.sessions.get("leader")).toThrow("session not started");
+  });
+
   it("checkpoints active work before stopping real Fake Agent sessions", async () => {
     const { lifecycle, store, sessions, tasks } = await (async () => {
       const harness = await createHarness();
@@ -659,7 +682,7 @@ describe("CheckpointService", () => {
     });
     const { lifecycle, store } = await createHarness({
       interrupt: async () => lateInterrupt,
-      pauseTimeoutMs: 100
+      pauseTimeoutMs: 500
     });
 
     await lifecycle.pause("user_requested");

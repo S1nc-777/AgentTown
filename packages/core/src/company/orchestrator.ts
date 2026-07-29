@@ -57,6 +57,7 @@ export class CompanyOrchestrator {
   #acceptingActions = false;
   #dispatchEpoch = 0;
   #dispatchController = new AbortController();
+  #reviewRecoveryTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly companyId: string,
@@ -313,6 +314,41 @@ export class CompanyOrchestrator {
   resumeDispatching(): void {
     this.#dispatchController = new AbortController();
     this.#acceptingActions = true;
+  }
+
+  recoverWork(): void {
+    const tasks = this.tasks.list();
+    for (const task of tasks
+      .filter(({ status }) => status === "running")
+      .slice(0, this.company.limits.maxParallelTasks)) {
+      if (!this.#inFlight.has(task.id)) this.#startInFlight(task.id);
+    }
+    for (const task of tasks.filter(({ status }) => status === "review")) {
+      if (this.#inFlight.has(task.id)) continue;
+      const epoch = this.#dispatchEpoch;
+      const signal = this.#dispatchController.signal;
+      const previous = this.#reviewRecoveryTail;
+      let tracked: Promise<void>;
+      tracked = previous
+        .catch(() => undefined)
+        .then(async () => {
+          this.#assertEpoch(epoch);
+          await this.requestReview(task.id, epoch, signal);
+        })
+        .catch((error: unknown) => {
+          if (epoch !== this.#dispatchEpoch) return;
+          this.#recordEvent("task.execution_error", "core", task.id, {
+            message: this.#errorMessage(error)
+          });
+        })
+        .finally(() => {
+          if (this.#inFlight.get(task.id) === tracked) {
+            this.#inFlight.delete(task.id);
+          }
+        });
+      this.#reviewRecoveryTail = tracked;
+      this.#inFlight.set(task.id, tracked);
+    }
   }
 
   async quiesce(signal: AbortSignal): Promise<boolean> {

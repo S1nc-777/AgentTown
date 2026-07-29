@@ -411,6 +411,69 @@ function createHarness(store: CoreStore = new CoreStore(":memory:")): Harness {
 }
 
 describe("CompanyOrchestrator", () => {
+  it("reissues persisted running and review work without duplicate transitions", async () => {
+    const { adapter, orchestrator, store, tasks } = createHarness();
+    await orchestrator.start({});
+    await orchestrator.stopDispatching();
+    for (const [taskId, owner] of [
+      ["task-running", "developer-a"],
+      ["task-review", "developer-b"]
+    ] as const) {
+      tasks.create({
+        id: taskId,
+        title: taskId,
+        objective: `Continue ${taskId}`,
+        ownerEmployeeId: null,
+        dependencies: [],
+        acceptanceCriteria: [`${taskId} passes`],
+        status: "draft",
+        retryCount: 0,
+        reviewLoopCount: 0,
+        artifacts: [],
+        evidence: []
+      });
+      tasks.assign(taskId, owner);
+      tasks.transition(taskId, "running", owner);
+    }
+    tasks.submit(
+      "task-review",
+      "developer-b",
+      ["artifact:task-review"],
+      ["evidence:task-review"]
+    );
+    const transitionsBefore = store.listEvents(0).filter(({ type }) =>
+      type === "task.started" || type === "task.review_requested"
+    ).length;
+
+    orchestrator.resumeDispatching();
+    orchestrator.recoverWork();
+    await adapter.waitForPending("developer-a");
+    await adapter.waitForPending("reviewer");
+    expect(adapter.nextTaskId("developer-a")).toBe("task-running");
+    expect(adapter.nextTaskId("reviewer")).toBe("task-review");
+    expect(store.listEvents(0).filter(({ type }) =>
+      type === "task.started" || type === "task.review_requested"
+    )).toHaveLength(transitionsBefore);
+
+    await adapter.complete(
+      "developer-a",
+      submitAction("task-running", "developer-a")
+    );
+    await adapter.complete("reviewer", approveAction("task-review"));
+    await adapter.waitForPending("reviewer");
+    await adapter.complete("reviewer", approveAction("task-running"));
+    await waitUntil(
+      () => tasks.list().every(({ status }) => status === "completed"),
+      "recovered work did not complete"
+    );
+    expect(tasks.get("task-review")).toMatchObject({
+      retryCount: 0,
+      reviewLoopCount: 0,
+      artifacts: ["artifact:task-review"],
+      evidence: ["evidence:task-review"]
+    });
+  });
+
   it("runs two developers concurrently and serializes the reviewer", async () => {
     const { adapter, orchestrator, sessions, store, tasks } = createHarness();
     await orchestrator.start({});
