@@ -221,6 +221,37 @@ function createConstraintDriftV2Database(): string {
   return path;
 }
 
+function createSemanticDriftVersionZeroDatabase(): string {
+  const path = temporaryDatabasePath();
+  const database = new DatabaseSync(path);
+  database.exec(P1A_SCHEMA_SQL.replace(
+    "id TEXT PRIMARY KEY,\n  definition_json",
+    "id TEXT COLLATE NOCASE PRIMARY KEY,\n  definition_json"
+  ));
+  database.prepare(`
+    INSERT INTO companies (id, definition_json, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run("company", "{}", "active", "created", "updated");
+  database.close();
+  return path;
+}
+
+function createSemanticDriftV2Database(): string {
+  const path = temporaryDatabasePath();
+  const database = new DatabaseSync(path);
+  database.exec(CORE_SCHEMA_SQL.replace(
+    "integration_ref TEXT NOT NULL UNIQUE",
+    "integration_ref TEXT NOT NULL COLLATE NOCASE UNIQUE"
+  ));
+  database.prepare(`
+    INSERT INTO companies (id, definition_json, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run("company", "{}", "active", "created", "updated");
+  database.exec("PRAGMA user_version = 2");
+  database.close();
+  return path;
+}
+
 function readUserVersion(path: string): number {
   const database = new DatabaseSync(path);
   try {
@@ -562,6 +593,20 @@ describe("Core schema migrations", () => {
     }
   });
 
+  it("rejects a version-zero P1A lookalike with NOCASE primary-key drift", () => {
+    const databasePath = createSemanticDriftVersionZeroDatabase();
+    const before = readSchemaLayout(databasePath);
+    const store = new CoreStore(databasePath);
+    try {
+      expect(() => store.initialize()).toThrow("schema migration");
+      expect(readUserVersion(databasePath)).toBe(0);
+      expect(readSchemaLayout(databasePath)).toEqual(before);
+      expect(countCompanies(databasePath)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it("rejects a future schema version without mutating it", () => {
     const databasePath = createFutureDatabase();
     const store = new CoreStore(databasePath);
@@ -595,6 +640,20 @@ describe("Core schema migrations", () => {
       expect(() => store.initialize()).toThrow("schema migration");
       expect(readUserVersion(databasePath)).toBe(2);
       expect(readSchemaLayout(databasePath)).toEqual(before);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a v2 lookalike with NOCASE required-unique-column drift", () => {
+    const databasePath = createSemanticDriftV2Database();
+    const before = readSchemaLayout(databasePath);
+    const store = new CoreStore(databasePath);
+    try {
+      expect(() => store.initialize()).toThrow("schema migration");
+      expect(readUserVersion(databasePath)).toBe(2);
+      expect(readSchemaLayout(databasePath)).toEqual(before);
+      expect(countCompanies(databasePath)).toBe(1);
     } finally {
       store.close();
     }

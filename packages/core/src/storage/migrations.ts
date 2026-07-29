@@ -66,9 +66,107 @@ function quoteIdentifier(identifier: string): string {
   return `"${identifier.replaceAll("\"", "\"\"")}"`;
 }
 
+function normalizeSchemaSql(sql: string): string {
+  const tokens: string[] = [];
+  for (let index = 0; index < sql.length;) {
+    const character = sql[index];
+    if (character === undefined) break;
+    if (/\s/u.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === "'" || character === "\"" || character === "`") {
+      const quote = character;
+      let token = quote;
+      index += 1;
+      while (index < sql.length) {
+        const quotedCharacter = sql[index];
+        if (quotedCharacter === undefined) break;
+        token += quotedCharacter;
+        index += 1;
+        if (quotedCharacter !== quote) continue;
+        if (sql[index] === quote) {
+          token += quote;
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      tokens.push(token);
+      continue;
+    }
+    if (character === "[") {
+      let token = character;
+      index += 1;
+      while (index < sql.length) {
+        const quotedCharacter = sql[index];
+        if (quotedCharacter === undefined) break;
+        token += quotedCharacter;
+        index += 1;
+        if (quotedCharacter !== "]") continue;
+        if (sql[index] === "]") {
+          token += "]";
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      tokens.push(token);
+      continue;
+    }
+    if (/[A-Za-z0-9_$]/u.test(character)) {
+      let token = character;
+      index += 1;
+      while (index < sql.length) {
+        const nextCharacter = sql[index];
+        if (nextCharacter === undefined || !/[A-Za-z0-9_$]/u.test(nextCharacter)) {
+          break;
+        }
+        token += nextCharacter;
+        index += 1;
+      }
+      tokens.push(token.toUpperCase());
+      continue;
+    }
+    tokens.push(character);
+    index += 1;
+  }
+
+  if (tokens[0] === "CREATE") {
+    const objectTypeIndex = tokens.findIndex((token, index) =>
+      index <= 2 && (token === "TABLE" || token === "INDEX")
+    );
+    if (
+      objectTypeIndex >= 0
+      && tokens[objectTypeIndex + 1] === "IF"
+      && tokens[objectTypeIndex + 2] === "NOT"
+      && tokens[objectTypeIndex + 3] === "EXISTS"
+    ) {
+      tokens.splice(objectTypeIndex + 1, 3);
+    }
+  }
+  return JSON.stringify(tokens);
+}
+
+function readNormalizedSchemaSql(
+  database: DatabaseSync,
+  type: "table" | "index",
+  name: string
+): string | null {
+  const row = database.prepare(`
+    SELECT sql
+    FROM sqlite_schema
+    WHERE type = ? AND name = ?
+  `).get(type, name) as DatabaseRow | undefined;
+  if (row === undefined) return null;
+  const sql = readNullableString(row, "sql");
+  return sql === null ? null : normalizeSchemaSql(sql);
+}
+
 function readSchemaStructure(database: DatabaseSync): {
   tables: Array<{
     name: string;
+    sql: string;
     columns: Array<{
       cid: number;
       name: string;
@@ -92,10 +190,19 @@ function readSchemaStructure(database: DatabaseSync): {
       unique: number;
       origin: string;
       partial: number;
+      sql: string | null;
       columns: Array<{
         seqno: number;
         cid: number;
         name: string | null;
+      }>;
+      extendedColumns: Array<{
+        seqno: number;
+        cid: number;
+        name: string | null;
+        descending: number;
+        collation: string;
+        key: number;
       }>;
     }>;
   }>;
@@ -107,6 +214,10 @@ function readSchemaStructure(database: DatabaseSync): {
 } {
   const tables = listUserTableNames(database).map((table) => {
     const quotedTable = quoteIdentifier(table);
+    const tableSql = readNormalizedSchemaSql(database, "table", table);
+    if (tableSql === null) {
+      throw new TypeError(`sqlite_schema SQL missing for table: ${table}`);
+    }
     const columns = (
       database.prepare(`PRAGMA table_info(${quotedTable})`).all() as DatabaseRow[]
     ).map((row) => ({
@@ -142,17 +253,29 @@ function readSchemaStructure(database: DatabaseSync): {
         cid: readNumber(column, "cid"),
         name: readNullableString(column, "name")
       }));
+      const extendedColumns = (
+        database.prepare(`PRAGMA index_xinfo(${quotedIndex})`).all() as DatabaseRow[]
+      ).map((column) => ({
+        seqno: readNumber(column, "seqno"),
+        cid: readNumber(column, "cid"),
+        name: readNullableString(column, "name"),
+        descending: readNumber(column, "desc"),
+        collation: readString(column, "coll"),
+        key: readNumber(column, "key")
+      }));
       return {
         name: origin === "c" ? indexName : null,
         unique: readNumber(row, "unique"),
         origin,
         partial: readNumber(row, "partial"),
-        columns: indexColumns
+        sql: readNormalizedSchemaSql(database, "index", indexName),
+        columns: indexColumns,
+        extendedColumns
       };
     }).sort((left, right) =>
       JSON.stringify(left).localeCompare(JSON.stringify(right))
     );
-    return { name: table, columns, foreignKeys, indexes };
+    return { name: table, sql: tableSql, columns, foreignKeys, indexes };
   });
   const otherObjects = database.prepare(`
     SELECT type, name, tbl_name
