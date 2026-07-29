@@ -20,6 +20,12 @@ import { GitCommandRunner } from "./git-command.js";
 
 const MINIMUM_GIT_VERSION = [2, 31, 0] as const;
 const AGENTTOWN_EXCLUDE = "/.agenttown/";
+const UPDATE_REF_TRANSACTION_INPUT = "start\nprepare\ncommit\n";
+const UPDATE_REF_ACKNOWLEDGEMENTS = [
+  "start: ok",
+  "prepare: ok",
+  "commit: ok"
+] as const;
 const IN_PROGRESS_MARKERS = [
   "MERGE_HEAD",
   "rebase-merge",
@@ -187,6 +193,12 @@ function validateWorktreeProtocol(output: string, projectRoot: string): void {
   }
 }
 
+function normalizedProtocolLines(output: string): string[] {
+  const lines = output.replace(/\r\n?/gu, "\n").split("\n");
+  while (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
 export class RepositoryPreflight {
   readonly #git: GitRunner;
 
@@ -238,13 +250,21 @@ export class RepositoryPreflight {
     }
 
     const branchResult = await this.#git.run(
-      ["symbolic-ref", "--quiet", "--short", "HEAD"],
+      ["symbolic-ref", "--quiet", "HEAD"],
       { cwd: canonicalProjectRoot, allowedExitCodes: [0, 1, 128] }
     );
     if (branchResult.exitCode !== 0) {
       throw new Error("project repository must have an attached branch");
     }
-    const originalBranch = trimmedLine(branchResult.stdout, "branch name");
+    const branchTarget = trimmedLine(branchResult.stdout, "HEAD symbolic target");
+    const branchPrefix = "refs/heads/";
+    if (
+      !branchTarget.startsWith(branchPrefix)
+      || branchTarget.length === branchPrefix.length
+    ) {
+      throw new Error("project repository must have an attached branch");
+    }
+    const originalBranch = branchTarget.slice(branchPrefix.length);
 
     const headResult = await this.#git.run(
       ["rev-parse", "HEAD"],
@@ -315,10 +335,19 @@ export class RepositoryPreflight {
 
     const updateRefResult = await this.#git.run(
       ["update-ref", "--stdin"],
-      { cwd: canonicalProjectRoot, stdin: "" }
+      {
+        cwd: canonicalProjectRoot,
+        stdin: UPDATE_REF_TRANSACTION_INPUT,
+        allowedExitCodes: [0, 1, 128]
+      }
     );
-    if (updateRefResult.stdout.length !== 0 || updateRefResult.stderr.length !== 0) {
-      throw new Error("Git update-ref protocol returned unexpected output");
+    if (
+      updateRefResult.exitCode !== 0
+      || updateRefResult.stderr.length !== 0
+      || normalizedProtocolLines(updateRefResult.stdout).join("\n")
+        !== UPDATE_REF_ACKNOWLEDGEMENTS.join("\n")
+    ) {
+      throw new Error("Git update-ref transaction capability check failed");
     }
 
     return {

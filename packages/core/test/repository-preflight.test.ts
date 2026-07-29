@@ -11,7 +11,9 @@ import {
   GitCommandError,
   GitCommandRunner,
   GitCommandTimeoutError,
-  GitOutputOverflowError
+  GitOutputOverflowError,
+  type GitCommandOptions,
+  type GitCommandResult
 } from "../src/git/git-command.js";
 import { RepositoryPreflight } from "../src/git/repository-preflight.js";
 import {
@@ -64,6 +66,7 @@ describe("RepositoryPreflight", () => {
     const repo = tracked(await createGitFixture());
     const gitignoreBefore = await readFile(join(repo.root, ".gitignore"), "utf8")
       .catch(() => null);
+    const refsBefore = (await repo.git(["show-ref"])).stdout;
 
     const result = await preflight.inspect(repo.root);
 
@@ -77,6 +80,7 @@ describe("RepositoryPreflight", () => {
     expect(await repo.readInfoExclude()).toContain("/.agenttown/");
     expect(await readFile(join(repo.root, ".gitignore"), "utf8").catch(() => null))
       .toBe(gitignoreBefore);
+    expect((await repo.git(["show-ref"])).stdout).toBe(refsBefore);
   });
 
   it("preserves existing exclude content without a final newline and is idempotent", async () => {
@@ -143,6 +147,14 @@ describe("RepositoryPreflight", () => {
     await expect(preflight.inspect(repo.root)).rejects.toThrow("attached branch");
   });
 
+  it("rejects a symbolic HEAD that targets a tag instead of a branch", async () => {
+    const repo = tracked(await createGitFixture());
+    await repo.git(["tag", "v1"]);
+    await repo.git(["symbolic-ref", "HEAD", "refs/tags/v1"]);
+
+    await expect(preflight.inspect(repo.root)).rejects.toThrow("attached branch");
+  });
+
   it.each([
     "MERGE_HEAD",
     "rebase-merge",
@@ -167,6 +179,65 @@ describe("RepositoryPreflight", () => {
       .toBe(expectedCommonDir.replaceAll("\\", "/"));
     expect(await repo.readInfoExclude()).toContain("/.agenttown/");
   });
+
+  it("requires the exact atomic update-ref transaction acknowledgements", async () => {
+    const repo = tracked(await createGitFixture());
+    const delegate = new GitCommandRunner();
+    let transactionStdin: string | undefined;
+    const injected = {
+      async run(
+        args: readonly string[],
+        options: GitCommandOptions
+      ): Promise<GitCommandResult> {
+        if (args[0] !== "update-ref") return delegate.run(args, options);
+        transactionStdin = options.stdin;
+        return {
+          stdout: "start: ok\r\nprepare: ok\r\ncommit: ok\r\n",
+          stderr: "",
+          exitCode: 0
+        };
+      }
+    };
+
+    await expect(new RepositoryPreflight(injected).inspect(repo.root))
+      .resolves.toBeDefined();
+    expect(transactionStdin).toBe("start\nprepare\ncommit\n");
+  });
+
+  it.each([
+    ["missing acknowledgement", {
+      stdout: "start: ok\nprepare: ok\n",
+      stderr: "",
+      exitCode: 0
+    }],
+    ["wrong acknowledgement order", {
+      stdout: "start: ok\ncommit: ok\nprepare: ok\n",
+      stderr: "",
+      exitCode: 0
+    }],
+    ["nonzero exit", {
+      stdout: "start: ok\nprepare: ok\ncommit: ok\n",
+      stderr: "transaction failed",
+      exitCode: 1
+    }]
+  ] satisfies ReadonlyArray<readonly [string, GitCommandResult]>)(
+    "rejects an update-ref transaction with %s",
+    async (_label, updateRefResult) => {
+      const repo = tracked(await createGitFixture());
+      const delegate = new GitCommandRunner();
+      const injected = {
+        run: (
+          args: readonly string[],
+          options: GitCommandOptions
+        ): Promise<GitCommandResult> => args[0] === "update-ref"
+          ? Promise.resolve(updateRefResult)
+          : delegate.run(args, options)
+      };
+
+      await expect(new RepositoryPreflight(injected).inspect(repo.root))
+        .rejects.toThrow("update-ref transaction");
+    }
+  );
 });
 
 describe("GitCommandRunner", () => {
