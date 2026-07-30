@@ -1,7 +1,8 @@
 import type {
   ActionProposal,
   ActionType,
-  CompanyDefinition
+  CompanyDefinition,
+  TaskRecord
 } from "@agenttown/runtime-contract";
 
 const supportedActions = new Set<ActionType>([
@@ -25,11 +26,22 @@ const leaderOnlyActions = new Set<ActionType>([
 ]);
 
 export class ActionPolicy {
+  readonly #authorizedReviewerIds: ReadonlySet<string>;
+
   constructor(
     private readonly company: CompanyDefinition,
     private readonly leaderId: string,
-    private readonly reviewerIds: ReadonlySet<string>
-  ) {}
+    reviewerIds: ReadonlySet<string>,
+    private readonly taskLookup?: (taskId: string) => TaskRecord | null
+  ) {
+    for (const reviewerId of reviewerIds) {
+      const reviewer = company.employees.find(({ id }) => id === reviewerId);
+      if (reviewer === undefined || reviewer.workspace !== "review_package") {
+        throw new Error(`invalid configured reviewer: ${reviewerId}`);
+      }
+    }
+    this.#authorizedReviewerIds = new Set(reviewerIds);
+  }
 
   validate(action: ActionProposal): ActionProposal {
     if (!supportedActions.has(action.type)) {
@@ -49,19 +61,32 @@ export class ActionPolicy {
 
     if (action.type === "task.assign") {
       const assignee = action.payload.assignee;
-      if (
-        typeof assignee !== "string"
-        || !this.company.employees.some((employee) => employee.id === assignee)
-      ) {
+      const employee = typeof assignee === "string"
+        ? this.company.employees.find(({ id }) => id === assignee)
+        : undefined;
+      if (employee === undefined) {
         throw new Error(`unknown assignee: ${String(assignee)}`);
+      }
+      if (employee.workspace !== "git_worktree") {
+        throw new Error("task assignee requires git_worktree workspace");
       }
     }
 
     if (
       (action.type === "task.approve" || action.type === "task.reject")
-      && !this.reviewerIds.has(action.actorEmployeeId)
+      && (
+        !this.#authorizedReviewerIds.has(action.actorEmployeeId)
+        || actor.workspace !== "review_package"
+      )
     ) {
       throw new Error("review permission required");
+    }
+    if (
+      (action.type === "task.approve" || action.type === "task.reject")
+      && action.taskId !== null
+      && this.taskLookup?.(action.taskId)?.ownerEmployeeId === action.actorEmployeeId
+    ) {
+      throw new Error("task owner cannot review their own submission");
     }
 
     if (action.type === "employee.message") {

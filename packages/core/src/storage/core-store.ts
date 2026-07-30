@@ -47,6 +47,17 @@ export interface StoredReviewDecision {
   decision: ReviewDecision;
 }
 
+export interface ApprovalRecord {
+  id: string;
+  companyId: string;
+  taskId: string | null;
+  status: "pending" | "approved" | "rejected";
+  request: Record<string, unknown>;
+  decision: Record<string, unknown> | null;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
 type DatabaseRow = Record<string, unknown>;
 
 function parseJsonObject<T extends object>(json: string, label: string): T {
@@ -628,6 +639,89 @@ export class CoreStore {
     });
   }
 
+  commitGitSubmissionCreation(input: {
+    submission: GitSubmissionRecord;
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      if (this.getGitSubmission(
+        input.submission.runId,
+        input.submission.taskId,
+        input.submission.revision
+      ) !== null) {
+        throw new Error("Git submission revision is immutable");
+      }
+      const latest = this.listGitSubmissions(
+        input.submission.runId,
+        input.submission.taskId
+      ).at(-1);
+      const expectedRevision = (latest?.revision ?? 0) + 1;
+      if (input.submission.revision !== expectedRevision) {
+        throw new Error(
+          `Git submission revision must increment to ${expectedRevision}`
+        );
+      }
+      if (input.submission.status !== "validated") {
+        throw new Error("new Git submission must be validated");
+      }
+      this.#putGitSubmissionRow(input.submission);
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
+  }
+
+  commitGitSubmissionReviewStart(input: {
+    companyId: string;
+    submission: GitSubmissionRecord;
+    task: TaskRecord;
+    reviewPackage: ReviewPackageRecord;
+    events: readonly NewEvent[];
+  }): void {
+    if (input.events.length === 0) {
+      throw new Error("commitGitSubmissionReviewStart requires events");
+    }
+    assertTaskScopedEvents(input.task.id, input.events);
+    const insertedEvents = this.inTransaction(() => {
+      const run = this.getGitRun(input.submission.runId);
+      const currentTask = this.getTask(input.companyId, input.task.id);
+      const currentSubmission = this.getGitSubmission(
+        input.submission.runId,
+        input.submission.taskId,
+        input.submission.revision
+      );
+      const latest = this.listGitSubmissions(
+        input.submission.runId,
+        input.submission.taskId
+      ).at(-1);
+      const reviewPackage = this.getReviewPackage(
+        input.reviewPackage.runId,
+        input.reviewPackage.taskId,
+        input.reviewPackage.revision
+      );
+      if (run === null || run.companyId !== input.companyId
+        || input.task.id !== input.submission.taskId
+        || currentTask === null || currentTask.status !== "running"
+        || currentTask.ownerEmployeeId !== input.task.ownerEmployeeId
+        || input.task.status !== "review"
+        || currentSubmission === null || currentSubmission.status !== "validated"
+        || currentSubmission.revision !== latest?.revision
+        || JSON.stringify(currentSubmission.submission)
+          !== JSON.stringify(input.submission.submission)
+        || input.submission.status !== "in_review"
+        || reviewPackage === null
+        || JSON.stringify(reviewPackage) !== JSON.stringify(input.reviewPackage)
+        || reviewPackage.runId !== input.submission.runId
+        || reviewPackage.taskId !== input.submission.taskId
+        || reviewPackage.revision !== input.submission.revision) {
+        throw new Error("Git review start facts are stale or mismatched");
+      }
+      this.#putGitSubmissionRow(input.submission);
+      this.#putTaskRow(input.companyId, input.task);
+      return input.events.map((event) => this.#insertEventRow(event));
+    });
+    this.#publishEvents(insertedEvents);
+  }
+
   getGitSubmission(
     runId: string,
     taskId: string,
@@ -663,6 +757,23 @@ export class CoreStore {
     return rows.map((row) =>
       parseGitSubmissionRecord(readString(row, "record_json"))
     );
+  }
+
+  latestGitSubmissionForCompanyTask(
+    companyId: string,
+    taskId: string
+  ): GitSubmissionRecord | null {
+    const row = this.#database.prepare(`
+      SELECT submissions.record_json
+      FROM git_submissions AS submissions
+      INNER JOIN git_runs AS runs ON runs.run_id = submissions.run_id
+      WHERE runs.company_id = ? AND submissions.task_id = ?
+      ORDER BY submissions.revision DESC, submissions.run_id DESC
+      LIMIT 1
+    `).get(companyId, taskId) as DatabaseRow | undefined;
+    return row === undefined
+      ? null
+      : parseGitSubmissionRecord(readString(row, "record_json"));
   }
 
   putValidationCommandGrant(grant: ValidationCommandGrant): void {
@@ -966,6 +1077,15 @@ export class CoreStore {
 
   putReviewDecision(input: StoredReviewDecision): void {
     this.inTransaction(() => {
+      const existing = this.getReviewDecision(
+        input.runId,
+        input.taskId,
+        input.revision
+      );
+      if (existing !== null) {
+        if (JSON.stringify(existing) === JSON.stringify(input.decision)) return;
+        throw new Error("review decision revision is immutable");
+      }
       this.#database.prepare(`
         INSERT INTO review_decisions (
           run_id,
@@ -974,8 +1094,6 @@ export class CoreStore {
           record_json
         )
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(run_id, task_id, revision) DO UPDATE SET
-          record_json = excluded.record_json
       `).run(
         input.runId,
         input.taskId,
@@ -983,6 +1101,135 @@ export class CoreStore {
         JSON.stringify(input.decision)
       );
     });
+  }
+
+  commitGitReviewDecision(input: {
+    companyId: string;
+    runId: string;
+    task: TaskRecord;
+    submission: GitSubmissionRecord;
+    decision: ReviewDecision;
+    approval?: ApprovalRecord;
+    events: readonly NewEvent[];
+  }): void {
+    if (input.events.length === 0) {
+      throw new Error("commitGitReviewDecision requires events");
+    }
+    assertTaskScopedEvents(input.task.id, input.events);
+    const insertedEvents = this.inTransaction(() => {
+      const run = this.getGitRun(input.runId);
+      const currentTask = this.getTask(input.companyId, input.task.id);
+      const currentSubmission = this.getGitSubmission(
+        input.runId,
+        input.task.id,
+        input.submission.revision
+      );
+      const latest = this.listGitSubmissions(input.runId, input.task.id).at(-1);
+      const reviewPackage = this.getReviewPackage(
+        input.runId,
+        input.task.id,
+        input.submission.revision
+      );
+      if (run === null || run.companyId !== input.companyId
+        || currentTask === null || currentTask.status !== "review"
+        || currentTask.updatedEventId === input.task.updatedEventId
+        || currentTask.ownerEmployeeId !== input.task.ownerEmployeeId
+        || currentSubmission === null || currentSubmission.status !== "in_review"
+        || latest?.revision !== input.submission.revision
+        || JSON.stringify(currentSubmission.submission)
+          !== JSON.stringify(input.submission.submission)
+        || reviewPackage === null
+        || reviewPackage.manifestHash !== input.decision.reviewedManifestHash
+        || this.getReviewDecision(
+          input.runId,
+          input.task.id,
+          input.submission.revision
+        ) !== null) {
+        throw new Error("Git review decision facts are stale or already decided");
+      }
+      this.#database.prepare(`
+        INSERT INTO review_decisions (
+          run_id,
+          task_id,
+          revision,
+          record_json
+        )
+        VALUES (?, ?, ?, ?)
+      `).run(
+        input.runId,
+        input.task.id,
+        input.submission.revision,
+        JSON.stringify(input.decision)
+      );
+      this.#putGitSubmissionRow(input.submission);
+      this.#putTaskRow(input.companyId, input.task);
+      if (input.approval !== undefined) {
+        const existing = this.#database.prepare(`
+          SELECT id, company_id, task_id, status, request_json,
+                 decision_json, created_at, decided_at
+          FROM approvals
+          WHERE id = ?
+        `).get(input.approval.id) as DatabaseRow | undefined;
+        if (existing === undefined) {
+          this.#database.prepare(`
+            INSERT INTO approvals (
+              id, company_id, task_id, status, request_json,
+              decision_json, created_at, decided_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            input.approval.id,
+            input.approval.companyId,
+            input.approval.taskId,
+            input.approval.status,
+            JSON.stringify(input.approval.request),
+            input.approval.decision === null
+              ? null
+              : JSON.stringify(input.approval.decision),
+            input.approval.createdAt,
+            input.approval.decidedAt
+          );
+        } else if (
+          readString(existing, "company_id") !== input.approval.companyId
+          || readNullableString(existing, "task_id") !== input.approval.taskId
+          || readString(existing, "status") !== input.approval.status
+          || readString(existing, "request_json")
+            !== JSON.stringify(input.approval.request)
+        ) {
+          throw new Error("review escalation approval identity is not idempotent");
+        }
+      }
+      return input.events.map((event) => this.#insertEventRow(event));
+    });
+    this.#publishEvents(insertedEvents);
+  }
+
+  listPendingApprovals(companyId: string): ApprovalRecord[] {
+    const rows = this.#database.prepare(`
+      SELECT id, company_id, task_id, status, request_json,
+             decision_json, created_at, decided_at
+      FROM approvals
+      WHERE company_id = ? AND status = 'pending'
+      ORDER BY created_at ASC, id ASC
+    `).all(companyId) as DatabaseRow[];
+    return rows.map((row) => ({
+      id: readString(row, "id"),
+      companyId: readString(row, "company_id"),
+      taskId: readNullableString(row, "task_id"),
+      status: "pending",
+      request: parseJsonObject<Record<string, unknown>>(
+        readString(row, "request_json"),
+        "approval request"
+      ),
+      decision: readNullableString(row, "decision_json") === null
+        ? null
+        : parseJsonObject<Record<string, unknown>>(
+            readString(row, "decision_json"),
+            "approval decision"
+          ),
+      createdAt: readString(row, "created_at"),
+      decidedAt: readNullableString(row, "decided_at")
+    }));
   }
 
   getReviewDecision(

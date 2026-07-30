@@ -137,6 +137,13 @@ export class TaskService {
       if (actor.workspace !== "review_package") {
         throw new Error("review permission required");
       }
+      const gitSubmission = this.store.latestGitSubmissionForCompanyTask(
+        this.companyId,
+        taskId
+      );
+      if (gitSubmission !== null) {
+        throw new Error("Git task completion requires integration");
+      }
       if (record.artifacts.length === 0 || record.evidence.length === 0) {
         throw new Error("submission evidence required");
       }

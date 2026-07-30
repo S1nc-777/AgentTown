@@ -1,5 +1,6 @@
 export {
   CoreStore,
+  type ApprovalRecord,
   type EventRecord,
   type NewEvent,
   type StoredCheckpoint,
@@ -12,7 +13,14 @@ export {
   type FakeAgentAdapterOptions
 } from "./agents/fake-adapter.js";
 export { SessionManager } from "./agents/session-manager.js";
-export { CompanyOrchestrator } from "./company/orchestrator.js";
+export {
+  CompanyOrchestrator,
+  FakeTaskWorkflow,
+  GitTaskWorkflow,
+  type GitTaskWorkflowCoordinator,
+  type TaskWorkflow,
+  type TaskWorkflowHandlers
+} from "./company/orchestrator.js";
 export { TaskService } from "./tasks/task-service.js";
 export {
   LeaseRegistry,
@@ -75,3 +83,15 @@ export {
   type EvidencePackageBuilderDependencies,
   type EvidencePackageInput
 } from "./git/evidence-package.js";
+export {
+  ReviewService,
+  type RecordReviewDecisionInput,
+  type ReviewOutcome,
+  type ReviewServiceOptions
+} from "./git/review-service.js";
+export {
+  GitWorkflowCoordinator,
+  type AssignTaskOutcome,
+  type GitWorkflowCoordinatorOptions,
+  type SubmitTaskOutcome
+} from "./git/git-workflow-coordinator.js";

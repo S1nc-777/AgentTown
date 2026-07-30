@@ -15,6 +15,66 @@ import { ActionPolicy } from "../policy/action-policy.js";
 import { CoreStore } from "../storage/core-store.js";
 import { TaskService } from "../tasks/task-service.js";
 
+export interface TaskWorkflow {
+  handles(action: ActionProposal): boolean;
+  assign(action: ActionProposal): Promise<void>;
+  submit(action: ActionProposal): Promise<void>;
+  review(action: ActionProposal): Promise<void>;
+}
+
+export interface TaskWorkflowHandlers {
+  assign(action: ActionProposal): Promise<void>;
+  submit(action: ActionProposal): Promise<void>;
+  review(action: ActionProposal): Promise<void>;
+}
+
+export class FakeTaskWorkflow implements TaskWorkflow {
+  constructor(private readonly handlers: TaskWorkflowHandlers) {}
+
+  handles(_action: ActionProposal): boolean {
+    return true;
+  }
+
+  async assign(action: ActionProposal): Promise<void> {
+    await this.handlers.assign(action);
+  }
+
+  async submit(action: ActionProposal): Promise<void> {
+    await this.handlers.submit(action);
+  }
+
+  async review(action: ActionProposal): Promise<void> {
+    await this.handlers.review(action);
+  }
+}
+
+export interface GitTaskWorkflowCoordinator {
+  handles(action: ActionProposal): boolean;
+  assignTask(action: ActionProposal): Promise<unknown>;
+  submitTask(action: ActionProposal): Promise<unknown>;
+  recordReview(action: ActionProposal): Promise<unknown>;
+}
+
+export class GitTaskWorkflow implements TaskWorkflow {
+  constructor(private readonly coordinator: GitTaskWorkflowCoordinator) {}
+
+  handles(action: ActionProposal): boolean {
+    return this.coordinator.handles(action);
+  }
+
+  async assign(action: ActionProposal): Promise<void> {
+    await this.coordinator.assignTask(action);
+  }
+
+  async submit(action: ActionProposal): Promise<void> {
+    await this.coordinator.submitTask(action);
+  }
+
+  async review(action: ActionProposal): Promise<void> {
+    await this.coordinator.recordReview(action);
+  }
+}
+
 function requiredTaskId(action: ActionProposal): string {
   if (action.taskId === null) throw new Error(`${action.type} requires taskId`);
   return action.taskId;
@@ -58,6 +118,7 @@ export class CompanyOrchestrator {
   #dispatchEpoch = 0;
   #dispatchController = new AbortController();
   #reviewRecoveryTail: Promise<void> = Promise.resolve();
+  readonly #fakeTaskWorkflow: FakeTaskWorkflow;
 
   constructor(
     private readonly companyId: string,
@@ -67,8 +128,37 @@ export class CompanyOrchestrator {
     private readonly policy: ActionPolicy,
     private readonly sessions: SessionManager,
     private readonly leaderId: string,
-    private readonly reviewerId: string
-  ) {}
+    private readonly reviewerId: string,
+    private readonly gitTaskWorkflow?: TaskWorkflow
+  ) {
+    this.#fakeTaskWorkflow = new FakeTaskWorkflow({
+      assign: async (action) => {
+        await this.#assignAndSend(action);
+      },
+      submit: async (action) => {
+        await this.#recordSubmissionAndRequestReview(action);
+      },
+      review: async (action) => {
+        if (action.type === "task.approve") {
+          this.tasks.transition(
+            requiredTaskId(action),
+            "completed",
+            action.actorEmployeeId
+          );
+          return;
+        }
+        if (action.type === "task.reject") {
+          await this.#rejectAndMaybeRequeue(
+            requiredTaskId(action),
+            action.actorEmployeeId,
+            requiredStringArray(action.payload.findings)
+          );
+          return;
+        }
+        throw new Error(`Fake review workflow cannot handle ${action.type}`);
+      }
+    });
+  }
 
   async start(scenarios: Readonly<Record<string, string>>): Promise<void> {
     try {
@@ -100,24 +190,16 @@ export class CompanyOrchestrator {
         this.#createProposedTask(action);
         return;
       case "task.assign":
-        await this.#assignAndSend(action);
+        await this.#taskWorkflow(action).assign(action);
         return;
       case "task.submit":
-        await this.#recordSubmissionAndRequestReview(action);
+        await this.#taskWorkflow(action).submit(action);
         return;
       case "task.approve":
-        this.tasks.transition(
-          requiredTaskId(action),
-          "completed",
-          action.actorEmployeeId
-        );
+        await this.#taskWorkflow(action).review(action);
         return;
       case "task.reject":
-        await this.#rejectAndMaybeRequeue(
-          requiredTaskId(action),
-          action.actorEmployeeId,
-          requiredStringArray(action.payload.findings)
-        );
+        await this.#taskWorkflow(action).review(action);
         return;
       case "task.start":
       case "task.request_review":
@@ -432,6 +514,11 @@ export class CompanyOrchestrator {
   async #applySupportedControlAction(action: ActionProposal): Promise<void> {
     switch (action.type) {
       case "task.start": {
+        if (this.gitTaskWorkflow?.handles(action) === true) {
+          throw new Error(
+            "Git task start requires coordinator assignment with WritableTaskContext"
+          );
+        }
         const task = this.tasks.get(requiredTaskId(action));
         if (task.ownerEmployeeId === null) throw new Error(`task has no owner: ${task.id}`);
         if (task.ownerEmployeeId !== action.actorEmployeeId) {
@@ -441,6 +528,11 @@ export class CompanyOrchestrator {
         return;
       }
       case "task.request_review":
+        if (this.gitTaskWorkflow?.handles(action) === true) {
+          throw new Error(
+            "Git review requires a structured submission through the coordinator"
+          );
+        }
         await this.requestReview(requiredTaskId(action));
         return;
       case "task.block":
@@ -639,5 +731,11 @@ export class CompanyOrchestrator {
       causationEventId: null,
       payload
     });
+  }
+
+  #taskWorkflow(action: ActionProposal): TaskWorkflow {
+    return this.gitTaskWorkflow?.handles(action) === true
+      ? this.gitTaskWorkflow
+      : this.#fakeTaskWorkflow;
   }
 }
