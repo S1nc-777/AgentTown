@@ -3,12 +3,12 @@
 - 更新日期：2026-07-30
 - 当前开发分支：`codex/p1b-git-collaboration`
 - P1B 基线：`2ea80ab`
-- 当前功能提交：`baad570`
-- 下一项任务：P1B Task 6
+- 当前功能提交：`589c5ea`
+- 下一项任务：P1B Task 7
 
 ## 一句话状态
 
-AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前五项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
+AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前六项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
 
 ## 已完成
 
@@ -27,7 +27,7 @@ P1A 是架构验证切片，不包含真实 Agent、Git worktree 协作或桌面
 
 ### P1B：Git 协作闭环
 
-P1B 计划共有 12 项。目前 Task 1–5 已完成并通过独立规格/代码质量审查，Task 6–12 尚未开始。
+P1B 计划共有 12 项。目前 Task 1–6 已完成并通过独立规格/代码质量审查，Task 7–12 尚未开始。
 
 | 任务 | 状态 | 提交范围 | 结果 |
 | --- | --- | --- | --- |
@@ -36,15 +36,16 @@ P1B 计划共有 12 项。目前 Task 1–5 已完成并通过独立规格/代�
 | 3. Git 边界与仓库预检 | 完成 | `f01c976..ef29598` | 审查通过 |
 | 4. Run/Task worktree 生命周期 | 完成 | `ef29598..bf01269` | 审查通过 |
 | 5. 结构化验证与证据日志 | 完成 | `1b27f2e..baad570` | 审查通过 |
-| 6–12. 审核、集成、恢复、CLI、E2E | 待办 | — | 尚未开始 |
+| 6. 提交验证与不可变审核包 | 完成 | `31ce670..589c5ea` | 审查通过 |
+| 7–12. 审核、集成、恢复、CLI、E2E | 待办 | — | 尚未开始 |
 
-Task 5 最终验证证据：
+Task 6 最终验证证据：
 
-- 验证与存储定向测试：32/32 通过；
-- Core：13 个测试文件、247 个测试通过；
+- 提交与审核包定向测试：50/50 通过；
+- Core：15 个测试文件、297 个测试通过；
 - 工作区类型检查：全部适用项目通过；
 - 独立复审：Spec Approved、Code-quality Approved；
-- 没有启动 Task 6。
+- 没有启动 Task 7。
 
 ## 当前架构边界
 
@@ -74,6 +75,8 @@ flowchart TB
 - 对命令 scope、公司归属、workspace、cwd 和授权指纹进行执行前校验；
 - 生成有界、脱敏、哈希校验且原子发布的验证证据；
 - 以身份安全、绝对截止时间和 fail-closed 语义处理进程树清理。
+- 从 Git 自行推导连续提交、文件、二进制元数据和文本 patch；
+- 生成逐文件哈希、不可覆盖、可重新验证的独立审核包。
 
 ## 开发经验
 
@@ -132,27 +135,39 @@ PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/
 
 一个 `CompanyDefinition` 不能替另一个公司的 run 授权。配置 revision、companyId、workspaceId、executable、args、cwd 和 timeout 都是权限边界；建议命令中的明显 token/password/API-key/Bearer 字面量在持久化 grant 前直接拒绝。
 
+### 13. TypeScript 类型不是运行时信任边界
+
+名称为 `ValidatedSubmission` 的结构对象仍可被调用者伪造。审核包发布前必须重新从 Git 和 CoreStore 派生提交、patch、文件、任务负责人、状态和验证证据，并逐字段比较；不能因为编译期类型正确就跳过权威校验。
+
+### 14. 不可变证据需要文件系统与数据库同时成立
+
+审核包先写入唯一临时目录，逐文件 fsync 和校验，最后发布并把 record/event 在一个事务中提交。目标目录和数据库记录只有完全一致时才允许幂等返回；不能覆盖、不能用调用者自构造 record 验证，也不能在 DB 失败后把身份不明的目录当作自己拥有。
+
+### 15. Git 的展示扩展也属于输入面
+
+`--no-ext-diff` 不会关闭 textconv。权威 patch 还必须使用 `--no-textconv`，否则仓库或用户配置可能把二进制文件转换成文本并混入审核证据。
+
 ## 已知问题与环境残留
 
 - 真实 Claude Code、OpenCode、Hermes Agent 适配尚未开始。
 - 根目录 `pnpm typecheck` 的依赖构建顺序仍值得后续整理；各包脚本目前承担部分预构建责任。
-- 截至本次复核，Windows 临时目录中有 24 个历史 `agenttown-git-*` 和 25 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
+- 截至本次复核，Windows 临时目录中有 24 个历史 `agenttown-git-*` 和 26 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
 - 仓库包元数据声明 `AGPL-3.0-only`，独立 `LICENSE` 文件和贡献指南仍待补齐。
 
-## 下一步：Task 6
+## 下一步：Task 7
 
-下一次开发从 [P1B 实施计划的 Task 6](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-6-submission-validation-and-immutable-review-packages) 继续：
+下一次开发从 [P1B 实施计划的 Task 7](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-7-review-state-and-git-workflow-coordinator) 继续：
 
-> Submission Validation and Immutable Review Packages
+> Review State and Git Workflow Coordinator
 
-目标是校验任务提交的 commit 范围和权威验证结果，并生成内容寻址、不可覆盖、可供独立审核员只读检查的审核包。
+目标是把提交、权威验证、审核包、独立审核决定和任务状态串成一个确定性的 Git 工作流，并在审核包发生变化时立即停止。
 
 恢复开发前应确认：
 
 1. 分支为 `codex/p1b-git-collaboration`；
 2. `git status --short` 为空；
-3. HEAD 至少包含 `baad570`；
-4. Task 1–5 不重新实现；
+3. HEAD 至少包含 `589c5ea`；
+4. Task 1–6 不重新实现；
 5. 先读 P1B 设计、实施计划和本文；
 6. 使用 TDD 和独立只读复审；
 7. 不在同一 Windows 工作区并发运行多套真实 Git 测试。
@@ -162,10 +177,10 @@ PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/
 如果后续对话上下文被压缩，只需保留以下事实：
 
 - 产品：AgentTown，本地“赛博公司”式多 Agent 调度器；
-- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–5；
+- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–6；
 - 当前分支：`codex/p1b-git-collaboration`；
-- 当前功能提交：`baad570`；
-- Task 5 已经完整测试并通过独立复审；
-- Task 6–12 尚未开始；
-- 下一步只做 Task 6，不重做之前任务；
+- 当前功能提交：`589c5ea`；
+- Task 6 已经完整测试并通过独立复审；
+- Task 7–12 尚未开始；
+- 下一步只做 Task 7，不重做之前任务；
 - README 与本文是面向用户和开发者的当前权威摘要，详细规则以 P1B spec/plan 为准。

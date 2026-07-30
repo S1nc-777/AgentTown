@@ -46,7 +46,7 @@ flowchart LR
 - P1A：一间由四个 Fake Agent 组成的本地公司；
 - Windows Named Pipe、SQLite 事实库、事件流、任务 DAG、暂停与恢复；
 - CLI 的初始化、启动、状态、任务、时间线、暂停、恢复和停止；
-- P1B 前五项：Git 协作契约、版本化存储、仓库安全预检、独立 worktree 生命周期，以及结构化验证命令与脱敏证据日志。
+- P1B 前六项：Git 协作契约、版本化存储、仓库安全预检、独立 worktree 生命周期、结构化验证命令与脱敏证据日志，以及不可变审核包。
 
 当前尚未完成：
 
@@ -135,7 +135,7 @@ AgentTown 的目标不是让模型随意控制电脑。当前设计坚持：
 ## 路线图
 
 - [x] P1A：Fake Company 核心闭环
-- [ ] P1B：Git 协作闭环（12 项中的前 5 项已完成）
+- [ ] P1B：Git 协作闭环（12 项中的前 6 项已完成）
 - [ ] P1C：Claude Code、OpenCode、Hermes Agent 适配器
 - [ ] P1D：四人真实 Agent Alpha 验收
 - [ ] 桌面端“赛博办公室”看板
