@@ -12,6 +12,7 @@ import type { NewEvent } from "../storage/core-store.js";
 import { CoreStore } from "../storage/core-store.js";
 
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
+const MAX_PROC_STAT_BYTES = 64 * 1024;
 
 export interface ValidationScope {
   runId: string;
@@ -105,6 +106,27 @@ function assertCommand(command: ValidationCommand): void {
   if (!Number.isSafeInteger(command.timeoutSeconds)
     || command.timeoutSeconds < 1 || command.timeoutSeconds > 3600) {
     throw new TypeError("validation command timeoutSeconds must be between 1 and 3600");
+  }
+}
+
+function isSensitiveKey(value: string): boolean {
+  return /(?:token|secret|password|api[-_]?key|authorization)/iu.test(value);
+}
+
+function assertGrantContainsNoObviousSecret(command: ValidationCommand): void {
+  const fields = [command.executable, command.cwd, ...command.args];
+  const assignment = /(?:^|[^A-Za-z0-9_])(?:--?)?[A-Za-z0-9_-]*(?:token|secret|password|api[-_]?key)[A-Za-z0-9_-]*\s*(?:=|:)\s*\S+/iu;
+  const bearer = /\b(?:authorization\s*[:=]?\s*)?bearer\s+\S+/iu;
+  if (fields.some((value) => assignment.test(value) || bearer.test(value))) {
+    throw new TypeError("suggested validation command contains an obvious sensitive literal");
+  }
+  for (let index = 0; index + 1 < command.args.length; index += 1) {
+    const flag = command.args[index]!;
+    if (/^--?[A-Za-z0-9_-]+$/u.test(flag)
+      && isSensitiveKey(flag.replace(/^--?/u, ""))
+      && command.args[index + 1]!.length > 0) {
+      throw new TypeError("suggested validation command contains an obvious sensitive literal");
+    }
   }
 }
 
@@ -302,7 +324,7 @@ async function assertSameDirectory(
   }
 }
 
-async function makeSafeDirectory(root: string, target: string): Promise<void> {
+async function makeSafeDirectory(root: string, target: string): Promise<DirectoryIdentity> {
   const resolvedRoot = resolve(root);
   const resolvedTarget = resolve(target);
   if (!isWithin(resolvedRoot, resolvedTarget)) throw new Error("validation log path escaped project root");
@@ -319,6 +341,7 @@ async function makeSafeDirectory(root: string, target: string): Promise<void> {
       throw new Error("validation log path contains a symbolic link or reparse point");
     }
   }
+  return await inspectSafeDirectory(resolvedRoot, resolvedTarget);
 }
 
 async function waitForCloseUntil(
@@ -401,22 +424,125 @@ async function snapshotWindows(deadlineAt: number): Promise<Array<ProcessIdentit
   return JSON.parse(output) as Array<ProcessIdentity & { parentPid: number }>;
 }
 
-async function snapshotPosix(deadlineAt: number): Promise<Array<ProcessIdentity & { parentPid: number }>> {
-  const output = await captureCommand("ps", ["-eo", "pid=,ppid=,lstart="], deadlineAt);
+function posixRelationships(output: string): Array<{ pid: number; parentPid: number }> {
   return output.split(/\r?\n/u).flatMap((line) => {
-    const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s*$/u.exec(line);
     return match === null ? [] : [{
       pid: Number(match[1]),
-      parentPid: Number(match[2]),
-      started: match[3]!
+      parentPid: Number(match[2])
     }];
   });
 }
 
-async function snapshotAll(deadlineAt: number): Promise<Array<ProcessIdentity & { parentPid: number }>> {
-  return process.platform === "win32"
-    ? await snapshotWindows(deadlineAt)
-    : await snapshotPosix(deadlineAt);
+function treeProcessIds(
+  rows: ReadonlyArray<{ pid: number; parentPid: number }>,
+  rootPid: number
+): Set<number> {
+  const selected = new Set<number>([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (selected.has(row.parentPid) && !selected.has(row.pid)) {
+        selected.add(row.pid);
+        changed = true;
+      }
+    }
+  }
+  return selected;
+}
+
+export function parseLinuxProcStatStarttime(value: string): string {
+  const close = value.lastIndexOf(")");
+  if (close < 0) throw new Error("invalid Linux process stat");
+  const prefix = value.slice(0, close + 1);
+  if (!/^\d+\s+\(/u.test(prefix)) throw new Error("invalid Linux process stat");
+  const fields = value.slice(close + 1).trim().split(/\s+/u);
+  const starttime = fields[19];
+  if (starttime === undefined || !/^\d+$/u.test(starttime)) {
+    throw new Error("invalid Linux process stat starttime");
+  }
+  return starttime;
+}
+
+async function readLinuxProcStatStarttime(pid: number): Promise<string | null> {
+  let handle;
+  try {
+    handle = await open(`/proc/${String(pid)}/stat`, "r");
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw error;
+  }
+  try {
+    const buffer = Buffer.allocUnsafe(MAX_PROC_STAT_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_PROC_STAT_BYTES) throw new Error("Linux process stat exceeded size limit");
+    return parseLinuxProcStatStarttime(buffer.subarray(0, bytesRead).toString("utf8"));
+  } finally {
+    await handle.close();
+  }
+}
+
+interface LinuxProcessTreeDependencies {
+  snapshotRelationships(
+    rootPid: number,
+    deadlineAt: number
+  ): Promise<Array<{ pid: number; parentPid: number }>>;
+  readStarttime(pid: number): Promise<string | null>;
+  terminate?(
+    child: ChildProcess,
+    members: readonly ProcessIdentity[],
+    deadlineAt: number
+  ): Promise<void>;
+}
+
+export function createInjectedLinuxProcessTreeController(
+  dependencies: LinuxProcessTreeDependencies
+): ProcessTreeController {
+  return {
+    async snapshot(rootPid) {
+      const deadlineAt = Date.now() + 5_000;
+      const rows = await dependencies.snapshotRelationships(rootPid, deadlineAt);
+      const selected = treeProcessIds(rows, rootPid);
+      const members: ProcessIdentity[] = [];
+      for (const pid of selected) {
+        const started = await beforeDeadline(
+          dependencies.readStarttime(pid),
+          "Linux process identity read",
+          deadlineAt
+        );
+        if (started !== null) members.push({ pid, started });
+      }
+      return members;
+    },
+    async query(identity) {
+      try {
+        const current = await beforeDeadline(
+          dependencies.readStarttime(identity.pid),
+          "Linux process identity read",
+          Date.now() + 5_000
+        );
+        if (current === null) return "absent";
+        return current === identity.started ? "same" : "reused";
+      } catch {
+        return "query_error";
+      }
+    },
+    async terminate(child, members, deadlineAt) {
+      if (dependencies.terminate !== undefined) {
+        await dependencies.terminate(child, members, deadlineAt);
+        return;
+      }
+      const closed = new Promise<ProcessExit>((resolvePromise) => {
+        if (!isLive(child)) {
+          resolvePromise({ code: child.exitCode, signal: child.signalCode });
+        } else {
+          child.once("close", (code, signal) => resolvePromise({ code, signal }));
+        }
+      });
+      await terminateProcessTree(child, closed, deadlineAt);
+    }
+  };
 }
 
 function treeMembers(
@@ -437,16 +563,33 @@ function treeMembers(
   return rows.filter(({ pid }) => selected.has(pid)).map(({ pid, started }) => ({ pid, started }));
 }
 
+const linuxProcessTree = createInjectedLinuxProcessTreeController({
+  async snapshotRelationships(_rootPid, deadlineAt) {
+    const output = await captureCommand("ps", ["-eo", "pid=,ppid="], deadlineAt);
+    return posixRelationships(output);
+  },
+  readStarttime: readLinuxProcStatStarttime
+});
+
 const defaultProcessTree: ProcessTreeController = {
   async snapshot(rootPid) {
-    return treeMembers(await snapshotAll(Date.now() + 5_000), rootPid);
+    const deadlineAt = Date.now() + 5_000;
+    if (process.platform === "win32") {
+      return treeMembers(await snapshotWindows(deadlineAt), rootPid);
+    }
+    if (process.platform === "linux") return await linuxProcessTree.snapshot(rootPid);
+    throw new Error("process identity cannot be verified on this POSIX platform");
   },
   async query(identity) {
     try {
-      const current = (await snapshotAll(Date.now() + 5_000))
-        .find(({ pid }) => pid === identity.pid);
-      if (current === undefined) return "absent";
-      return current.started === identity.started ? "same" : "reused";
+      if (process.platform === "win32") {
+        const current = (await snapshotWindows(Date.now() + 5_000))
+          .find(({ pid }) => pid === identity.pid);
+        if (current === undefined) return "absent";
+        return current.started === identity.started ? "same" : "reused";
+      }
+      if (process.platform === "linux") return await linuxProcessTree.query(identity);
+      return "query_error";
     } catch {
       return "query_error";
     }
@@ -563,6 +706,7 @@ export class ValidationRunner {
 
   async requestGrant(command: ValidationCommand, scope: ValidationScope): Promise<ValidationCommandGrant> {
     assertCommand(command);
+    assertGrantContainsNoObviousSecret(command);
     await this.#resolveScope(command, scope);
     if (scope.taskId === null) throw new Error("validation command grants require a task scope");
     const hash = fingerprint(command, scope.workspaceId);
@@ -613,7 +757,7 @@ export class ValidationRunner {
     const secretValues = options.secretValues ?? [];
     const validationId = randomUUID();
     const logDirectory = resolve(context.projectRoot, ".agenttown", "runs", scope.runId, "validation");
-    await makeSafeDirectory(context.projectRoot, logDirectory);
+    const logDirectoryIdentity = await makeSafeDirectory(context.projectRoot, logDirectory);
     const logPath = resolve(logDirectory, `${validationId}.log`);
     const temporaryPath = resolve(logDirectory, `.${validationId}.tmp`);
     const startedAt = new Date().toISOString();
@@ -701,18 +845,30 @@ export class ValidationRunner {
     }).join("");
     const finalLog = truncateUtf8(Buffer.from(redactedLog), MAX_LOG_BYTES);
     await dependencies.beforeEvidenceOpen?.();
-    await inspectSafeDirectory(context.projectRoot, logDirectory);
+    await assertSameDirectory(
+      logDirectoryIdentity,
+      await inspectSafeDirectory(context.projectRoot, logDirectory)
+    );
     const finalHandle = await open(temporaryPath, "wx", 0o600);
     try {
       await finalHandle.writeFile(finalLog);
     } finally {
       await finalHandle.close();
     }
-    await inspectSafeDirectory(context.projectRoot, logDirectory);
+    await assertSameDirectory(
+      logDirectoryIdentity,
+      await inspectSafeDirectory(context.projectRoot, logDirectory)
+    );
     await dependencies.beforeEvidenceRename?.();
-    await inspectSafeDirectory(context.projectRoot, logDirectory);
+    await assertSameDirectory(
+      logDirectoryIdentity,
+      await inspectSafeDirectory(context.projectRoot, logDirectory)
+    );
     await rename(temporaryPath, logPath);
-    await inspectSafeDirectory(context.projectRoot, logDirectory);
+    await assertSameDirectory(
+      logDirectoryIdentity,
+      await inspectSafeDirectory(context.projectRoot, logDirectory)
+    );
     const completedAt = new Date().toISOString();
     const record: ValidationRunRecord = {
       validationId, runId: scope.runId, taskId: scope.taskId,

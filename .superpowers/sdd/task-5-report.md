@@ -256,3 +256,79 @@ not call the implementation race-free.
     PowerShell AST parser was intentionally not classified as a test process
 - Exact RED-test `agenttown-core-*` leftovers listed during this run were
   removed; no `agenttown-git-*` directory was touched.
+
+## Second independent-review fixes
+
+A second review identified three narrower fail-closed gaps. These were fixed
+without changing the public `ValidationRunner` options, command fingerprint,
+or starting Task 6.
+
+### 1. Linux process identity precision
+
+- RED: the POSIX controller used `ps lstart`, whose one-second precision could
+  report a reused PID as the same process.
+- GREEN on Linux: the controller still uses `ps pid/ppid` only to discover the
+  visible tree, but every captured identity and every pre/post-termination
+  query now reads the process starttime ticks from `/proc/<pid>/stat`.
+  The parser locates the final closing parenthesis so command names containing
+  spaces or parentheses do not shift field 22. Each proc read is capped at
+  64 KiB; `ENOENT` means absent, while parse, I/O, or deadline errors remain
+  unverifiable and become `query_error`/`cleanup_failed`.
+- Other POSIX platforms no longer claim a reusable-safe identity: cleanup
+  fails closed before termination.
+- A deterministic test runs the production Linux controller with two
+  observations that have the same second-level `lstart` but starttime ticks
+  100 and 101. The pre-termination query returns reused, the unrelated live
+  process is not terminated, and the run atomically becomes
+  `cleanup_failed`/paused.
+
+### 2. Stable evidence-directory identity
+
+- RED: renaming the ordinary log directory and recreating a new directory at
+  the same path before evidence open allowed the validation to succeed and
+  publish evidence into the replacement directory.
+- GREEN: safe directory creation now returns the original realpath,
+  device, and inode identity. That exact identity is compared immediately
+  before the exclusive temporary open, after close, immediately before
+  rename, and after rename.
+- The injection race now renames the real directory and creates a normal
+  replacement (not a junction). The run rejects with an identity change and
+  the replacement directory contains no final or temporary evidence.
+
+### 3. Suggested-grant obvious-secret rejection
+
+- RED: a suggested command containing `--api-token=known-secret` was persisted
+  verbatim in the grant.
+- GREEN: grant schema validation rejects common token, secret, password, and
+  API-key assignments; sensitive flag plus next-value forms; and obvious
+  Authorization/Bearer literals across executable, args, and cwd. The generic
+  error never echoes the value. The detector is intentionally limited to these
+  obvious forms and does not claim arbitrary-secret detection.
+- Tests cover `--api-token=...`, `--password value`, and Authorization Bearer,
+  then scan durable grants and events for all known values. An ordinary grant
+  still works, and the existing exact fingerprint is unchanged.
+
+### Second-review verification
+
+- Focused validation and CoreStore:
+  `pnpm exec vitest run test/validation-runner.test.ts test/core-store.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1`
+  - 2 files passed
+  - 32 tests passed
+- Core single-worker full suite:
+  `pnpm exec vitest run --reporter=dot --no-file-parallelism --maxWorkers=1`
+  - 13 files passed
+  - 247 tests passed
+- Root `pnpm typecheck`
+  - all 8 participating workspace projects passed
+- The first full-suite shell call reached its 183-second external tool limit
+  and closed the reporter pipe; it had no assertion failure and left no
+  Vitest/validation process. The same exact command then completed under a
+  600-second bounded shell limit with the result above.
+- `git diff --check`
+  - passed
+- Vitest emitted only the expected experimental SQLite warning.
+- The final process audit found no live Vitest or validation Node process. Five
+  exact `agenttown-core-*` directories left by the intentional RED failures
+  remain under the system temp directory because both validated `Remove-Item`
+  attempts were blocked by the command policy. No `agenttown-git-*` directory
+  was inspected or touched.

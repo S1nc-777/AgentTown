@@ -3,7 +3,11 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CompanyDefinition, ValidationCommand } from "@agenttown/runtime-contract";
 import { CoreStore, ValidationRunner, type ValidationScope } from "../src/index.js";
-import { createInjectedValidationRunner } from "../src/git/validation-runner.js";
+import {
+  createInjectedValidationRunner,
+  createInjectedLinuxProcessTreeController,
+  parseLinuxProcStatStarttime
+} from "../src/git/validation-runner.js";
 import { companyDefinitionFixture, createTemporaryProject } from "./helpers.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -235,6 +239,28 @@ describe("ValidationRunner", () => {
     store.close();
   });
 
+  it("fails closed when the ordinary evidence directory is renamed and recreated before open", async () => {
+    const executable = command("process.stdout.write('evidence')");
+    let replaceEvidenceDirectory: () => Promise<void> = async () => undefined;
+    const { project, runner, scope, store } = await createRunner([executable], {
+      dependencies: {
+        beforeEvidenceOpen: async () => await replaceEvidenceDirectory()
+      }
+    });
+    const evidenceDirectory = join(project.root, ".agenttown", "runs", scope.runId, "validation");
+    const originalEvidenceDirectory = `${evidenceDirectory}-original`;
+    replaceEvidenceDirectory = async () => {
+      await rename(evidenceDirectory, originalEvidenceDirectory);
+      await mkdir(evidenceDirectory);
+    };
+
+    await expect(runner.run(executable, scope)).rejects.toThrow("directory identity changed");
+
+    expect(await readdir(evidenceDirectory)).toEqual([]);
+    expect(await readdir(originalEvidenceDirectory)).toEqual([]);
+    store.close();
+  });
+
   it("rejects commands for a run owned by another company before executing", async () => {
     const markerProject = await createTemporaryProject();
     cleanups.push(markerProject.cleanup);
@@ -354,6 +380,65 @@ describe("ValidationRunner", () => {
     10_000
   );
 
+  it("does not terminate a process whose same-second POSIX identity has different proc starttime ticks", async () => {
+    const sameSecondLstart = "Thu Jul 30 12:34:56 2026";
+    const procStat = (pid: number, starttime: string): string =>
+      `${pid} (command (with spaces)) S ${Array.from({ length: 18 }, (_, index) => index + 1).join(" ")} ${starttime} 99`;
+    const observations = [
+      { lstart: sameSecondLstart, starttime: "100" },
+      { lstart: sameSecondLstart, starttime: "101" }
+    ];
+    let terminateCalled = false;
+    let capturedPid: number | undefined;
+    cleanups.push(async () => {
+      if (capturedPid !== undefined && !isProcessGone(capturedPid)) {
+        process.kill(capturedPid, "SIGKILL");
+        const deadlineAt = Date.now() + 2_000;
+        while (!isProcessGone(capturedPid) && Date.now() < deadlineAt) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+        }
+      }
+    });
+    const executable = command("setTimeout(() => process.exit(0), 1600)", { timeoutSeconds: 1 });
+    let identityReadCount = 0;
+    const processTree = createInjectedLinuxProcessTreeController({
+      snapshotRelationships: async (rootPid: number) => {
+        capturedPid = rootPid;
+        return [{ pid: rootPid, parentPid: 0 }];
+      },
+      readStarttime: async (pid: number) => parseLinuxProcStatStarttime(
+        procStat(pid, observations[identityReadCount++]!.starttime)
+      ),
+      terminate: async () => {
+        terminateCalled = true;
+      }
+    });
+    const { runner, scope, store } = await createRunner([executable], {
+      dependencies: {
+        processTree
+      }
+    });
+
+    const result = await runner.run(executable, scope);
+
+    expect(result.outcome).toBe("cleanup_failed");
+    expect(new Set(observations.map(({ lstart }) => lstart))).toHaveLength(1);
+    expect(identityReadCount).toBe(2);
+    expect(terminateCalled).toBe(false);
+    expect(store.getGitRun(scope.runId)?.status).toBe("paused");
+    expect(capturedPid).toBeDefined();
+    expect(isProcessGone(capturedPid!)).toBe(false);
+    if (capturedPid !== undefined) {
+      const deadlineAt = Date.now() + 3_000;
+      while (!isProcessGone(capturedPid) && Date.now() < deadlineAt) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+      }
+      expect(isProcessGone(capturedPid)).toBe(true);
+    }
+    capturedPid = undefined;
+    store.close();
+  }, 10_000);
+
   it("treats a captured escaped descendant as cleanup_failed", async () => {
     const executable = command("setInterval(() => {}, 1000)", { timeoutSeconds: 1 });
     let terminated = false;
@@ -434,6 +519,40 @@ describe("ValidationRunner", () => {
     await expect(runner.run(suggested, scope))
       .resolves.toEqual(expect.objectContaining({ outcome: "passed" }));
     expect(store.listEvents(0).some(({ type }) => type === "user.approval.requested")).toBe(true);
+    store.close();
+  });
+
+  it("rejects obvious grant secrets without persisting the literal in grants or events", async () => {
+    const { runner, scope, store } = await createRunner();
+    const secretCommands = [
+      command("process.exit(0)", {
+        id: "token-secret",
+        args: ["--api-token=known-secret"]
+      }),
+      command("process.exit(0)", {
+        id: "password-secret",
+        args: ["--password", "known-password"]
+      }),
+      command("process.exit(0)", {
+        id: "bearer-secret",
+        args: ["Authorization: Bearer known-bearer"]
+      })
+    ];
+
+    for (const secretCommand of secretCommands) {
+      await expect(runner.requestGrant(secretCommand, scope))
+        .rejects.toThrow("suggested validation command contains an obvious sensitive literal");
+    }
+    const persisted = JSON.stringify({
+      grants: store.listValidationCommandGrants(scope.runId, scope.taskId!),
+      events: store.listEvents(0)
+    });
+    expect(persisted).not.toContain("known-secret");
+    expect(persisted).not.toContain("known-password");
+    expect(persisted).not.toContain("known-bearer");
+
+    await expect(runner.requestGrant(command("process.exit(0)", { id: "ordinary" }), scope))
+      .resolves.toEqual(expect.objectContaining({ status: "pending" }));
     store.close();
   });
 
