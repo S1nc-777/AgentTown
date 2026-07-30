@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type {
   CompanyDefinition,
   GitSubmissionRecord,
@@ -576,6 +577,57 @@ describe("IntegrationService", () => {
     await expect(staleReplay.service.integrate(harness.approved))
       .rejects.toThrow("committed integration facts");
     staleReplay.assertNoMutationCalls();
+    harness.store.putGitWorkspace(integration!);
+
+    const committedEvent = harness.store.listEvents(0).find(
+      ({ type, taskId }) =>
+        type === "git.integration.committed" && taskId === "task-a"
+    )!;
+    const duplicateCommittedId = randomUUID();
+    harness.store.insertEvent({
+      id: duplicateCommittedId,
+      type: committedEvent.type,
+      actorId: committedEvent.actorId,
+      taskId: committedEvent.taskId,
+      causationEventId: committedEvent.causationEventId,
+      payload: committedEvent.payload
+    });
+    const duplicateReplay = replayService(harness);
+    await expect(duplicateReplay.service.integrate(harness.approved))
+      .rejects.toThrow("committed integration facts");
+    duplicateReplay.assertNoMutationCalls();
+
+    const database = new DatabaseSync(resolve(harness.repo.root, "core.sqlite"));
+    try {
+      database.prepare("DELETE FROM events WHERE id = ?")
+        .run(duplicateCommittedId);
+      database.prepare(`
+        UPDATE events
+        SET actor_id = ?, payload_json = ?
+        WHERE id = ?
+      `).run(
+        "attacker",
+        JSON.stringify({
+          ...committedEvent.payload,
+          newCommit: harness.oldCommit
+        }),
+        committedEvent.id
+      );
+      const forgedReplay = replayService(harness);
+      await expect(forgedReplay.service.integrate(harness.approved))
+        .rejects.toThrow("committed integration facts");
+      forgedReplay.assertNoMutationCalls();
+
+      database.prepare("DELETE FROM events WHERE id = ?")
+        .run(committedEvent.id);
+      const missingReplay = replayService(harness);
+      await expect(missingReplay.service.integrate(harness.approved))
+        .rejects.toThrow("committed integration facts");
+      missingReplay.assertNoMutationCalls();
+    } finally {
+      database.close();
+    }
+    expect(await formalRef(harness)).toBe(attempt.candidateCommit);
   }, 20_000);
 
   it("keeps the formal ref and worktree unchanged when candidate validation fails", async () => {
@@ -1204,11 +1256,27 @@ describe("IntegrationService", () => {
     });
     harness.store.putIntegrationAttempt(preparedWithValidation);
     const currentTask = harness.store.getTask("company-1", "task-a")!;
-    const completedEvent = event("task.completed", "task-a");
+    const completedEvent = {
+      ...event("task.completed", "task-a"),
+      payload: {
+        attemptId: attempt.attemptId,
+        runId: attempt.runId,
+        revision: attempt.submissionRevision,
+        integrationCommit: candidateCommit
+      }
+    };
     const integration = harness.store.getGitWorkspace(
       harness.integrationWorkspaceId
     )!;
-    const commitEvent = event("git.integration.committed", "task-a");
+    const commitEvent = {
+      ...event("git.integration.committed", "task-a"),
+      payload: {
+        attemptId: attempt.attemptId,
+        oldCommit: attempt.expectedOldCommit,
+        newCommit: candidateCommit,
+        validationRunIds: [validationId]
+      }
+    };
 
     expect(() => harness.store.commitIntegratedTask({
       companyId: "company-1",

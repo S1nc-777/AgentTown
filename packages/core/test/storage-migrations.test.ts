@@ -553,6 +553,72 @@ function seedApprovedQueuedIntegration(store: CoreStore): GitSubmissionRecord {
   return queued;
 }
 
+function seedPreparedValidatedIntegration(store: CoreStore): {
+  attempt: IntegrationAttemptRecord;
+  run: GitRunRecord;
+  submission: GitSubmissionRecord;
+  task: TaskRecord;
+  workspace: GitWorkspaceRecord;
+} {
+  const queuedSubmission = seedApprovedQueuedIntegration(store);
+  const prepared = preparedAttempt();
+  store.putGitWorkspace(integrationWorkspace());
+  store.commitPreparedIntegration({
+    companyId: "company",
+    attempt: prepared,
+    submission: queuedSubmission,
+    event: event("integration-prepared", "git.integration.prepared")
+  });
+  const candidate = candidateWorkspace();
+  store.putGitWorkspace(candidate);
+  const preparedWithValidation: IntegrationAttemptRecord = {
+    ...prepared,
+    candidateCommit: "c".repeat(40),
+    validationRunIds: ["validation-1"]
+  };
+  store.putIntegrationAttempt(preparedWithValidation);
+  store.putValidationRun({
+    ...validationRun(),
+    integrationAttemptId: prepared.attemptId,
+    workspaceId: candidate.workspaceId
+  });
+  return {
+    attempt: {
+      ...preparedWithValidation,
+      status: "committed"
+    },
+    run: gitRun({ integrationCommit: "c".repeat(40) }),
+    submission: gitSubmission({ status: "integrated" }),
+    task: task("completed"),
+    workspace: integrationWorkspace("c".repeat(40))
+  };
+}
+
+function integratedEvents(
+  attempt: IntegrationAttemptRecord
+): [NewEvent, NewEvent] {
+  return [
+    {
+      ...event("integration-committed", "git.integration.committed"),
+      payload: {
+        attemptId: attempt.attemptId,
+        oldCommit: attempt.expectedOldCommit,
+        newCommit: attempt.candidateCommit,
+        validationRunIds: [...attempt.validationRunIds]
+      }
+    },
+    {
+      ...event("task-completed", "task.completed"),
+      payload: {
+        attemptId: attempt.attemptId,
+        runId: attempt.runId,
+        revision: attempt.submissionRevision,
+        integrationCommit: attempt.candidateCommit
+      }
+    }
+  ];
+}
+
 describe("Core schema migrations", () => {
   it("creates the complete v2 schema for a fresh database", () => {
     const databasePath = temporaryDatabasePath();
@@ -1075,48 +1141,20 @@ describe("typed Git fact storage", () => {
   it("commits an integrated task, attempt, submission and events atomically", () => {
     const store = initializedStore();
     try {
-      const queuedSubmission = seedApprovedQueuedIntegration(store);
-      store.putGitWorkspace(integrationWorkspace());
-      store.commitPreparedIntegration({
-        companyId: "company",
-        attempt: preparedAttempt(),
-        submission: queuedSubmission,
-        event: event("integration-prepared", "git.integration.prepared")
-      });
-      const candidate = candidateWorkspace();
-      store.putGitWorkspace(candidate);
-      const preparedWithValidation = {
-        ...preparedAttempt(),
-        candidateCommit: "c".repeat(40),
-        validationRunIds: ["validation-1"]
-      };
-      store.putIntegrationAttempt(preparedWithValidation);
-      store.putValidationRun({
-        ...validationRun(),
-        integrationAttemptId: "attempt-1",
-        workspaceId: candidate.workspaceId
-      });
-      const attempt = {
-        ...preparedWithValidation,
-        status: "committed" as const
-      };
-      const submission = gitSubmission({ status: "integrated" });
-      const completedTask = task("completed");
+      const facts = seedPreparedValidatedIntegration(store);
       store.commitIntegratedTask({
         companyId: "company",
-        attempt,
-        submission,
-        task: completedTask,
-        run: gitRun({ integrationCommit: "c".repeat(40) }),
-        integrationWorkspace: integrationWorkspace("c".repeat(40)),
-        events: [
-          event("integration-committed", "git.integration.committed"),
-          event("task-completed", "task.completed")
-        ]
+        attempt: facts.attempt,
+        submission: facts.submission,
+        task: facts.task,
+        run: facts.run,
+        integrationWorkspace: facts.workspace,
+        events: integratedEvents(facts.attempt)
       });
-      expect(store.getIntegrationAttempt("attempt-1")).toEqual(attempt);
-      expect(store.getGitSubmission("run-1", "task-1", 1)).toEqual(submission);
-      expect(store.getTask("company", "task-1")).toEqual(completedTask);
+      expect(store.getIntegrationAttempt("attempt-1")).toEqual(facts.attempt);
+      expect(store.getGitSubmission("run-1", "task-1", 1))
+        .toEqual(facts.submission);
+      expect(store.getTask("company", "task-1")).toEqual(facts.task);
       expect(store.listEvents(0).map(({ id }) => id)).toEqual([
         "company-created",
         "task-review",
@@ -1125,6 +1163,94 @@ describe("typed Git fact storage", () => {
         "integration-committed",
         "task-completed"
       ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "omitted committed event",
+      mutate: ([, completed]: [NewEvent, NewEvent]) => [completed]
+    },
+    {
+      name: "forged committed payload",
+      mutate: ([committed, completed]: [NewEvent, NewEvent]) => [{
+        ...committed,
+        payload: { ...committed.payload, validationRunIds: [] }
+      }, completed]
+    },
+    {
+      name: "forged committed actor",
+      mutate: ([committed, completed]: [NewEvent, NewEvent]) => [{
+        ...committed,
+        actorId: "attacker"
+      }, completed]
+    },
+    {
+      name: "extra event",
+      mutate: ([committed, completed]: [NewEvent, NewEvent]) => [
+        committed,
+        completed,
+        event("integration-extra", "integration.extra")
+      ]
+    },
+    {
+      name: "duplicate committed event",
+      mutate: ([committed, completed]: [NewEvent, NewEvent]) => [
+        committed,
+        { ...committed, id: "integration-committed-duplicate" },
+        completed
+      ]
+    },
+    {
+      name: "completion id not bound to task",
+      mutate: (events: [NewEvent, NewEvent]) => events,
+      taskUpdatedEventId: "not-the-completion-event"
+    }
+  ])("rolls back an integrated bundle with $name", ({
+    mutate,
+    taskUpdatedEventId
+  }) => {
+    const store = initializedStore();
+    try {
+      const facts = seedPreparedValidatedIntegration(store);
+      const before = {
+        attempt: store.getIntegrationAttempt(facts.attempt.attemptId),
+        events: store.listEvents(0),
+        run: store.getGitRun(facts.run.runId),
+        submission: store.getGitSubmission(
+          facts.submission.runId,
+          facts.submission.taskId,
+          facts.submission.revision
+        ),
+        task: store.getTask("company", facts.task.id),
+        workspace: store.getGitWorkspace(facts.workspace.workspaceId)
+      };
+      expect(() => store.commitIntegratedTask({
+        companyId: "company",
+        attempt: facts.attempt,
+        submission: facts.submission,
+        task: taskUpdatedEventId === undefined
+          ? facts.task
+          : { ...facts.task, updatedEventId: taskUpdatedEventId },
+        run: facts.run,
+        integrationWorkspace: facts.workspace,
+        events: mutate(integratedEvents(facts.attempt))
+      })).toThrow("integrated event bundle");
+
+      expect({
+        attempt: store.getIntegrationAttempt(facts.attempt.attemptId),
+        events: store.listEvents(0),
+        run: store.getGitRun(facts.run.runId),
+        submission: store.getGitSubmission(
+          facts.submission.runId,
+          facts.submission.taskId,
+          facts.submission.revision
+        ),
+        task: store.getTask("company", facts.task.id),
+        workspace: store.getGitWorkspace(facts.workspace.workspaceId)
+      }).toEqual(before);
     } finally {
       store.close();
     }

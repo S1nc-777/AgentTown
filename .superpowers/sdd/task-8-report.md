@@ -46,7 +46,10 @@ were not implemented or changed.
   stash, clean, or original-worktree mutation is used.
 - Atomically commits the committed attempt, integrated submission, completed
   task, run integration SHA, registered integration workspace head, and both
-  events. Listener exceptions remain isolated after the durable commit.
+  events. The final transaction accepts exactly one core-authored
+  `git.integration.committed` and one core-authored `task.completed`, with
+  exact attempt/SHA/revision/validation payloads and completion-event task
+  binding. Listener exceptions remain isolated after the durable commit.
 - Added exact-CAS candidate ref removal after WorkspaceManager's verified
   worktree removal. Cleanup ambiguity is preserved for reconciliation rather
   than force-deleted.
@@ -144,7 +147,7 @@ were upgraded to the real approved → queued → prepared → validated lifecyc
 and immutable-attempt error ordering was retained. The storage suite passed
 30/30.
 
-Final focused behavior is included in the 171-test relevant-suite run below.
+Final focused behavior is included in the 177-test relevant-suite run below.
 
 ### Second-review replay gate RED/GREEN
 
@@ -174,6 +177,29 @@ Every requested replay window now invokes both direct `integrate()` and
 - duplicate exact attempts, tampered attempt facts, and tampered committed
   facts fail closed without choosing a latest attempt.
 
+### Third-review final-event binding RED/GREEN
+
+The Important event-authentication finding was reproduced independently at
+both persistence and replay boundaries:
+
+- six table-driven CoreStore cases all failed because omitted commit events,
+  forged commit payloads/actors, extra events, duplicate commit events, and a
+  completion ID not bound to the completed task were accepted;
+- after a successful real-Git integration, injecting a second exact durable
+  commit event still let direct replay return integrated.
+
+The CoreStore final transaction now requires exactly two different event IDs
+with unique commit/completion types, actor `core`, exact task, null causation,
+exact payload keys/values, ordered validation IDs, and
+`task.updatedEventId === completion.id`. Every malformed case snapshots and
+proves rollback of attempt, submission, task, run, formal workspace, and events.
+
+Committed replay independently requires exactly one durable task commit event
+with the exact attempt/old SHA/new SHA/validation IDs plus the exact completion
+event addressed by `task.updatedEventId`. Duplicate, forged actor/SHA, missing,
+wrongly scoped, or otherwise nonexact history fails closed before any Git or
+workspace operation. The focused integration/storage run passed 57/57.
+
 ## Verification
 
 ### Relevant Core, storage, Task 7, and workflow suites
@@ -183,7 +209,7 @@ pnpm exec vitest run test/integration-service.test.ts test/storage-migrations.te
 ```
 
 - 9 files passed;
-- 171 tests passed;
+- 177 tests passed;
 - 0 failed;
 - all real-Git suites ran serially with one worker.
 
@@ -193,7 +219,8 @@ was scoped to the new strict bundle, and missing-attempt ownership was restored
 ahead of candidate-kind validation. The two directly affected suites then
 passed 52/52 before the initial 165/165 run. After the first independent-review
 fixes, the storage suite passed 30/30 and the wider run passed 170/170. After
-the replay gate, the final wider run passed 171/171.
+the replay gate, the wider run passed 171/171. After strict final-event
+authentication, the final wider run passed 177/177.
 
 ### P1A gate
 
@@ -230,8 +257,12 @@ Node's experimental SQLite warning is expected and pre-existing.
   second-attempt and Git activity across conflict, validation failure, CAS
   mismatch, final transaction rollback, and every crash hook.
 - Confirmed committed replay requires exact integrated submission, completed
-  task/completion event, run SHA, and unique formal workspace facts; it does not
-  infer success from attempt status alone.
+  task/completion event, one exact durable integration-commit event, run SHA,
+  and unique formal workspace facts; it does not infer success from attempt
+  status alone.
+- Confirmed malformed final event arrays are rejected before any SQLite fact
+  mutation, while listener exceptions remain isolated only after the valid
+  two-event transaction has durably committed.
 - Confirmed task order never trusts mutable timestamps or Agent text; only the
   immutable task-created event sequence is used.
 - Confirmed candidate commands use only the verified candidate path and

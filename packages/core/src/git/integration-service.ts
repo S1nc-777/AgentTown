@@ -90,7 +90,26 @@ export function orderIntegrations<T extends OrderedIntegration>(
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => sameJson(value, right[index]));
+  }
+  if (left === null || right === null
+    || typeof left !== "object" || typeof right !== "object") {
+    return false;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) =>
+      key === rightKeys[index]
+      && sameJson(leftRecord[key], rightRecord[key])
+    );
 }
 
 function sameCommand(left: ValidationCommand, right: ValidationCommand): boolean {
@@ -534,9 +553,17 @@ export class IntegrationService {
         && workspace.branchRef === run.integrationRef
       );
       const workspace = integrationWorkspaces[0];
-      const completedEvent = this.#store.listEvents(0).find(
+      const events = this.#store.listEvents(0);
+      const committedEvents = events.filter((event) =>
+        event.type === "git.integration.committed"
+        && (event.taskId === attempt.taskId
+          || event.payload.attemptId === attempt.attemptId)
+      );
+      const committedEvent = committedEvents[0];
+      const completedEvents = events.filter(
         ({ id }) => id === task.updatedEventId
       );
+      const completedEvent = completedEvents[0];
       if (attempt.candidateCommit === null
         || durableSubmission.status !== "integrated"
         || task.status !== "completed"
@@ -545,13 +572,30 @@ export class IntegrationService {
         || workspace?.workspaceId !== `${this.#runId}:integration`
         || workspace.baseCommit !== run.baseCommit
         || workspace.headCommit !== attempt.candidateCommit
+        || committedEvents.length !== 1
+        || committedEvent === undefined
+        || committedEvent.actorId !== "core"
+        || committedEvent.taskId !== attempt.taskId
+        || committedEvent.causationEventId !== null
+        || !sameJson(committedEvent.payload, {
+          attemptId: attempt.attemptId,
+          oldCommit: attempt.expectedOldCommit,
+          newCommit: attempt.candidateCommit,
+          validationRunIds: attempt.validationRunIds
+        })
+        || completedEvents.length !== 1
         || completedEvent?.type !== "task.completed"
+        || completedEvent.id === committedEvent.id
+        || completedEvent.actorId !== "core"
         || completedEvent.taskId !== attempt.taskId
+        || completedEvent.causationEventId !== null
         || completedEvent.payload.attemptId !== attempt.attemptId
-        || completedEvent.payload.runId !== attempt.runId
-        || completedEvent.payload.revision !== attempt.submissionRevision
-        || completedEvent.payload.integrationCommit
-          !== attempt.candidateCommit) {
+        || !sameJson(completedEvent.payload, {
+          attemptId: attempt.attemptId,
+          runId: attempt.runId,
+          revision: attempt.submissionRevision,
+          integrationCommit: attempt.candidateCommit
+        })) {
         throw new Error("committed integration facts are stale or mismatched");
       }
       return { kind: "integrated", attempt };

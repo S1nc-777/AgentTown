@@ -300,6 +300,72 @@ function assertTaskScopedEvents(
   }
 }
 
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) =>
+        jsonValuesEqual(value, right[index])
+      );
+  }
+  if (left === null || right === null
+    || typeof left !== "object" || typeof right !== "object") {
+    return false;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) =>
+      key === rightKeys[index]
+      && jsonValuesEqual(leftRecord[key], rightRecord[key])
+    );
+}
+
+function assertIntegratedEventBundle(
+  attempt: IntegrationAttemptRecord,
+  task: TaskRecord,
+  events: readonly NewEvent[]
+): void {
+  const committed = events.filter(
+    ({ type }) => type === "git.integration.committed"
+  );
+  const completed = events.filter(({ type }) => type === "task.completed");
+  const committedEvent = committed[0];
+  const completedEvent = completed[0];
+  if (attempt.candidateCommit === null
+    || events.length !== 2
+    || committed.length !== 1
+    || completed.length !== 1
+    || committedEvent === undefined
+    || completedEvent === undefined
+    || committedEvent.id === completedEvent.id
+    || committedEvent.actorId !== "core"
+    || completedEvent.actorId !== "core"
+    || committedEvent.taskId !== attempt.taskId
+    || completedEvent.taskId !== attempt.taskId
+    || committedEvent.causationEventId !== null
+    || completedEvent.causationEventId !== null
+    || task.updatedEventId !== completedEvent.id
+    || !jsonValuesEqual(committedEvent.payload, {
+      attemptId: attempt.attemptId,
+      oldCommit: attempt.expectedOldCommit,
+      newCommit: attempt.candidateCommit,
+      validationRunIds: attempt.validationRunIds
+    })
+    || !jsonValuesEqual(completedEvent.payload, {
+      attemptId: attempt.attemptId,
+      runId: attempt.runId,
+      revision: attempt.submissionRevision,
+      integrationCommit: attempt.candidateCommit
+    })) {
+    throw new Error("integrated event bundle is stale or mismatched");
+  }
+}
+
 function parseGitRunRow(row: DatabaseRow): GitRunRecord {
   return {
     runId: readString(row, "run_id"),
@@ -1523,6 +1589,7 @@ export class CoreStore {
       || input.task.status !== "completed") {
       throw new Error("integrated facts have invalid statuses");
     }
+    assertIntegratedEventBundle(input.attempt, input.task, input.events);
     const insertedEvents = this.inTransaction(() => {
       const currentRun = this.getGitRun(input.attempt.runId);
       if (currentRun === null) {
