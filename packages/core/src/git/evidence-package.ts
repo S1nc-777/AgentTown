@@ -16,6 +16,8 @@ import {
   resolve
 } from "node:path";
 import type {
+  CompanyDefinition,
+  GitTaskSubmission,
   ReviewPackageRecord,
   ValidationRunRecord
 } from "@agenttown/runtime-contract";
@@ -27,6 +29,7 @@ import type {
   AuthoritativeValidation,
   ValidatedSubmission
 } from "./submission-validator.js";
+import { SubmissionValidator } from "./submission-validator.js";
 
 interface DirectoryIdentity {
   path: string;
@@ -56,6 +59,7 @@ interface EvidenceManifest {
 }
 
 export interface EvidencePackageInput extends ValidatedSubmission {
+  submission: GitTaskSubmission;
   revision: number;
   generatedAt?: string;
 }
@@ -68,6 +72,7 @@ export interface EvidencePackageBuilderOptions {
 
 export interface EvidencePackageBuilderDependencies {
   beforePublish?: () => Promise<void>;
+  afterPublish?: () => Promise<void>;
 }
 
 const injectedDependencies = new WeakMap<
@@ -122,6 +127,10 @@ function stableJson(value: unknown): Buffer {
   return Buffer.from(`${JSON.stringify(stableValue(value), null, 2)}\n`, "utf8");
 }
 
+function exactJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(stableValue(left)) === JSON.stringify(stableValue(right));
+}
+
 function sha256(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -158,6 +167,14 @@ function sameDirectory(left: DirectoryIdentity, right: DirectoryIdentity): boole
     && pathKey(left.realPath) === pathKey(right.realPath)
     && left.device === right.device
     && left.inode === right.inode;
+}
+
+function sameObjectIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function normalizeLf(value: string): string {
+  return value.replace(/\r\n?/gu, "\n");
 }
 
 async function assertSafeTree(root: string, target: string): Promise<void> {
@@ -280,14 +297,14 @@ async function ownedFileCleanup(
 function summaryMarkdown(input: EvidencePackageInput): Buffer {
   const risks = input.knownRisks.length === 0
     ? "- None declared."
-    : input.knownRisks.map((risk) => `- ${risk}`).join("\n");
+    : input.knownRisks.map((risk) => `- ${normalizeLf(risk)}`).join("\n");
   const warnings = input.warnings.length === 0
     ? "- None."
     : input.warnings.map((warning) =>
       `- Patch is ${warning.actualBytes} bytes; warning threshold is ${warning.warningBytes} bytes.`)
       .join("\n");
   return Buffer.from(
-    `# Change Summary\n\n${input.changeSummary.trim()}\n\n`
+    `# Change Summary\n\n${normalizeLf(input.changeSummary).trim()}\n\n`
     + `## Known Risks\n\n${risks}\n\n`
     + `## Evidence Warnings\n\n${warnings}\n`,
     "utf8"
@@ -326,10 +343,32 @@ export class EvidencePackageBuilder {
       || workspace.headCommit !== input.headCommit) {
       throw new Error("review package input does not match an active registered workspace");
     }
+    const task = this.#store.getTask(this.#companyId, input.taskId);
+    if (task === null || task.ownerEmployeeId !== workspace.employeeId
+      || (task.status !== "running" && task.status !== "review")) {
+      throw new Error("review package task owner or status is not authoritative");
+    }
     const company = this.#store.getCompany(this.#companyId);
     if (company === null || company.status !== "active") {
       throw new Error("review package company is not active");
     }
+    const definition = JSON.parse(company.definitionJson) as CompanyDefinition;
+    const actualInputPatchBytes = Buffer.byteLength(input.patch, "utf8");
+    if (input.patchBytes !== actualInputPatchBytes
+      || !Number.isSafeInteger(definition.evidence?.diffHardLimitBytes)
+      || actualInputPatchBytes > definition.evidence.diffHardLimitBytes) {
+      throw new Error("validated submission patch bytes exceed or mismatch the current hard limit");
+    }
+    const authoritative = await new SubmissionValidator({
+      store: this.#store,
+      companyId: this.#companyId
+    }).validate(workspace, input.submission);
+    this.#assertAuthoritativeInput(input, authoritative);
+    input = {
+      ...authoritative,
+      revision: input.revision,
+      ...(input.generatedAt === undefined ? {} : { generatedAt: input.generatedAt })
+    };
     const projectRoot = resolve(run.projectRoot);
     const taskDirectory = resolve(
       projectRoot,
@@ -490,13 +529,18 @@ export class EvidencePackageBuilder {
           if (!isMissing(error)) throw error;
         }
         await rename(tempDirectory, destination);
+        await injectedDependencies.get(this)?.afterPublish?.();
+        const publishedIdentity = await inspectDirectory(destination);
+        if (!sameObjectIdentity(tempIdentity, publishedIdentity)) {
+          throw new Error("tampered: published review directory identity changed");
+        }
+        cleanupIdentity = publishedIdentity;
       } finally {
         await reservation.close();
         if (reservationIdentity !== null) {
           await ownedFileCleanup(reservationPath, reservationIdentity);
         }
       }
-      cleanupIdentity = await inspectDirectory(destination);
       await syncDirectory(taskDirectory);
       if (!sameDirectory(taskIdentity, await inspectDirectory(taskDirectory))) {
         throw new Error("tampered: review task directory identity changed after rename");
@@ -546,6 +590,39 @@ export class EvidencePackageBuilder {
         await ownedCleanup(cleanupPath, cleanupIdentity).catch(() => undefined);
       }
       throw error;
+    }
+  }
+
+  #assertAuthoritativeInput(
+    input: EvidencePackageInput,
+    authoritative: ValidatedSubmission
+  ): void {
+    const scalarMatch = input.schemaVersion === authoritative.schemaVersion
+      && input.runId === authoritative.runId
+      && input.taskId === authoritative.taskId
+      && input.workspaceId === authoritative.workspaceId
+      && input.employeeId === authoritative.employeeId
+      && input.branchRef === authoritative.branchRef
+      && input.baseCommit === authoritative.baseCommit
+      && input.headCommit === authoritative.headCommit
+      && input.patch === authoritative.patch
+      && input.patchBytes === authoritative.patchBytes
+      && input.changeSummary === authoritative.changeSummary;
+    const structuredMatch = exactJson(input.submission, authoritative.submission)
+      && exactJson(input.commits, authoritative.commits)
+      && exactJson(input.files, authoritative.files)
+      && exactJson(input.warnings, authoritative.warnings)
+      && exactJson(input.knownRisks, authoritative.knownRisks)
+      && exactJson(input.reportedResults, authoritative.reportedResults)
+      && input.validations.length === authoritative.validations.length
+      && input.validations.every((validation, index) => {
+        const expected = authoritative.validations[index];
+        return expected !== undefined
+          && exactJson(validation.record, expected.record)
+          && validation.log.equals(expected.log);
+      });
+    if (!scalarMatch || !structuredMatch) {
+      throw new Error("validated submission does not match authoritative Git and CoreStore facts");
     }
   }
 

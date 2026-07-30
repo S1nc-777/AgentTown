@@ -14,6 +14,9 @@
   authoritative Git derivation of the exact non-empty ordered commit range,
   canonical bounded commit metadata, clean task branch/head/base facts,
   binary-aware file metadata, raw blob SHA-256 hashes, and a text-only patch.
+- Bound both submission validation and package creation to the authoritative
+  CoreStore task: the task must belong to the run's company, remain in
+  `running` or `review`, and still be owned by the task workspace employee.
 - Rejected omitted, foreign, reordered, and duplicate commits; dirty index,
   worktree, or untracked state; in-progress Git operations; changed task
   branch/head/base facts; and gitlink/submodule changes.
@@ -35,6 +38,14 @@
   layout, stable sorted JSON and LF output, exclusive file creation, manifest
   written last, fsync where supported, full pre/post-publish verification, and
   an exclusive sibling publish reservation.
+- Package creation retains the original parsed submission, reruns
+  `SubmissionValidator` immediately before any package write, recomputes patch
+  bytes against the current persisted company hard limit, and compares every
+  scalar, commit, file, patch, warning, declaration, and authoritative
+  validation byte against the caller's `ValidatedSubmission`.
+- Every Git diff plumbing invocation explicitly disables external diff and
+  textconv. Markdown source text is normalized from CRLF or CR to LF before
+  bytes are written.
 - Published each revision to its immutable destination only after repeated
   directory identity and destination-absence checks. Existing destinations are
   accepted only when an exact durable CoreStore record exists and every
@@ -111,21 +122,46 @@ runtime schema parsing, the same command passed 6/6.
 Final focused GREEN:
 
 - 2 files passed.
-- 32 tests passed.
+- 50 tests passed after the independent-review follow-up.
 - 0 failed.
+
+### Independent-review follow-up
+
+A second independent review requested five additional hardening changes. The
+state-model audit selected `running | review` as the only submission/package
+states because TaskService names its awaiting-review state `review`.
+
+Targeted RED:
+
+- 17 tests failed for expected missing behavior and one existing authoritative
+  hard-limit control already passed.
+- Failures covered forged caller commits/files/patch/patchBytes/warnings and
+  oversized caller patch; task absence, reassignment, blocked/completed/failed
+  state; configured binary textconv output entering the patch; CR/CRLF
+  Markdown bytes; and destination replacement immediately after rename.
+
+Targeted GREEN:
+
+- 18/18 selected tests passed after authoritative builder rederivation,
+  persisted task ownership/state checks, explicit
+  `--no-textconv --no-ext-diff`, LF normalization, and post-rename owned
+  directory identity comparison.
+- The two old validation-package fixtures were upgraded to generate real
+  authoritative validation results, after which the final focused suite passed
+  50/50.
 
 ## Final Verification
 
 - Focused:
   `pnpm exec vitest run test/submission-validator.test.ts test/evidence-package.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1`
   - 2 files passed
-  - 32 tests passed
-  - duration 40.53s
+  - 50 tests passed
+  - duration 123.67s
 - Core full:
   `pnpm exec vitest run --reporter=dot --no-file-parallelism --maxWorkers=1`
   - 15 files passed
-  - 279 tests passed
-  - duration 149.13s
+  - 297 tests passed
+  - duration 229.88s
 - Root `pnpm typecheck`
   - all 8 participating workspace projects passed
 - `git diff --check`

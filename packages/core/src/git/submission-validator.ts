@@ -71,6 +71,7 @@ export interface AuthoritativeValidation {
 
 export interface ValidatedSubmission {
   schemaVersion: 1;
+  submission: GitTaskSubmission;
   runId: string;
   taskId: string;
   workspaceId: string;
@@ -373,6 +374,11 @@ export class SubmissionValidator {
       || registered.employeeId === null) {
       throw new Error("submission run, company, task, or workspace is not active and matched");
     }
+    const task = this.#store.getTask(this.#companyId, registered.taskId);
+    if (task === null || task.ownerEmployeeId !== registered.employeeId
+      || (task.status !== "running" && task.status !== "review")) {
+      throw new Error("submission task owner or status is not authoritative");
+    }
     assertIdentifier(run.runId, "run id");
     assertIdentifier(registered.taskId, "task id");
     assertIdentifier(registered.workspaceId, "workspace id");
@@ -489,6 +495,8 @@ export class SubmissionValidator {
 
     const rawChanges = parseRawChanges((await git([
       "diff",
+      "--no-ext-diff",
+      "--no-textconv",
       "--raw",
       "-z",
       "--find-renames",
@@ -498,6 +506,8 @@ export class SubmissionValidator {
     ])).stdout);
     const numstat = parseNumstat((await git([
       "diff",
+      "--no-ext-diff",
+      "--no-textconv",
       "--numstat",
       "-z",
       "--find-renames",
@@ -534,6 +544,7 @@ export class SubmissionValidator {
     const patch = (await patchRunner.run([
       "diff",
       "--no-ext-diff",
+      "--no-textconv",
       "--no-color",
       "--full-index",
       "--find-renames",
@@ -564,6 +575,7 @@ export class SubmissionValidator {
     );
     return {
       schemaVersion: 1,
+      submission: structuredClone(submission),
       runId: run.runId,
       taskId: registered.taskId,
       workspaceId: registered.workspaceId,

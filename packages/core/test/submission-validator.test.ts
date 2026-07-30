@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   CompanyDefinition,
   GitTaskSubmission,
   GitWorkspaceRecord,
+  TaskState,
   ValidationCommand
 } from "@agenttown/runtime-contract";
 import {
@@ -42,8 +43,11 @@ function submission(headCommit: string, commits: string[]): GitTaskSubmission {
 async function setup(options: {
   company?: CompanyDefinition;
   baseBinary?: Buffer;
+  createTask?: boolean;
   firstContent?: string;
   secondContent?: string;
+  taskOwner?: string;
+  taskState?: TaskState;
 } = {}): Promise<{
   repo: GitFixture;
   store: CoreStore;
@@ -99,6 +103,30 @@ async function setup(options: {
     createdAt: "2026-07-30T00:00:00.000Z",
     updatedAt: "2026-07-30T00:00:00.000Z"
   });
+  if (options.createTask !== false) {
+    store.putTask("company-1", {
+      id: "task-1",
+      title: "Task one",
+      objective: "Implement task one",
+      ownerEmployeeId: options.taskOwner ?? "developer",
+      dependencies: [],
+      acceptanceCriteria: ["Evidence is valid"],
+      status: options.taskState ?? "running",
+      retryCount: 0,
+      reviewLoopCount: 0,
+      artifacts: [],
+      evidence: [],
+      createdEventId: "task-created",
+      updatedEventId: "task-running"
+    }, [{
+      id: randomUUID(),
+      type: "task.started",
+      actorId: "developer",
+      taskId: "task-1",
+      causationEventId: null,
+      payload: { status: options.taskState ?? "running" }
+    }]);
+  }
   const workspace: GitWorkspaceRecord = {
     workspaceId: "workspace-1",
     runId: "run-1",
@@ -150,6 +178,21 @@ describe("SubmissionValidator", () => {
 
     await expect(fixture.validator.validate(fixture.workspace, declared))
       .rejects.toThrow(/schema|version/u);
+  });
+
+  it.each([
+    ["missing", { createTask: false }],
+    ["reassigned", { taskOwner: "leader" }],
+    ["blocked", { taskState: "blocked" as const }],
+    ["completed", { taskState: "completed" as const }],
+    ["failed", { taskState: "failed" as const }]
+  ])("rejects a %s authoritative task before Git derivation", async (_label, options) => {
+    const fixture = await setup(options);
+
+    await expect(fixture.validator.validate(
+      fixture.workspace,
+      submission(fixture.second, [fixture.first, fixture.second])
+    )).rejects.toThrow(/task|owner|state|status/u);
   });
 
   it.each([
@@ -208,6 +251,38 @@ describe("SubmissionValidator", () => {
     });
     expect(result.patch).not.toContain("base64");
     expect(result.patch).not.toContain("GIT binary patch");
+  });
+
+  it("disables configured binary textconv when deriving the patch", async () => {
+    const fixture = await setup();
+    const marker = join(fixture.repo.root, "..", "textconv-ran.txt");
+    const script = join(fixture.repo.root, "..", "textconv.cjs");
+    await writeFile(
+      script,
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`
+      + `process.stdout.write("BASE64-TEXTCONV-LEAK");\n`
+    );
+    await fixture.repo.git([
+      "config",
+      "diff.leak.textconv",
+      `"${process.execPath}" "${script}"`
+    ]);
+    await fixture.repo.write(".gitattributes", "*.bin diff=leak\n");
+    await writeFile(join(fixture.repo.root, "converted.bin"), Buffer.from([0, 1, 2, 255]));
+    await fixture.repo.git(["add", ".gitattributes", "converted.bin"]);
+    await fixture.repo.git(["commit", "-m", "binary with textconv"]);
+    const head = (await fixture.repo.git(["rev-parse", "HEAD"])).stdout.trim();
+    const registered = { ...fixture.workspace, headCommit: head };
+    fixture.store.putGitWorkspace(registered);
+
+    const result = await fixture.validator.validate(
+      registered,
+      submission(head, [fixture.first, fixture.second, head])
+    );
+
+    expect(result.patch).not.toContain("BASE64-TEXTCONV-LEAK");
+    expect(result.files.find(({ path }) => path === "converted.bin")?.binary).toBe(true);
+    await expect(lstat(marker)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("hashes a deleted binary from Git blob bytes", async () => {
@@ -317,6 +392,23 @@ describe("SubmissionValidator", () => {
     expect(result.warnings).toEqual([
       expect.objectContaining({ code: "patch_warning_limit_exceeded" })
     ]);
+  });
+
+  it("rejects an authoritative patch above the persisted hard limit", async () => {
+    const company = companyDefinitionFixture();
+    company.evidence = {
+      diffWarningBytes: 256 * 1024,
+      diffHardLimitBytes: 1024 * 1024
+    };
+    const fixture = await setup({
+      company,
+      firstContent: `${"x".repeat(1100 * 1024)}\n`
+    });
+
+    await expect(fixture.validator.validate(
+      fixture.workspace,
+      submission(fixture.second, [fixture.first, fixture.second])
+    )).rejects.toThrow(/hard limit|capture limit|exceeded/u);
   });
 
   it("requires authoritative passed validation evidence with matching log bytes", async () => {
