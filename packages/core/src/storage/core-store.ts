@@ -866,6 +866,15 @@ export class CoreStore {
 
   putReviewPackage(reviewPackage: ReviewPackageRecord): void {
     this.inTransaction(() => {
+      const existing = this.getReviewPackage(
+        reviewPackage.runId,
+        reviewPackage.taskId,
+        reviewPackage.revision
+      );
+      if (existing !== null) {
+        if (JSON.stringify(existing) === JSON.stringify(reviewPackage)) return;
+        throw new Error("review package immutable identity already exists");
+      }
       this.#database.prepare(`
         INSERT INTO review_packages (
           run_id,
@@ -874,8 +883,6 @@ export class CoreStore {
           record_json
         )
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(run_id, task_id, revision) DO UPDATE SET
-          record_json = excluded.record_json
       `).run(
         reviewPackage.runId,
         reviewPackage.taskId,
@@ -883,6 +890,41 @@ export class CoreStore {
         JSON.stringify(reviewPackage)
       );
     });
+  }
+
+  commitReviewPackageCreation(input: {
+    reviewPackage: ReviewPackageRecord;
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      const existing = this.getReviewPackage(
+        input.reviewPackage.runId,
+        input.reviewPackage.taskId,
+        input.reviewPackage.revision
+      );
+      if (existing !== null) {
+        if (JSON.stringify(existing) !== JSON.stringify(input.reviewPackage)) {
+          throw new Error("review package immutable identity already exists");
+        }
+        return null;
+      }
+      this.#database.prepare(`
+        INSERT INTO review_packages (
+          run_id,
+          task_id,
+          revision,
+          record_json
+        )
+        VALUES (?, ?, ?, ?)
+      `).run(
+        input.reviewPackage.runId,
+        input.reviewPackage.taskId,
+        input.reviewPackage.revision,
+        JSON.stringify(input.reviewPackage)
+      );
+      return this.#insertEventRow(input.event);
+    });
+    if (insertedEvent !== null) this.#publishEvents([insertedEvent]);
   }
 
   getReviewPackage(

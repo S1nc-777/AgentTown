@@ -58,3 +58,20 @@ export {
   type ValidationRunnerOptions,
   type ValidationScope
 } from "./git/validation-runner.js";
+export {
+  SubmissionValidator,
+  type AuthoritativeValidation,
+  type CanonicalCommit,
+  type EvidenceFile,
+  type EvidenceFileStatus,
+  type SubmissionValidatorOptions,
+  type SubmissionWarning,
+  type ValidatedSubmission
+} from "./git/submission-validator.js";
+export {
+  EvidencePackageBuilder,
+  createInjectedEvidencePackageBuilder,
+  type EvidencePackageBuilderOptions,
+  type EvidencePackageBuilderDependencies,
+  type EvidencePackageInput
+} from "./git/evidence-package.js";
