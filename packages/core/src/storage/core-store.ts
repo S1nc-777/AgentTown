@@ -671,6 +671,17 @@ export class CoreStore {
     });
   }
 
+  commitValidationCommandGrant(input: {
+    grant: ValidationCommandGrant;
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      this.#putValidationCommandGrantRow(input.grant);
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
+  }
+
   getValidationCommandGrant(grantId: string): ValidationCommandGrant | null {
     const row = this.#database.prepare(`
       SELECT record_json
@@ -736,43 +747,56 @@ export class CoreStore {
     });
   }
 
+  commitValidationCommandGrantDecision(input: {
+    grantId: string;
+    decision: "approved" | "rejected";
+    reason: string;
+    event: NewEvent;
+  }): ValidationCommandGrant {
+    if (input.reason.trim().length === 0) {
+      throw new Error("validation command grant decision reason is required");
+    }
+    const { grant, insertedEvent } = this.inTransaction(() => {
+      const current = this.getValidationCommandGrant(input.grantId);
+      if (current === null) {
+        throw new Error(`validation command grant not found: ${input.grantId}`);
+      }
+      if (current.status !== "pending") {
+        if (
+          current.status === input.decision
+          && current.decisionReason === input.reason
+        ) {
+          return { grant: current, insertedEvent: null };
+        }
+        throw new Error(`validation command grant already ${current.status}: ${input.grantId}`);
+      }
+      const grant: ValidationCommandGrant = {
+        ...current,
+        status: input.decision,
+        decisionReason: input.reason
+      };
+      this.#putValidationCommandGrantRow(grant);
+      return { grant, insertedEvent: this.#insertEventRow(input.event) };
+    });
+    if (insertedEvent !== null) this.#publishEvents([insertedEvent]);
+    return grant;
+  }
+
   putValidationRun(validation: ValidationRunRecord): void {
     this.inTransaction(() => {
-      if (validation.integrationAttemptId !== null) {
-        const attempt = this.getIntegrationAttempt(validation.integrationAttemptId);
-        if (
-          attempt === null
-          || validation.runId !== attempt.runId
-          || validation.taskId !== attempt.taskId
-        ) {
-          throw new Error(
-            `linked validation ownership must match integration attempt: `
-            + validation.integrationAttemptId
-          );
-        }
-      }
-      this.#database.prepare(`
-        INSERT INTO validation_runs (
-          validation_id,
-          run_id,
-          task_id,
-          integration_attempt_id,
-          record_json
-        )
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(validation_id) DO UPDATE SET
-          run_id = excluded.run_id,
-          task_id = excluded.task_id,
-          integration_attempt_id = excluded.integration_attempt_id,
-          record_json = excluded.record_json
-      `).run(
-        validation.validationId,
-        validation.runId,
-        validation.taskId,
-        validation.integrationAttemptId,
-        JSON.stringify(validation)
-      );
+      this.#putValidationRunRow(validation);
     });
+  }
+
+  commitValidationRun(input: {
+    validation: ValidationRunRecord;
+    event: NewEvent;
+  }): void {
+    const insertedEvent = this.inTransaction(() => {
+      this.#putValidationRunRow(input.validation);
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
   }
 
   getValidationRun(validationId: string): ValidationRunRecord | null {
@@ -1575,6 +1599,43 @@ export class CoreStore {
     );
   }
 
+  #putValidationRunRow(validation: ValidationRunRecord): void {
+    if (validation.integrationAttemptId !== null) {
+      const attempt = this.getIntegrationAttempt(validation.integrationAttemptId);
+      if (
+        attempt === null
+        || validation.runId !== attempt.runId
+        || validation.taskId !== attempt.taskId
+      ) {
+        throw new Error(
+          `linked validation ownership must match integration attempt: `
+          + validation.integrationAttemptId
+        );
+      }
+    }
+    this.#database.prepare(`
+      INSERT INTO validation_runs (
+        validation_id,
+        run_id,
+        task_id,
+        integration_attempt_id,
+        record_json
+      )
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(validation_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        task_id = excluded.task_id,
+        integration_attempt_id = excluded.integration_attempt_id,
+        record_json = excluded.record_json
+    `).run(
+      validation.validationId,
+      validation.runId,
+      validation.taskId,
+      validation.integrationAttemptId,
+      JSON.stringify(validation)
+    );
+  }
+
   #putTaskRow(companyId: string, task: TaskRecord): void {
     this.#database.prepare(`
       INSERT INTO tasks (
@@ -1634,7 +1695,12 @@ export class CoreStore {
   #publishEvents(events: readonly EventRecord[]): void {
     for (const event of events) {
       for (const listener of this.#eventListeners) {
-        listener(event);
+        try {
+          listener(event);
+        } catch {
+          // Event delivery is best effort; the committed event remains available
+          // from the durable cursor for a listener that needs to recover.
+        }
       }
     }
   }

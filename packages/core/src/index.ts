@@ -53,3 +53,8 @@ export {
   type CreateTaskWorkspaceInput,
   type WorkspaceManagerOptions
 } from "./git/workspace-manager.js";
+export {
+  ValidationRunner,
+  type ValidationRunnerOptions,
+  type ValidationScope
+} from "./git/validation-runner.js";

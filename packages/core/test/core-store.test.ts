@@ -8,6 +8,24 @@ afterEach(async () => {
 });
 
 describe("CoreStore", () => {
+  it("commits events when one listener throws and still notifies later listeners", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    const received: string[] = [];
+    store.subscribeEvents(() => { throw new Error("listener failure"); });
+    store.subscribeEvents((event) => { received.push(event.id); });
+
+    expect(() => store.insertEvent({
+      id: "event-1", type: "validation.completed", actorId: "core", taskId: null,
+      causationEventId: null, payload: {}
+    })).not.toThrow();
+    expect(store.listEvents(0).map(({ id }) => id)).toEqual(["event-1"]);
+    expect(received).toEqual(["event-1"]);
+    store.close();
+  });
+
   it("persists atomic mutation request claims across reopen", async () => {
     const project = await createTemporaryProject();
     cleanups.push(project.cleanup);
