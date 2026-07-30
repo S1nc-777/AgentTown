@@ -3,12 +3,12 @@
 - 更新日期：2026-07-30
 - 当前开发分支：`codex/p1b-git-collaboration`
 - P1B 基线：`2ea80ab`
-- 当前实现提交：`bf01269`
-- 下一项任务：P1B Task 5
+- 当前功能提交：`baad570`
+- 下一项任务：P1B Task 6
 
 ## 一句话状态
 
-AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前四项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
+AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前五项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
 
 ## 已完成
 
@@ -27,7 +27,7 @@ P1A 是架构验证切片，不包含真实 Agent、Git worktree 协作或桌面
 
 ### P1B：Git 协作闭环
 
-P1B 计划共有 12 项。目前 Task 1–4 已完成并通过独立规格/代码质量审查，Task 5–12 按用户要求暂停。
+P1B 计划共有 12 项。目前 Task 1–5 已完成并通过独立规格/代码质量审查，Task 6–12 尚未开始。
 
 | 任务 | 状态 | 提交范围 | 结果 |
 | --- | --- | --- | --- |
@@ -35,15 +35,16 @@ P1B 计划共有 12 项。目前 Task 1–4 已完成并通过独立规格/代�
 | 2. Schema v2 与 Git 事实存储 | 完成 | `4c61014..f01c976` | 审查通过 |
 | 3. Git 边界与仓库预检 | 完成 | `f01c976..ef29598` | 审查通过 |
 | 4. Run/Task worktree 生命周期 | 完成 | `ef29598..bf01269` | 审查通过 |
-| 5–12. 验证、审核、集成、恢复、CLI、E2E | 暂停 | — | 尚未开始 |
+| 5. 结构化验证与证据日志 | 完成 | `1b27f2e..baad570` | 审查通过 |
+| 6–12. 审核、集成、恢复、CLI、E2E | 待办 | — | 尚未开始 |
 
-Task 4 最终验证证据：
+Task 5 最终验证证据：
 
-- `WorkspaceManager` 定向测试：24/24 通过；
-- Core：12 个测试文件、223 个测试通过；
+- 验证与存储定向测试：32/32 通过；
+- Core：13 个测试文件、247 个测试通过；
 - 工作区类型检查：全部适用项目通过；
 - 独立复审：Spec Approved、Code-quality Approved；
-- 没有启动 Task 5。
+- 没有启动 Task 6。
 
 ## 当前架构边界
 
@@ -69,6 +70,10 @@ flowchart TB
 - 在 Git 操作前持久化意图，操作后验证路径、ref 和 commit；
 - 暂停时保留工作区，清理时只处理能够证明归属且状态一致的资产；
 - 对外部移动、缺失、ref 改写或路径占用记录 `tampered`/`missing`，不猜测修复。
+- 只执行公司配置或用户精确批准的无 shell 验证命令；
+- 对命令 scope、公司归属、workspace、cwd 和授权指纹进行执行前校验；
+- 生成有界、脱敏、哈希校验且原子发布的验证证据；
+- 以身份安全、绝对截止时间和 fail-closed 语义处理进程树清理。
 
 ## 开发经验
 
@@ -115,27 +120,39 @@ flowchart TB
 
 多个 Git-heavy Vitest 运行重叠时，会显著放大进程启动延迟。测试只对三条已证明需要的真实 Git 用例使用局部 20 秒上限，没有扩大生产默认值、全局超时、重试或 sleep。
 
+### 10. 未脱敏数据不能先写临时文件
+
+“最终文件会脱敏”不足以保护进程崩溃、断电或 rename 失败。Task 5 在有界内存中按 stdout/stderr 保留跨 chunk 状态，先完成脱敏，再把安全内容写入临时证据；跨 chunk token、Bearer 和常见敏感赋值也不能靠插入日志标签绕过。
+
+### 11. 进程清理需要验证身份，而不只是 PID
+
+PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/stat` 的 starttime ticks；终止前后都要复核已经捕获的树成员。身份查询失败、PID 重用或成员仍存活都必须得到 `cleanup_failed`，并与 workflow 暂停在同一事务落库。
+
+### 12. 授权必须绑定公司、工作区和精确命令
+
+一个 `CompanyDefinition` 不能替另一个公司的 run 授权。配置 revision、companyId、workspaceId、executable、args、cwd 和 timeout 都是权限边界；建议命令中的明显 token/password/API-key/Bearer 字面量在持久化 grant 前直接拒绝。
+
 ## 已知问题与环境残留
 
 - 真实 Claude Code、OpenCode、Hermes Agent 适配尚未开始。
 - 根目录 `pnpm typecheck` 的依赖构建顺序仍值得后续整理；各包脚本目前承担部分预构建责任。
-- 此轮开发早期取消的真实 Git 测试在 Windows 临时目录留下 18 个 `agenttown-git-*` fixture。复核时没有存活的 Vitest/Git 进程占用它们。原计划使用经过解析和逐项验证的 PowerShell 删除，但环境策略在执行前拒绝了命令；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
+- 截至本次复核，Windows 临时目录中有 24 个历史 `agenttown-git-*` 和 25 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
 - 仓库包元数据声明 `AGPL-3.0-only`，独立 `LICENSE` 文件和贡献指南仍待补齐。
 
-## 下一步：Task 5
+## 下一步：Task 6
 
-下一次开发从 [P1B 实施计划的 Task 5](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-5-structured-validation-runner-and-evidence-logs) 继续：
+下一次开发从 [P1B 实施计划的 Task 6](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-6-submission-validation-and-immutable-review-packages) 继续：
 
-> Structured Validation Runner and Evidence Logs
+> Submission Validation and Immutable Review Packages
 
-目标是让 Core 在已注册 worktree 中无 shell 地执行允许的验证命令，记录有界、脱敏、可审计的输出，并对未经配置的命令生成需要用户明确批准的精确授权。
+目标是校验任务提交的 commit 范围和权威验证结果，并生成内容寻址、不可覆盖、可供独立审核员只读检查的审核包。
 
 恢复开发前应确认：
 
 1. 分支为 `codex/p1b-git-collaboration`；
 2. `git status --short` 为空；
-3. HEAD 至少包含 `bf01269`；
-4. Task 1–4 不重新实现；
+3. HEAD 至少包含 `baad570`；
+4. Task 1–5 不重新实现；
 5. 先读 P1B 设计、实施计划和本文；
 6. 使用 TDD 和独立只读复审；
 7. 不在同一 Windows 工作区并发运行多套真实 Git 测试。
@@ -145,10 +162,10 @@ flowchart TB
 如果后续对话上下文被压缩，只需保留以下事实：
 
 - 产品：AgentTown，本地“赛博公司”式多 Agent 调度器；
-- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–4；
+- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–5；
 - 当前分支：`codex/p1b-git-collaboration`；
-- 当前实现提交：`bf01269`；
-- Task 4 已经完整测试并通过独立复审；
-- Task 5–12 尚未开始；
-- 下一步只做 Task 5，不重做之前任务；
+- 当前功能提交：`baad570`；
+- Task 5 已经完整测试并通过独立复审；
+- Task 6–12 尚未开始；
+- 下一步只做 Task 6，不重做之前任务；
 - README 与本文是面向用户和开发者的当前权威摘要，详细规则以 P1B spec/plan 为准。
