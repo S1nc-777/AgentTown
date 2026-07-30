@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CoreStore } from "../src/storage/core-store.js";
 import { companyDefinitionFixture, createTemporaryProject } from "./helpers.js";
@@ -23,6 +24,69 @@ describe("CoreStore", () => {
     })).not.toThrow();
     expect(store.listEvents(0).map(({ id }) => id)).toEqual(["event-1"]);
     expect(received).toEqual(["event-1"]);
+    store.close();
+  });
+
+  it("rolls back cleanup_failed validation and pause facts when the pause event fails", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: {
+        id: "company-created", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: { companyId: "company-1" }
+      }
+    });
+    const run = {
+      runId: "run-1", companyId: "company-1", projectRoot: project.root,
+      originalBranch: "main", baseCommit: "a".repeat(40),
+      integrationRef: "refs/heads/agenttown/run-1/integration",
+      integrationCommit: "a".repeat(40), status: "active" as const,
+      createdAt: "2026-07-30T00:00:00.000Z", updatedAt: "2026-07-30T00:00:00.000Z"
+    };
+    const workspace = {
+      workspaceId: "workspace-1", runId: "run-1", taskId: "task-1",
+      employeeId: "developer", kind: "task" as const, path: project.root,
+      branchRef: "refs/heads/agenttown/run-1/task-1", baseCommit: "a".repeat(40),
+      headCommit: "a".repeat(40), status: "active" as const
+    };
+    store.putGitRun(run);
+    store.putGitWorkspace(workspace);
+
+    expect(() => store.commitValidationRunCompletion({
+      validation: {
+        validationId: "validation-1", runId: "run-1", taskId: "task-1",
+        integrationAttemptId: null,
+        command: {
+          id: "check", executable: process.execPath, args: ["--version"],
+          cwd: ".", timeoutSeconds: 1
+        },
+        workspaceId: "workspace-1", outcome: "cleanup_failed", exitCode: null,
+        startedAt: "2026-07-30T00:00:01.000Z",
+        completedAt: "2026-07-30T00:00:02.000Z",
+        logPath: join(project.root, "validation.log"), logHash: "b".repeat(64)
+      },
+      completedEvent: {
+        id: "validation-completed", type: "validation.completed", actorId: "core",
+        taskId: "task-1", causationEventId: null, payload: {}
+      },
+      pause: {
+        run: { ...run, status: "paused" },
+        workspaces: [{ ...workspace, status: "paused" }],
+        event: {
+          id: "company-created", type: "git.run.paused", actorId: "core",
+          taskId: null, causationEventId: null, payload: {}
+        }
+      }
+    })).toThrow();
+
+    expect(store.getValidationRun("validation-1")).toBeNull();
+    expect(store.getGitRun("run-1")?.status).toBe("active");
+    expect(store.getGitWorkspace("workspace-1")?.status).toBe("active");
+    expect(store.listEvents(0).map(({ id }) => id)).toEqual(["company-created"]);
     store.close();
   });
 

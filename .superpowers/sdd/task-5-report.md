@@ -133,5 +133,126 @@ Vitest emitted only the repository's expected Node experimental SQLite warning.
 
 ## Concerns
 
-No functional concerns remain for Task 5. The experimental SQLite warning is
-expected and unrelated to this change.
+The remaining pure-Node OS-open/escaped-descendant proof limits are documented
+below and require controller adjudication against the existing P1A trust
+model. The experimental SQLite warning is expected and unrelated.
+
+## Independent review fixes
+
+An independent review after `dcc4de5` identified six additional hardening
+requirements. They were handled with the following RED -> GREEN evidence.
+
+### 1. Disk-before-redaction and cross-chunk secrets
+
+- RED: a finalization dependency was ignored, proving the old runner could not
+  test or guarantee failure residue; inspection also confirmed raw stdout and
+  stderr chunks were written to the temporary file before redaction.
+- GREEN: raw output is now held only in a bounded in-memory representation.
+  Redaction ranges are computed independently for stdout and stderr over the
+  complete stream, then mapped back onto the original global chunk sequence.
+  Only those redacted, sequence-labelled bytes are opened/written on disk.
+- Coverage splits an exact secret and `API_TOKEN` assignment across writes with
+  interleaved stderr, then scans every final/temp file. A forced pre-rename
+  failure likewise scans the surviving exclusive temp file. Neither path
+  contains plaintext.
+
+### 2. Identity-safe process-tree cleanup
+
+- RED: the earlier timeout test only proved parent closure/taskkill completion;
+  it did not make PID reuse or identity-query failure fail closed.
+- GREEN on Windows: cleanup snapshots the root and current descendants through
+  `Win32_Process`, records `pid + CreationDate`, rechecks the root identity
+  before `taskkill /T /F`, waits for close, then verifies every captured
+  identity is absent. Query error, PID reuse, or a captured member that remains
+  present becomes `cleanup_failed`. All inspection/termination work shares one
+  independent five-second cleanup deadline.
+- A real parent+child timeout test verifies both PIDs disappear. Deterministic
+  controller tests cover post-kill query error, PID reuse, and a captured
+  escaped member that remains live; each returns `cleanup_failed` and pauses.
+- The first Windows GREEN attempt exposed serial CIM post-checks consuming the
+  cleanup deadline. Parallel post-checks fixed that root cause while retaining
+  the single absolute deadline.
+
+On POSIX, AgentTown snapshots the visible parent tree and kills the detached
+process group, then verifies captured identities. Pure Node cannot prove the
+absence of an arbitrary malicious descendant that double-forks/creates a new
+session before the snapshot and is no longer related by PPID or process group.
+The runner therefore does not claim that guarantee; any escaped member that is
+captured but cannot be proven absent fails closed.
+
+### 3. Company ownership
+
+- RED: a runner injected with company B's definition executed B's configured
+  command against company A's Git run.
+- GREEN: `ValidationRunnerOptions` now requires `companyId`. Request, decision,
+  and execution paths bind the run's `companyId` and the persisted exact
+  definition JSON to that company before any grant mutation, authorization, or
+  spawn. Cross-company run execution and cross-company grant decision tests
+  reject before mutation/execution.
+
+### 4. Atomic cleanup failure and active scopes
+
+- RED: paused runs/workspaces were executable, and the previous runner committed
+  `ValidationRunRecord`/`validation.completed` before a separate pause
+  transaction.
+- GREEN: scope resolution rejects any non-active run or workspace.
+  `commitValidationRunCompletion` writes the cleanup-failed record,
+  `validation.completed`, paused run/workspaces, and `git.run.paused` in one
+  CoreStore transaction.
+- A forced duplicate pause-event failure verifies rollback leaves no validation
+  record/event and leaves the run/workspace active. Identity-failure tests
+  verify the successful atomic bundle has all facts and both events.
+
+### 5. Cwd/log replacement hardening and pure-Node boundary
+
+- RED: there was only one cwd validation before spawn and no repeated log
+  directory identity validation around open/rename.
+- GREEN: cwd is checked component-by-component with `lstat`/`realpath` and a
+  device/inode identity, then checked again immediately before spawn. The log
+  directory is revalidated before exclusive mode-0600 temp open, after close,
+  immediately before rename, and after rename. A deterministic dependency
+  hook replaces cwd with a symlink/junction between the checks and execution is
+  rejected. These harness dependencies are available only through an internal
+  source-module factory used by Core tests; they are not part of the package
+  root export or `ValidationRunnerOptions` public API.
+
+This follows the existing P1A pure-Node filesystem trust model: validation is
+fail-closed for observed reparse/identity changes, but `spawn({ cwd: path })`
+cannot bind a previously validated Windows directory handle. Therefore a final
+OS-open race remains between the immediately preceding identity check and
+Node/Windows opening `cwd`; eliminating it requires a native handle-relative
+spawn API that Node does not expose. The same limitation applies to the final
+few instructions around path-based open/rename. This report deliberately does
+not call the implementation race-free.
+
+### 6. Full command timeout budget
+
+- RED: a command configured for one second but completing after about 500 ms
+  returned `timed_out`, because two thirds of the command budget was reserved
+  for cleanup.
+- GREEN: the command timer now fires only at
+  `started + timeoutSeconds * 1000`. Cleanup begins after that deadline and
+  receives a separate, explicit, bounded five-second deadline.
+- The regression asserts the approximately 500 ms command passes and a command
+  exceeding one second times out, with only scheduling tolerance in tests and
+  no production-timeout relaxation.
+
+### Independent-review verification
+
+- Focused:
+  `pnpm exec vitest run test/validation-runner.test.ts test/core-store.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1`
+  - 2 files passed
+  - 29 tests passed
+- Core single-worker full suite:
+  `pnpm exec vitest run --reporter=dot --no-file-parallelism --maxWorkers=1`
+  - 13 files passed
+  - 244 tests passed
+- Root `pnpm typecheck`
+  - all 8 participating workspace projects passed
+- `git diff --check`
+  - passed
+- Live-process audit
+  - no Node/Vitest validation process remained; the long-lived Codex
+    PowerShell AST parser was intentionally not classified as a test process
+- Exact RED-test `agenttown-core-*` leftovers listed during this run were
+  removed; no `agenttown-git-*` directory was touched.

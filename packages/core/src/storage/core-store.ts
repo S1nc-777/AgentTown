@@ -799,6 +799,38 @@ export class CoreStore {
     this.#publishEvents([insertedEvent]);
   }
 
+  commitValidationRunCompletion(input: {
+    validation: ValidationRunRecord;
+    completedEvent: NewEvent;
+    pause?: {
+      run: GitRunRecord;
+      workspaces: readonly GitWorkspaceRecord[];
+      event: NewEvent;
+    };
+  }): void {
+    if (input.pause !== undefined && (
+      input.validation.outcome !== "cleanup_failed"
+      || input.pause.run.runId !== input.validation.runId
+      || input.pause.run.status !== "paused"
+      || input.pause.workspaces.some(({ runId }) => runId !== input.validation.runId)
+    )) {
+      throw new Error("cleanup_failed pause facts do not match validation run");
+    }
+    const insertedEvents = this.inTransaction(() => {
+      this.#putValidationRunRow(input.validation);
+      const events = [this.#insertEventRow(input.completedEvent)];
+      if (input.pause !== undefined) {
+        this.#putGitRunRow(input.pause.run);
+        for (const workspace of input.pause.workspaces) {
+          this.#putGitWorkspaceRow(workspace);
+        }
+        events.push(this.#insertEventRow(input.pause.event));
+      }
+      return events;
+    });
+    this.#publishEvents(insertedEvents);
+  }
+
   getValidationRun(validationId: string): ValidationRunRecord | null {
     const row = this.#database.prepare(`
       SELECT record_json

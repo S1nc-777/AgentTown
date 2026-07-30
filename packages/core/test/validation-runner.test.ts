@@ -1,8 +1,9 @@
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, symlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CompanyDefinition, ValidationCommand } from "@agenttown/runtime-contract";
 import { CoreStore, ValidationRunner, type ValidationScope } from "../src/index.js";
+import { createInjectedValidationRunner } from "../src/git/validation-runner.js";
 import { companyDefinitionFixture, createTemporaryProject } from "./helpers.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -27,7 +28,10 @@ function configuredCompany(commands: ValidationCommand[]): CompanyDefinition {
   return { ...company, validation: { commands, integrationCommandIds: [] } };
 }
 
-async function createRunner(commands: ValidationCommand[] = []) {
+async function createRunner(
+  commands: ValidationCommand[] = [],
+  runnerOverrides: Record<string, unknown> = {}
+) {
   const project = await createTemporaryProject();
   cleanups.push(project.cleanup);
   const store = new CoreStore(project.databasePath);
@@ -76,11 +80,27 @@ async function createRunner(commands: ValidationCommand[] = []) {
     workspaceId: "workspace-1",
     workspaceRoot: project.root
   };
+  const {
+    dependencies,
+    ...optionOverrides
+  } = runnerOverrides;
   return {
     project,
     store,
     scope,
-    runner: new ValidationRunner({ store, company })
+    runner: dependencies === undefined
+      ? new ValidationRunner({
+          store,
+          companyId: "company-1",
+          company,
+          ...optionOverrides
+        })
+      : createInjectedValidationRunner({
+          store,
+          companyId: "company-1",
+          company,
+          ...optionOverrides
+        }, dependencies as Parameters<typeof createInjectedValidationRunner>[1])
   };
 }
 
@@ -165,6 +185,219 @@ describe("ValidationRunner", () => {
 
     expect(await readFile(result.logPath, "utf8")).not.toContain("secret-value");
     expect(await readFile(result.logPath, "utf8")).toContain("[REDACTED]");
+    store.close();
+  });
+
+  it("redacts same-stream secrets across chunks before any disk persistence", async () => {
+    const executable = command([
+      "process.stdout.write('secret-');",
+      "process.stderr.write('interleaved');",
+      "setTimeout(() => { process.stdout.write('value'); process.stderr.write(' API_TOKEN=to'); }, 30);",
+      "setTimeout(() => { process.stderr.write('ken'); }, 60);"
+    ].join(""));
+    const { project, runner, scope, store } = await createRunner([executable]);
+
+    const result = await runner.run(executable, scope, {
+      secretValues: ["secret-value", "token"]
+    });
+    const evidenceDirectory = join(project.root, ".agenttown", "runs", scope.runId, "validation");
+    const persisted = await Promise.all(
+      (await readdir(evidenceDirectory)).map(async (name) =>
+        await readFile(join(evidenceDirectory, name), "utf8"))
+    );
+
+    expect(persisted.join("\n")).not.toContain("secret-value");
+    expect(persisted.join("\n")).not.toContain("API_TOKEN=token");
+    expect(await readFile(result.logPath, "utf8")).toContain("[REDACTED]");
+    store.close();
+  });
+
+  it("never leaves plaintext in a temporary log when evidence finalization fails", async () => {
+    const executable = command("process.stdout.write('secret-value')");
+    const { project, runner, scope, store } = await createRunner([executable], {
+      dependencies: {
+        beforeEvidenceRename: async () => {
+          throw new Error("injected rename failure");
+        }
+      }
+    });
+
+    await expect(runner.run(executable, scope, {
+      secretValues: ["secret-value"]
+    })).rejects.toThrow("injected rename failure");
+    const evidenceDirectory = join(project.root, ".agenttown", "runs", scope.runId, "validation");
+    const persisted = await Promise.all(
+      (await readdir(evidenceDirectory)).map(async (name) =>
+        await readFile(join(evidenceDirectory, name), "utf8"))
+    );
+
+    expect(persisted.join("\n")).not.toContain("secret-value");
+    store.close();
+  });
+
+  it("rejects commands for a run owned by another company before executing", async () => {
+    const markerProject = await createTemporaryProject();
+    cleanups.push(markerProject.cleanup);
+    const markerPath = join(markerProject.root, "wrong-company.txt");
+    const executable = command(
+      `require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'executed')`
+    );
+    const companyB = configuredCompany([executable]);
+    const { runner, scope, store } = await createRunner([], {
+      companyId: "company-b",
+      company: companyB
+    });
+    store.createCompany({
+      id: "company-b",
+      definition: companyB,
+      event: {
+        id: "company-b-created", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: { companyId: "company-b" }
+      }
+    });
+
+    await expect(runner.run(executable, scope)).rejects.toThrow("company ownership");
+    await expect(stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    store.close();
+  });
+
+  it("rejects deciding another company's validation grant", async () => {
+    const suggested = command("process.exit(0)", { id: "suggested" });
+    const { runner, scope, store } = await createRunner();
+    const pending = await runner.requestGrant(suggested, scope);
+    const companyB = configuredCompany([]);
+    store.createCompany({
+      id: "company-b",
+      definition: companyB,
+      event: {
+        id: "company-b-created", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: { companyId: "company-b" }
+      }
+    });
+    const runnerB = new ValidationRunner({
+      store,
+      companyId: "company-b",
+      company: companyB
+    });
+
+    await expect(runnerB.decideGrant(pending.grantId, "approved", "cross-company"))
+      .rejects.toThrow("company ownership");
+    expect(store.getValidationCommandGrant(pending.grantId)?.status).toBe("pending");
+    store.close();
+  });
+
+  it("rejects a paused run and workspace before executing", async () => {
+    const executable = command("process.exit(0)");
+    const { runner, scope, store } = await createRunner([executable]);
+    const run = store.getGitRun(scope.runId)!;
+    const workspace = store.getGitWorkspace(scope.workspaceId)!;
+    store.putGitRun({ ...run, status: "paused" });
+    store.putGitWorkspace({ ...workspace, status: "paused" });
+
+    await expect(runner.run(executable, scope)).rejects.toThrow("not active");
+    store.close();
+  });
+
+  it("uses timeoutSeconds as the full command execution budget", async () => {
+    const quick = command("setTimeout(() => process.exit(0), 500)", {
+      id: "quick",
+      timeoutSeconds: 1
+    });
+    const slow = command("setTimeout(() => process.exit(0), 1300)", {
+      id: "slow",
+      timeoutSeconds: 1
+    });
+    const { runner, scope, store } = await createRunner([quick, slow]);
+
+    const quickStarted = Date.now();
+    const quickResult = await runner.run(quick, scope);
+    const quickElapsed = Date.now() - quickStarted;
+    const slowStarted = Date.now();
+    const slowResult = await runner.run(slow, scope);
+    const slowElapsed = Date.now() - slowStarted;
+
+    expect(quickResult.outcome).toBe("passed");
+    expect(quickElapsed).toBeGreaterThanOrEqual(450);
+    expect(quickElapsed).toBeLessThan(1_500);
+    expect(slowResult.outcome).toBe("timed_out");
+    expect(slowElapsed).toBeGreaterThanOrEqual(900);
+    store.close();
+  }, 10_000);
+
+  it.each(["query_error", "reused"] as const)(
+    "fails closed on process identity status %s and atomically pauses",
+    async (terminalIdentityStatus) => {
+    const executable = command("setInterval(() => {}, 1000)", { timeoutSeconds: 1 });
+    let queryCount = 0;
+    const { runner, scope, store } = await createRunner([executable], {
+      dependencies: {
+        processTree: {
+          snapshot: async (pid: number) => [{ pid, started: "root-start" }],
+          query: async () => (++queryCount === 1 ? "same" : terminalIdentityStatus),
+          terminate: async (child: { kill: (signal?: NodeJS.Signals) => boolean }) => {
+            child.kill("SIGKILL");
+          }
+        }
+      }
+    });
+
+    const result = await runner.run(executable, scope);
+
+    expect(result.outcome).toBe("cleanup_failed");
+    expect(store.getValidationRun(result.validationId)).toEqual(result);
+    expect(store.getGitRun(scope.runId)?.status).toBe("paused");
+    expect(store.getGitWorkspace(scope.workspaceId)?.status).toBe("paused");
+    expect(store.listEvents(0).slice(-2).map(({ type }) => type))
+      .toEqual(["validation.completed", "git.run.paused"]);
+    store.close();
+    },
+    10_000
+  );
+
+  it("treats a captured escaped descendant as cleanup_failed", async () => {
+    const executable = command("setInterval(() => {}, 1000)", { timeoutSeconds: 1 });
+    let terminated = false;
+    const { runner, scope, store } = await createRunner([executable], {
+      dependencies: {
+        processTree: {
+          snapshot: async (pid: number) => [
+            { pid, started: "root-start" },
+            { pid: 999_999, started: "escaped-start" }
+          ],
+          query: async (identity: { pid: number }) =>
+            identity.pid === 999_999 ? "same" : terminated ? "absent" : "same",
+          terminate: async (child: { kill: (signal?: NodeJS.Signals) => boolean }) => {
+            terminated = true;
+            child.kill("SIGKILL");
+          }
+        }
+      }
+    });
+
+    const result = await runner.run(executable, scope);
+
+    expect(result.outcome).toBe("cleanup_failed");
+    expect(store.getGitRun(scope.runId)?.status).toBe("paused");
+    store.close();
+  }, 10_000);
+
+  it("rejects a cwd replaced by a junction between validation and spawn", async () => {
+    const executable = command("process.exit(0)", { cwd: "work" });
+    let race: () => Promise<void> = async () => undefined;
+    const { project, runner, scope, store } = await createRunner([executable], {
+      dependencies: { beforeSpawn: async () => await race() }
+    });
+    const outside = await createTemporaryProject();
+    cleanups.push(outside.cleanup);
+    const cwd = join(project.root, "work");
+    await mkdir(cwd);
+    race = async () => {
+      await rename(cwd, join(project.root, "work-original"));
+      await symlink(outside.root, cwd, process.platform === "win32" ? "junction" : "dir");
+    };
+
+    await expect(runner.run(executable, scope))
+      .rejects.toThrow(/symbolic link|reparse|identity|non-directory/u);
     store.close();
   });
 

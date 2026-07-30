@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, realpath, rename, lstat } from "node:fs/promises";
+import { mkdir, open, realpath, rename, lstat, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import type {
   CompanyDefinition,
@@ -23,6 +23,7 @@ export interface ValidationScope {
 
 export interface ValidationRunnerOptions {
   store: CoreStore;
+  companyId: string;
   company: CompanyDefinition;
   actorId?: string;
 }
@@ -30,6 +31,46 @@ export interface ValidationRunnerOptions {
 interface ProcessExit {
   code: number | null;
   signal: NodeJS.Signals | null;
+}
+
+interface ProcessIdentity {
+  pid: number;
+  started: string;
+}
+
+interface ProcessTreeController {
+  snapshot(rootPid: number): Promise<ProcessIdentity[]>;
+  query(identity: ProcessIdentity): Promise<"same" | "absent" | "reused" | "query_error">;
+  terminate(
+    child: ChildProcess,
+    members: readonly ProcessIdentity[],
+    deadlineAt: number
+  ): Promise<void>;
+}
+
+interface ValidationRunnerDependencies {
+  beforeSpawn?: () => Promise<void>;
+  beforeEvidenceOpen?: () => Promise<void>;
+  beforeEvidenceRename?: () => Promise<void>;
+  processTree?: ProcessTreeController;
+}
+
+const injectedDependencies = new WeakMap<ValidationRunner, ValidationRunnerDependencies>();
+
+export function createInjectedValidationRunner(
+  options: ValidationRunnerOptions,
+  dependencies: ValidationRunnerDependencies
+): ValidationRunner {
+  const runner = new ValidationRunner(options);
+  injectedDependencies.set(runner, dependencies);
+  return runner;
+}
+
+interface DirectoryIdentity {
+  path: string;
+  realPath: string;
+  device: number;
+  inode: number;
 }
 
 function isWithin(parent: string, child: string): boolean {
@@ -97,10 +138,6 @@ function isLive(child: ChildProcess): boolean {
   return child.exitCode === null && child.signalCode === null;
 }
 
-function cleanupReserve(totalBudgetMs: number): number {
-  return Math.min(1_000, Math.max(25, Math.floor(totalBudgetMs * (2 / 3))), totalBudgetMs - 1);
-}
-
 function redact(value: string, secretValues: readonly string[]): string {
   let result = value;
   for (const secret of secretValues) {
@@ -109,6 +146,88 @@ function redact(value: string, secretValues: readonly string[]): string {
   return result
     .replace(/\b(Bearer\s+)[^\s"']+/giu, "$1[REDACTED]")
     .replace(/\b([A-Za-z_][A-Za-z0-9_]*(?:token|secret|password|api[_-]?key)[A-Za-z0-9_]*)\s*=\s*[^\s"']+/giu, "$1=[REDACTED]");
+}
+
+interface RedactionRange {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+function redactionRanges(value: string, secretValues: readonly string[]): RedactionRange[] {
+  const candidates: RedactionRange[] = [];
+  for (const secret of secretValues) {
+    if (secret.length === 0) continue;
+    let start = 0;
+    while ((start = value.indexOf(secret, start)) >= 0) {
+      candidates.push({ start, end: start + secret.length, replacement: "[REDACTED]" });
+      start += secret.length;
+    }
+  }
+  for (const match of value.matchAll(/\bBearer\s+[^\s"']+/giu)) {
+    const prefix = /^Bearer\s+/iu.exec(match[0])?.[0] ?? "Bearer ";
+    candidates.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      replacement: `${prefix}[REDACTED]`
+    });
+  }
+  for (const match of value.matchAll(
+    /\b[A-Za-z_][A-Za-z0-9_]*(?:token|secret|password|api[_-]?key)[A-Za-z0-9_]*\s*=\s*[^\s"']+/giu
+  )) {
+    const equals = match[0].indexOf("=");
+    candidates.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      replacement: `${match[0].slice(0, equals)}=[REDACTED]`
+    });
+  }
+  candidates.sort((left, right) => left.start - right.start || right.end - left.end);
+  const selected: RedactionRange[] = [];
+  for (const candidate of candidates) {
+    const previous = selected.at(-1);
+    if (previous !== undefined && candidate.start < previous.end) continue;
+    selected.push(candidate);
+  }
+  return selected;
+}
+
+function redactChunkSequence(
+  chunks: ReadonlyArray<{ sequence: number; stream: "stdout" | "stderr"; value: string }>,
+  secretValues: readonly string[]
+): Map<number, string> {
+  const result = new Map<number, string>();
+  for (const stream of ["stdout", "stderr"] as const) {
+    const streamChunks = chunks.filter((chunk) => chunk.stream === stream);
+    const combined = streamChunks.map(({ value }) => value).join("");
+    const ranges = redactionRanges(combined, secretValues);
+    let streamOffset = 0;
+    let coveredUntil = 0;
+    let rangeIndex = 0;
+    for (const chunk of streamChunks) {
+      const chunkStart = streamOffset;
+      const chunkEnd = chunkStart + chunk.value.length;
+      let cursor = Math.max(chunkStart, coveredUntil);
+      let output = "";
+      while (rangeIndex < ranges.length && ranges[rangeIndex]!.end <= chunkStart) {
+        rangeIndex += 1;
+      }
+      while (rangeIndex < ranges.length && ranges[rangeIndex]!.start < chunkEnd) {
+        const range = ranges[rangeIndex]!;
+        if (range.start >= cursor) {
+          output += combined.slice(cursor, range.start);
+          output += range.replacement;
+        }
+        coveredUntil = Math.max(coveredUntil, range.end);
+        cursor = Math.max(cursor, range.end);
+        rangeIndex += 1;
+      }
+      if (cursor < chunkEnd) output += combined.slice(cursor, chunkEnd);
+      result.set(chunk.sequence, output);
+      streamOffset = chunkEnd;
+    }
+  }
+  return result;
 }
 
 function redactedCommand(command: ValidationCommand, secretValues: readonly string[]): ValidationCommand {
@@ -162,6 +281,27 @@ async function assertSafeDirectory(root: string, target: string): Promise<string
   return resolvedTarget;
 }
 
+async function inspectSafeDirectory(root: string, target: string): Promise<DirectoryIdentity> {
+  const path = await assertSafeDirectory(root, target);
+  const metadata = await stat(path);
+  return {
+    path,
+    realPath: await realpath(path),
+    device: metadata.dev,
+    inode: metadata.ino
+  };
+}
+
+async function assertSameDirectory(
+  expected: DirectoryIdentity,
+  actual: DirectoryIdentity
+): Promise<void> {
+  if (pathKey(expected.realPath) !== pathKey(actual.realPath)
+    || expected.device !== actual.device || expected.inode !== actual.inode) {
+    throw new Error("directory identity changed during validation setup");
+  }
+}
+
 async function makeSafeDirectory(root: string, target: string): Promise<void> {
   const resolvedRoot = resolve(root);
   const resolvedTarget = resolve(target);
@@ -195,6 +335,179 @@ async function waitForCloseUntil(
   ]).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
   });
+}
+
+async function beforeDeadline<T>(
+  operation: Promise<T>,
+  label: string,
+  deadlineAt: number
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return await Promise.race([
+    operation,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${label} exceeded cleanup deadline`)),
+        Math.max(0, deadlineAt - Date.now())
+      );
+    })
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+async function captureCommand(
+  executable: string,
+  args: string[],
+  deadlineAt: number
+): Promise<string> {
+  const child = spawn(executable, args, {
+    shell: false,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (value: string) => { stdout += value; });
+  child.stderr.on("data", (value: string) => { stderr += value; });
+  let result: ProcessExit;
+  try {
+    result = await waitForCloseUntil(new Promise<ProcessExit>((resolvePromise, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolvePromise({ code, signal }));
+    }), "process identity query", deadlineAt);
+  } finally {
+    if (isLive(child)) child.kill("SIGKILL");
+  }
+  if (result.code !== 0) throw new Error(`process identity query failed: ${stderr}`);
+  return stdout;
+}
+
+async function snapshotWindows(deadlineAt: number): Promise<Array<ProcessIdentity & { parentPid: number }>> {
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$rows=Get-CimInstance Win32_Process | ForEach-Object {",
+    "  [pscustomobject]@{pid=[int]$_.ProcessId;parentPid=[int]$_.ParentProcessId;started=$_.CreationDate.ToUniversalTime().Ticks.ToString()}",
+    "}",
+    "ConvertTo-Json -Compress -InputObject @($rows)"
+  ].join(";");
+  const output = await captureCommand(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", script],
+    deadlineAt
+  );
+  return JSON.parse(output) as Array<ProcessIdentity & { parentPid: number }>;
+}
+
+async function snapshotPosix(deadlineAt: number): Promise<Array<ProcessIdentity & { parentPid: number }>> {
+  const output = await captureCommand("ps", ["-eo", "pid=,ppid=,lstart="], deadlineAt);
+  return output.split(/\r?\n/u).flatMap((line) => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
+    return match === null ? [] : [{
+      pid: Number(match[1]),
+      parentPid: Number(match[2]),
+      started: match[3]!
+    }];
+  });
+}
+
+async function snapshotAll(deadlineAt: number): Promise<Array<ProcessIdentity & { parentPid: number }>> {
+  return process.platform === "win32"
+    ? await snapshotWindows(deadlineAt)
+    : await snapshotPosix(deadlineAt);
+}
+
+function treeMembers(
+  rows: ReadonlyArray<ProcessIdentity & { parentPid: number }>,
+  rootPid: number
+): ProcessIdentity[] {
+  const selected = new Set<number>([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (selected.has(row.parentPid) && !selected.has(row.pid)) {
+        selected.add(row.pid);
+        changed = true;
+      }
+    }
+  }
+  return rows.filter(({ pid }) => selected.has(pid)).map(({ pid, started }) => ({ pid, started }));
+}
+
+const defaultProcessTree: ProcessTreeController = {
+  async snapshot(rootPid) {
+    return treeMembers(await snapshotAll(Date.now() + 5_000), rootPid);
+  },
+  async query(identity) {
+    try {
+      const current = (await snapshotAll(Date.now() + 5_000))
+        .find(({ pid }) => pid === identity.pid);
+      if (current === undefined) return "absent";
+      return current.started === identity.started ? "same" : "reused";
+    } catch {
+      return "query_error";
+    }
+  },
+  async terminate(child, _members, deadlineAt) {
+    const closed = new Promise<ProcessExit>((resolvePromise) => {
+      if (!isLive(child)) {
+        resolvePromise({ code: child.exitCode, signal: child.signalCode });
+      } else {
+        child.once("close", (code, signal) => resolvePromise({ code, signal }));
+      }
+    });
+    await terminateProcessTree(child, closed, deadlineAt);
+  }
+};
+
+async function terminateVerifiedProcessTree(
+  controller: ProcessTreeController,
+  child: ChildProcess,
+  closed: Promise<ProcessExit>,
+  deadlineAt: number
+): Promise<void> {
+  const pid = child.pid;
+  if (!Number.isSafeInteger(pid) || (pid ?? 0) <= 0) {
+    throw new Error("live validation process has no valid PID");
+  }
+  const members = await beforeDeadline(
+    controller.snapshot(pid as number),
+    "process tree snapshot",
+    deadlineAt
+  );
+  const root = members.find((member) => member.pid === pid);
+  if (root === undefined) {
+    await waitForCloseUntil(closed, "validation process identity", deadlineAt);
+    if (!isLive(child)) return;
+    throw new Error("validation process identity could not be verified before cleanup: missing");
+  }
+  const rootStatus = await beforeDeadline(
+    controller.query(root),
+    "process identity query",
+    deadlineAt
+  );
+  if (rootStatus !== "same") {
+    throw new Error(`validation process identity could not be verified before cleanup: ${rootStatus}`);
+  }
+  await beforeDeadline(
+    controller.terminate(child, members, deadlineAt),
+    "process tree termination",
+    deadlineAt
+  );
+  await waitForCloseUntil(closed, "validation process tree", deadlineAt);
+  const finalStatuses = await beforeDeadline(
+    Promise.all(members.map(async (member) => await controller.query(member))),
+    "process identity verification",
+    deadlineAt
+  );
+  for (const status of finalStatuses) {
+    if (status !== "absent") {
+      throw new Error("validation process tree cleanup could not be verified");
+    }
+  }
 }
 
 async function terminateProcessTree(
@@ -237,11 +550,13 @@ async function terminateProcessTree(
 
 export class ValidationRunner {
   readonly #store: CoreStore;
+  readonly #companyId: string;
   readonly #company: CompanyDefinition;
   readonly #actorId: string;
 
   constructor(options: ValidationRunnerOptions) {
     this.#store = options.store;
+    this.#companyId = options.companyId;
     this.#company = options.company;
     this.#actorId = options.actorId ?? "core";
   }
@@ -273,6 +588,7 @@ export class ValidationRunner {
   ): Promise<ValidationCommandGrant> {
     const current = this.#store.getValidationCommandGrant(grantId);
     if (current === null) throw new Error(`validation command grant not found: ${grantId}`);
+    this.#assertCompanyBinding(current.runId);
     const event = this.#event("user.approval.decided", current.taskId, {
       grantId, decision, reason
     });
@@ -301,32 +617,28 @@ export class ValidationRunner {
     const logPath = resolve(logDirectory, `${validationId}.log`);
     const temporaryPath = resolve(logDirectory, `.${validationId}.tmp`);
     const startedAt = new Date().toISOString();
-    const handle = await open(temporaryPath, "wx");
     let sequence = 0;
     let bytesWritten = 0;
-    let writeChain: Promise<void> = Promise.resolve();
-    let writeError: unknown;
     let overflow = false;
     let resolveStop: (reason: "overflow") => void = () => undefined;
     const stopRequested = new Promise<"overflow">((resolvePromise) => { resolveStop = resolvePromise; });
+    const chunks: Array<{ sequence: number; stream: "stdout" | "stderr"; value: string }> = [];
     const writeChunk = (stream: "stdout" | "stderr", value: Buffer | string): void => {
       if (overflow) return;
       const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      const label = `[${String(++sequence).padStart(6, "0")}] ${stream}: `;
-      const available = MAX_LOG_BYTES - bytesWritten - Buffer.byteLength(label) - 1;
+      const available = MAX_LOG_BYTES - bytesWritten;
       const body = available > 0 ? truncateUtf8(chunk, available) : Buffer.alloc(0);
-      bytesWritten += Buffer.byteLength(label) + body.length + 1;
-      writeChain = writeChain.then(async () => {
-        await handle.write(label);
-        await handle.write(body);
-        await handle.write("\n");
-      }).catch((error: unknown) => { writeError ??= error; });
+      bytesWritten += body.length;
+      chunks.push({ sequence: ++sequence, stream, value: body.toString("utf8") });
       if (body.length !== chunk.length || bytesWritten >= MAX_LOG_BYTES) {
         overflow = true;
         resolveStop("overflow");
       }
     };
 
+    const dependencies = injectedDependencies.get(this) ?? {};
+    await dependencies.beforeSpawn?.();
+    await assertSameDirectory(context.cwdIdentity, await inspectSafeDirectory(scope.workspaceRoot, context.cwd));
     const ownsProcessGroup = process.platform !== "win32";
     const child = spawn(command.executable, [...command.args], {
       cwd: context.cwd, env: minimalEnvironment(), shell: false, detached: ownsProcessGroup,
@@ -342,10 +654,10 @@ export class ValidationRunner {
     child.stderr.on("data", (chunk: Buffer | string) => writeChunk("stderr", chunk));
 
     const timeoutMs = command.timeoutSeconds * 1_000;
-    const deadlineAt = Date.now() + timeoutMs;
+    const commandDeadlineAt = Date.now() + timeoutMs;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<"timed_out">((resolvePromise) => {
-      timer = setTimeout(() => resolvePromise("timed_out"), Math.max(0, deadlineAt - cleanupReserve(timeoutMs) - Date.now()));
+      timer = setTimeout(() => resolvePromise("timed_out"), Math.max(0, commandDeadlineAt - Date.now()));
     });
     let outcome: ProcessExit | "timed_out" | "overflow" | "start_failed";
     try {
@@ -357,9 +669,15 @@ export class ValidationRunner {
     }
 
     let cleanupFailed = false;
+    const cleanupDeadlineAt = Date.now() + 5_000;
     if (typeof outcome === "string" && outcome !== "start_failed") {
       try {
-        await terminateProcessTree(child, closed, deadlineAt);
+        await terminateVerifiedProcessTree(
+          dependencies.processTree ?? defaultProcessTree,
+          child,
+          closed,
+          cleanupDeadlineAt
+        );
       } catch {
         cleanupFailed = true;
       }
@@ -369,25 +687,32 @@ export class ValidationRunner {
       child.stderr?.removeAllListeners("data");
     } else {
       try {
-        await waitForCloseUntil(closed, "validation process", deadlineAt);
+        await waitForCloseUntil(closed, "validation process", cleanupDeadlineAt);
       } catch {
         cleanupFailed = true;
         child.stdout?.removeAllListeners("data");
         child.stderr?.removeAllListeners("data");
       }
     }
-    await writeChain;
-    if (writeError !== undefined) cleanupFailed = true;
-    await handle.close();
-    const redactedLog = redact(await readFile(temporaryPath, "utf8"), secretValues);
+    const redactedChunks = redactChunkSequence(chunks, secretValues);
+    const redactedLog = chunks.map((chunk) => {
+      const label = `[${String(chunk.sequence).padStart(6, "0")}] ${chunk.stream}: `;
+      return `${label}${redactedChunks.get(chunk.sequence) ?? ""}\n`;
+    }).join("");
     const finalLog = truncateUtf8(Buffer.from(redactedLog), MAX_LOG_BYTES);
-    const finalHandle = await open(temporaryPath, "w");
+    await dependencies.beforeEvidenceOpen?.();
+    await inspectSafeDirectory(context.projectRoot, logDirectory);
+    const finalHandle = await open(temporaryPath, "wx", 0o600);
     try {
       await finalHandle.writeFile(finalLog);
     } finally {
       await finalHandle.close();
     }
+    await inspectSafeDirectory(context.projectRoot, logDirectory);
+    await dependencies.beforeEvidenceRename?.();
+    await inspectSafeDirectory(context.projectRoot, logDirectory);
     await rename(temporaryPath, logPath);
+    await inspectSafeDirectory(context.projectRoot, logDirectory);
     const completedAt = new Date().toISOString();
     const record: ValidationRunRecord = {
       validationId, runId: scope.runId, taskId: scope.taskId,
@@ -406,18 +731,42 @@ export class ValidationRunner {
       validationId, runId: scope.runId, workspaceId: scope.workspaceId,
       outcome: record.outcome, exitCode: record.exitCode, logPath, logHash: record.logHash
     });
-    this.#commitRunDurably(record, event);
-    if (record.outcome === "cleanup_failed") this.#pauseRun(scope.runId);
+    const run = this.#store.getGitRun(scope.runId);
+    const pause = record.outcome === "cleanup_failed" && run?.status === "active"
+      ? {
+          run: { ...run, status: "paused" as const, updatedAt: new Date().toISOString() },
+          workspaces: this.#store.listGitWorkspaces(scope.runId).map((workspace) =>
+            workspace.status === "active" ? { ...workspace, status: "paused" as const } : workspace
+          ),
+          event: this.#event("git.run.paused", null, {
+            runId: scope.runId,
+            reason: "validation_cleanup_failed"
+          })
+        }
+      : undefined;
+    this.#store.commitValidationRunCompletion({
+      validation: record,
+      completedEvent: event,
+      ...(pause === undefined ? {} : { pause })
+    });
     return record;
   }
 
-  async #resolveScope(command: ValidationCommand, scope: ValidationScope): Promise<{ projectRoot: string; cwd: string }> {
+  async #resolveScope(command: ValidationCommand, scope: ValidationScope): Promise<{
+    projectRoot: string;
+    cwd: string;
+    cwdIdentity: DirectoryIdentity;
+  }> {
     assertIdentifier(scope.runId, "run id");
     const run = this.#store.getGitRun(scope.runId);
     const workspace = this.#store.getGitWorkspace(scope.workspaceId);
     if (run === null || workspace === null || workspace.runId !== scope.runId
       || workspace.taskId !== scope.taskId || pathKey(workspace.path) !== pathKey(scope.workspaceRoot)) {
       throw new Error("validation scope workspace is not registered");
+    }
+    this.#assertCompanyBinding(scope.runId);
+    if (run.status !== "active" || workspace.status !== "active") {
+      throw new Error("validation run or workspace is not active");
     }
     if (scope.integrationAttemptId !== null) {
       const attempt = this.#store.getIntegrationAttempt(scope.integrationAttemptId);
@@ -428,7 +777,11 @@ export class ValidationRunner {
     const relativeCwd = command.cwd;
     if (isAbsolute(relativeCwd)) throw new Error("cwd outside workspace");
     const cwd = resolve(scope.workspaceRoot, relativeCwd);
-    return { projectRoot: resolve(run.projectRoot), cwd: await assertSafeDirectory(scope.workspaceRoot, cwd) };
+    return {
+      projectRoot: resolve(run.projectRoot),
+      cwd,
+      cwdIdentity: await inspectSafeDirectory(scope.workspaceRoot, cwd)
+    };
   }
 
   #authorize(command: ValidationCommand, scope: ValidationScope): void {
@@ -444,6 +797,18 @@ export class ValidationRunner {
     throw new Error("approval required");
   }
 
+  #assertCompanyBinding(runId: string): void {
+    const run = this.#store.getGitRun(runId);
+    if (run === null || run.companyId !== this.#companyId) {
+      throw new Error("validation company ownership does not match run");
+    }
+    const persistedCompany = this.#store.getCompany(this.#companyId);
+    if (persistedCompany === null
+      || persistedCompany.definitionJson !== JSON.stringify(this.#company)) {
+      throw new Error("validation company definition is not bound to company");
+    }
+  }
+
   #event(type: string, taskId: string | null, payload: Record<string, unknown>): NewEvent {
     return { id: randomUUID(), type, actorId: this.#actorId, taskId, causationEventId: null, payload };
   }
@@ -456,27 +821,4 @@ export class ValidationRunner {
     }
   }
 
-  #commitRunDurably(validation: ValidationRunRecord, event: NewEvent): void {
-    try { this.#store.commitValidationRun({ validation, event }); } catch (error) {
-      const durable = this.#store.getValidationRun(validation.validationId);
-      if (durable?.validationId === validation.validationId && this.#store.listEvents(0).some(({ id }) => id === event.id)) return;
-      throw error;
-    }
-  }
-
-  #pauseRun(runId: string): void {
-    const run = this.#store.getGitRun(runId);
-    if (run === null || run.status !== "active") return;
-    const workspaces = this.#store.listGitWorkspaces(runId).map((workspace) =>
-      workspace.status === "active" ? { ...workspace, status: "paused" as const } : workspace
-    );
-    const event = this.#event("git.run.paused", null, { runId, reason: "validation_cleanup_failed" });
-    try {
-      this.#store.commitGitRunPause({ run: { ...run, status: "paused", updatedAt: new Date().toISOString() }, workspaces, event });
-    } catch (error) {
-      if (this.#store.getGitRun(runId)?.status === "paused"
-        && this.#store.listEvents(0).some(({ id }) => id === event.id)) return;
-      throw error;
-    }
-  }
 }
