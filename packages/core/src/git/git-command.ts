@@ -12,6 +12,7 @@ export interface GitCommandOptions {
   timeoutMs?: number;
   stdin?: string;
   allowedExitCodes?: readonly number[];
+  gitEditor?: true;
 }
 
 export interface GitCommandResult {
@@ -284,6 +285,7 @@ export class GitCommandRunner {
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: "0",
+        ...(options.gitEditor === true ? { GIT_EDITOR: "true" } : {}),
         LANG: "C",
         LC_ALL: "C"
       },

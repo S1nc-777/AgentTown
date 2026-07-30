@@ -1,0 +1,190 @@
+# Task 8 Report: Deterministic Candidate Integration
+
+## Status
+
+Implemented Task 8 on `codex/p1b-git-collaboration` from required base
+`c2a484815e8a507c5514198d8a49ac21af346b2f`.
+
+Task 9 conflict-task creation, Task 10 reconciliation, real Agents, pushes,
+runtime dependencies, global timeouts/retries/sleeps, and historical fixtures
+were not implemented or changed.
+
+## Delivered
+
+- Added `IntegrationService.enqueue`, `drain`, `integrate`, and
+  `recoverPrepared`, plus the public deterministic ordering helper and result,
+  options, and fault-hook types.
+- Rebuilds task DAG layers from persisted tasks, rejects dangling dependencies
+  and cycles, derives immutable creation sequence through each exact
+  `createdEventId`, and orders by zero-padded layer, sequence, then task ID.
+- Keeps later same-layer work behind earlier nonintegrated tasks, requires
+  completed dependencies and the exact latest approved revision, and persists
+  the chosen `orderKey` in the prepared attempt.
+- Rebinds the persisted company definition, active company-owned run, review
+  task, exact latest submission, approval decision/package hash, formal ref,
+  and unique registered integration workspace before Git mutation.
+- Persists `prepared` attempt + queued submission + event in one transaction
+  before candidate creation. Candidate workspaces are exact attempt-owned
+  WorkspaceManager assets at the expected old integration SHA.
+- Cherry-picks the reviewed commit list in declared order with an actual
+  `GIT_EDITOR=true` process environment and never mutates the formal
+  integration worktree for candidate application.
+- On conflict, collects Git porcelain-v2 unmerged paths, aborts and verifies
+  the exact clean candidate, persists conflict evidence, leaves the formal ref
+  and worktree unchanged, and cleans only exactly verified candidate assets.
+- Runs every configured integration command, including commands after an
+  earlier non-passed result, only in the exact registered candidate workspace
+  and with exact run/task/workspace/attempt bindings. Returned records must
+  match their durable CoreStore facts.
+- Stores the candidate SHA and ordered validation IDs while the attempt remains
+  prepared, then performs one exact `git update-ref <ref> <new> <old>` CAS.
+  Mismatch is not retried and returns `reconciliation_required`.
+- Updates the formal worktree through a clean detached checkout of the exact
+  old/new commits followed by exact ref reattachment; no reset, force checkout,
+  stash, clean, or original-worktree mutation is used.
+- Atomically commits the committed attempt, integrated submission, completed
+  task, run integration SHA, registered integration workspace head, and both
+  events. Listener exceptions remain isolated after the durable commit.
+- Added exact-CAS candidate ref removal after WorkspaceManager's verified
+  worktree removal. Cleanup ambiguity is preserved for reconciliation rather
+  than force-deleted.
+- Added `afterPrepared`, `afterRefUpdated`, and `beforeFactsCommitted` crash
+  hooks. Prepared facts retain enough old/new SHA evidence for Task 10.
+- Wired approved Git reviews through coordinator `enqueue` then `drain`, while
+  leaving the optional boundary absent for existing P1A/Fake workflow callers.
+- Extended ValidationRunner's existing exact scope rules so an attempt-bound
+  integration validation can use a registered task-null candidate workspace
+  while still binding the validation record to the exact task and attempt.
+
+## TDD Evidence
+
+### Initial missing-service RED
+
+Command:
+
+```powershell
+pnpm exec vitest run test/integration-service.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1
+```
+
+Observed:
+
+- 1 suite failed;
+- no tests were collected;
+- the failure was exactly missing
+  `../src/git/integration-service.js`.
+
+The pure stable-order test then passed 1/1 after the minimal helper was added.
+
+### Queue RED/GREEN
+
+Two new tests failed because `IntegrationService` did not exist:
+
+- earlier same-layer non-approved task blocks a later approved task;
+- persisted dependency cycles are rejected before selection.
+
+They passed 3/3 with the ordering test after the minimal queue implementation.
+
+### Real-Git main-chain RED/GREEN
+
+Success, validation-failure, and conflict tests failed 3/3 with
+`candidate integration is not implemented`. After the prepared/candidate/CAS
+implementation, all functional assertions passed; the sole first-run mismatch
+was a corrected test assumption that a cherry-picked candidate SHA must equal
+the source commit SHA.
+
+Additional focused RED/GREEN covered coordinator approval wiring: 12/13 tests
+passed and the new coordinator test failed because `enqueue` had zero calls.
+Adding the explicit approval-to-integration boundary made the suite 13/13.
+
+Focused coverage was extended to 15 tests for:
+
+- stable order and same-layer blocking;
+- cycle, stale, and foreign fact rejection before candidate mutation;
+- successful candidate validation and exact ref/worktree advancement;
+- conflict capture and abort;
+- validation failure with formal state unchanged;
+- execution of every configured integration command;
+- one-shot CAS mismatch;
+- final SQLite transaction rollback;
+- listener isolation;
+- all three crash hooks and prepared recovery discovery;
+- actual `GIT_EDITOR=true`;
+- coordinator enqueue/drain wiring.
+
+Final focused behavior is included in the 165-test relevant-suite run below.
+
+## Verification
+
+### Relevant Core, storage, Task 7, and workflow suites
+
+```powershell
+pnpm exec vitest run test/integration-service.test.ts test/storage-migrations.test.ts test/core-store.test.ts test/git-workflow-coordinator.test.ts test/review-service.test.ts test/validation-runner.test.ts test/workspace-manager.test.ts test/task-service.test.ts test/orchestrator.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1
+```
+
+- 9 files passed;
+- 165 tests passed;
+- 0 failed;
+- all real-Git suites ran serially with one worker.
+
+An earlier wider run exposed four legacy CoreStore error-order regressions and
+one ValidationRunner error-order regression. Strict Task 8 status validation
+was scoped to the new strict bundle, and missing-attempt ownership was restored
+ahead of candidate-kind validation. The two directly affected suites then
+passed 52/52 before the final 165/165 run.
+
+### P1A gate
+
+```powershell
+pnpm test:p1a
+```
+
+- 2 files passed;
+- 9 tests passed;
+- 0 failed.
+
+### Types and source checks
+
+```powershell
+pnpm typecheck
+git diff --check
+```
+
+- root typecheck passed for all eight participating workspace projects;
+- `git diff --check` passed;
+- only expected Git line-ending notices were printed.
+
+Node's experimental SQLite warning is expected and pre-existing.
+
+## Self-review
+
+- Confirmed prepared intent is durable before candidate ref/worktree creation
+  and no candidate command can run before exact company/run/task/revision/
+  decision/formal-workspace binding.
+- Confirmed task order never trusts mutable timestamps or Agent text; only the
+  immutable task-created event sequence is used.
+- Confirmed candidate commands use only the verified candidate path and
+  authoritative Git/validation facts; reported submission results are ignored.
+- Confirmed conflict and non-passed validation leave formal ref/worktree facts
+  unchanged and all configured integration commands are attempted.
+- Confirmed CAS has exact old/new operands, no force update, no retry, and no
+  guessed continuation.
+- Confirmed the formal integration worktree changes only after candidate
+  validation passes and is updated to the exact new SHA through a detached,
+  clean transition.
+- Confirmed the successful fact bundle includes attempt, submission, task, run,
+  integration workspace, and events in one SQLite transaction; the duplicate
+  event injection proves complete rollback.
+- Confirmed `afterPrepared` leaves old ref + null candidate SHA,
+  `afterRefUpdated` leaves new ref + old durable facts, and
+  `beforeFactsCommitted` leaves exact new ref/worktree + old durable facts.
+- Confirmed candidate cleanup uses Task 4 verified removal plus exact old-value
+  ref deletion and never recursively removes an unproven path.
+- Confirmed no conflict task, reconciliation implementation, real Agent,
+  project-ref push, runtime dependency, production sleep/retry, timeout
+  weakening, or historical fixture deletion entered the diff.
+
+## Concerns
+
+No blocking concern remains. Task 10 must consume the durable prepared intents
+left by the demonstrated crash/CAS/transaction windows; Task 8 intentionally
+classifies them as reconciliation-required without implementing recovery.

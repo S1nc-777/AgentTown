@@ -18,6 +18,7 @@ import {
 import { CoreStore, type NewEvent } from "../storage/core-store.js";
 import { TaskService } from "../tasks/task-service.js";
 import type { EvidencePackageInput } from "./evidence-package.js";
+import type { IntegrationResult } from "./integration-service.js";
 import type {
   RecordReviewDecisionInput,
   ReviewOutcome
@@ -57,6 +58,11 @@ interface TaskReviewService {
   recordDecision(input: RecordReviewDecisionInput): Promise<ReviewOutcome>;
 }
 
+interface ApprovedIntegrationService {
+  enqueue(submission: GitSubmissionRecord): Promise<void>;
+  drain(): Promise<IntegrationResult | null>;
+}
+
 export interface GitWorkflowCoordinatorOptions {
   store: CoreStore;
   companyId: string;
@@ -68,6 +74,7 @@ export interface GitWorkflowCoordinatorOptions {
   validationRunner: TaskValidationRunner;
   evidenceBuilder: TaskEvidenceBuilder;
   reviewService: TaskReviewService;
+  integrationService?: ApprovedIntegrationService;
   reviewerIds: ReadonlySet<string>;
   sendMessage(employeeId: string, message: AgentMessage): Promise<void>;
   leaderId?: string;
@@ -137,6 +144,7 @@ export class GitWorkflowCoordinator {
   readonly #validationRunner: TaskValidationRunner;
   readonly #evidenceBuilder: TaskEvidenceBuilder;
   readonly #reviewService: TaskReviewService;
+  readonly #integrationService: ApprovedIntegrationService | undefined;
   readonly #reviewerIds: ReadonlySet<string>;
   readonly #sendMessage: GitWorkflowCoordinatorOptions["sendMessage"];
   readonly #leaderId: string;
@@ -152,6 +160,7 @@ export class GitWorkflowCoordinator {
     this.#validationRunner = options.validationRunner;
     this.#evidenceBuilder = options.evidenceBuilder;
     this.#reviewService = options.reviewService;
+    this.#integrationService = options.integrationService;
     this.#reviewerIds = options.reviewerIds;
     this.#sendMessage = options.sendMessage;
     this.#leaderId = options.leaderId ?? this.#deriveLeaderId();
@@ -467,13 +476,18 @@ export class GitWorkflowCoordinator {
     if ((action.type === "task.approve") !== (parsedDecision.decision === "approve")) {
       throw new Error("review action type and structured decision disagree");
     }
-    return await this.#reviewService.recordDecision({
+    const outcome = await this.#reviewService.recordDecision({
       runId: this.#runId,
       task: this.#tasks.get(taskId),
       reviewerId: reviewer.id,
       revision: requiredRevision(action.payload.revision),
       decision: parsedDecision
     });
+    if (outcome.kind === "approved" && this.#integrationService !== undefined) {
+      await this.#integrationService.enqueue(outcome.submission);
+      await this.#integrationService.drain();
+    }
+    return outcome;
   }
 
   #bindCompanyAndRun(): void {

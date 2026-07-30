@@ -1321,13 +1321,53 @@ export class CoreStore {
   }
 
   commitPreparedIntegration(input: {
+    companyId?: string;
     attempt: IntegrationAttemptRecord;
     submission: GitSubmissionRecord;
     event: NewEvent;
   }): void {
     assertIntegrationFactsMatch(input.attempt, input.submission);
     assertTaskScopedEvents(input.attempt.taskId, [input.event]);
+    if (input.companyId !== undefined
+      && (input.attempt.status !== "prepared"
+        || input.attempt.candidateCommit !== null
+        || input.submission.status !== "queued")) {
+      throw new Error("prepared integration facts have invalid statuses");
+    }
     const insertedEvent = this.inTransaction(() => {
+      if (input.companyId !== undefined) {
+        const run = this.getGitRun(input.attempt.runId);
+        const task = this.getTask(input.companyId, input.attempt.taskId);
+        const currentSubmission = this.getGitSubmission(
+          input.attempt.runId,
+          input.attempt.taskId,
+          input.attempt.submissionRevision
+        );
+        const latest = this.listGitSubmissions(
+          input.attempt.runId,
+          input.attempt.taskId
+        ).at(-1);
+        const decision = this.getReviewDecision(
+          input.attempt.runId,
+          input.attempt.taskId,
+          input.attempt.submissionRevision
+        );
+        if (run === null
+          || run.companyId !== input.companyId
+          || run.status !== "active"
+          || run.integrationCommit !== input.attempt.expectedOldCommit
+          || task === null
+          || task.status !== "review"
+          || currentSubmission === null
+          || currentSubmission.status !== "approved"
+          || latest?.revision !== input.attempt.submissionRevision
+          || JSON.stringify(currentSubmission.submission)
+            !== JSON.stringify(input.submission.submission)
+          || decision?.decision !== "approve"
+          || this.getIntegrationAttempt(input.attempt.attemptId) !== null) {
+          throw new Error("prepared integration facts are stale or mismatched");
+        }
+      }
       this.#putIntegrationAttemptRow(input.attempt);
       this.#putGitSubmissionRow(input.submission);
       return this.#insertEventRow(input.event);
@@ -1335,10 +1375,44 @@ export class CoreStore {
     this.#publishEvents([insertedEvent]);
   }
 
+  commitIntegrationAttemptOutcome(input: {
+    attempt: IntegrationAttemptRecord;
+    event: NewEvent;
+  }): void {
+    if (input.attempt.status !== "conflicted"
+      && input.attempt.status !== "validation_failed"
+      && input.attempt.status !== "aborted") {
+      throw new Error("integration attempt outcome status is invalid");
+    }
+    assertTaskScopedEvents(input.attempt.taskId, [input.event]);
+    const insertedEvent = this.inTransaction(() => {
+      const current = this.getIntegrationAttempt(input.attempt.attemptId);
+      if (current === null
+        || current.status !== "prepared"
+        || current.runId !== input.attempt.runId
+        || current.taskId !== input.attempt.taskId
+        || current.submissionRevision !== input.attempt.submissionRevision
+        || current.orderKey !== input.attempt.orderKey
+        || current.expectedOldCommit !== input.attempt.expectedOldCommit
+        || current.candidateRef !== input.attempt.candidateRef
+        || current.candidateCommit !== input.attempt.candidateCommit
+        || JSON.stringify(current.validationRunIds)
+          !== JSON.stringify(input.attempt.validationRunIds)) {
+        throw new Error("integration attempt outcome is stale or mismatched");
+      }
+      this.#putIntegrationAttemptRow(input.attempt);
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([insertedEvent]);
+  }
+
   commitIntegratedTask(input: {
+    companyId?: string;
     attempt: IntegrationAttemptRecord;
     submission: GitSubmissionRecord;
     task: TaskRecord;
+    run?: GitRunRecord;
+    integrationWorkspace?: GitWorkspaceRecord;
     events: readonly NewEvent[];
   }): void {
     if (input.events.length === 0) {
@@ -1346,14 +1420,111 @@ export class CoreStore {
     }
     assertIntegrationFactsMatch(input.attempt, input.submission, input.task);
     assertTaskScopedEvents(input.attempt.taskId, input.events);
+    if (input.run !== undefined
+      && (input.attempt.status !== "committed"
+        || input.attempt.candidateCommit === null
+        || input.submission.status !== "integrated"
+        || input.task.status !== "completed")) {
+      throw new Error("integrated facts have invalid statuses");
+    }
+    if ((input.run === undefined) !== (input.integrationWorkspace === undefined)
+      || (input.run !== undefined && input.companyId === undefined)) {
+      throw new Error("strict integrated facts require company, run and workspace");
+    }
     const insertedEvents = this.inTransaction(() => {
-      const run = this.getGitRun(input.attempt.runId);
-      if (run === null) {
+      const currentRun = this.getGitRun(input.attempt.runId);
+      if (currentRun === null) {
         throw new Error(`Git run not found: ${input.attempt.runId}`);
+      }
+      if (input.run !== undefined && input.integrationWorkspace !== undefined) {
+        const currentAttempt = this.getIntegrationAttempt(input.attempt.attemptId);
+        const currentSubmission = this.getGitSubmission(
+          input.attempt.runId,
+          input.attempt.taskId,
+          input.attempt.submissionRevision
+        );
+        const latest = this.listGitSubmissions(
+          input.attempt.runId,
+          input.attempt.taskId
+        ).at(-1);
+        const currentTask = this.getTask(input.companyId!, input.attempt.taskId);
+        const currentWorkspace = this.getGitWorkspace(
+          input.integrationWorkspace.workspaceId
+        );
+        const decision = this.getReviewDecision(
+          input.attempt.runId,
+          input.attempt.taskId,
+          input.attempt.submissionRevision
+        );
+        const validations = input.attempt.validationRunIds.map(
+          (validationId) => this.getValidationRun(validationId)
+        );
+        if (currentRun.companyId !== input.companyId
+          || currentRun.status !== "active"
+          || currentRun.integrationCommit !== input.attempt.expectedOldCommit
+          || input.run.runId !== currentRun.runId
+          || input.run.companyId !== currentRun.companyId
+          || input.run.projectRoot !== currentRun.projectRoot
+          || input.run.originalBranch !== currentRun.originalBranch
+          || input.run.baseCommit !== currentRun.baseCommit
+          || input.run.integrationRef !== currentRun.integrationRef
+          || input.run.integrationCommit !== input.attempt.candidateCommit
+          || input.run.status !== currentRun.status
+          || input.run.createdAt !== currentRun.createdAt
+          || currentAttempt === null
+          || currentAttempt.status !== "prepared"
+          || currentAttempt.candidateCommit !== input.attempt.candidateCommit
+          || JSON.stringify({
+            ...input.attempt,
+            status: currentAttempt.status
+          }) !== JSON.stringify(currentAttempt)
+          || currentSubmission === null
+          || currentSubmission.status !== "queued"
+          || latest?.revision !== input.attempt.submissionRevision
+          || JSON.stringify(currentSubmission.submission)
+            !== JSON.stringify(input.submission.submission)
+          || currentTask === null
+          || currentTask.status !== "review"
+          || currentTask.updatedEventId === input.task.updatedEventId
+          || JSON.stringify({
+            ...input.task,
+            status: currentTask.status,
+            updatedEventId: currentTask.updatedEventId
+          }) !== JSON.stringify(currentTask)
+          || decision?.decision !== "approve"
+          || currentWorkspace === null
+          || currentWorkspace.runId !== currentRun.runId
+          || currentWorkspace.kind !== "integration"
+          || currentWorkspace.status !== "active"
+          || currentWorkspace.branchRef !== currentRun.integrationRef
+          || currentWorkspace.headCommit !== input.attempt.expectedOldCommit
+          || input.integrationWorkspace.workspaceId !== currentWorkspace.workspaceId
+          || input.integrationWorkspace.runId !== currentWorkspace.runId
+          || input.integrationWorkspace.taskId !== currentWorkspace.taskId
+          || input.integrationWorkspace.employeeId !== currentWorkspace.employeeId
+          || input.integrationWorkspace.path !== currentWorkspace.path
+          || input.integrationWorkspace.branchRef !== currentWorkspace.branchRef
+          || input.integrationWorkspace.baseCommit !== currentWorkspace.baseCommit
+          || input.integrationWorkspace.kind !== "integration"
+          || input.integrationWorkspace.status !== "active"
+          || input.integrationWorkspace.headCommit !== input.attempt.candidateCommit
+          || new Set(input.attempt.validationRunIds).size
+            !== input.attempt.validationRunIds.length
+          || validations.some((validation) =>
+            validation === null
+            || validation.runId !== input.attempt.runId
+            || validation.taskId !== input.attempt.taskId
+            || validation.integrationAttemptId !== input.attempt.attemptId
+            || validation.outcome !== "passed"
+          )) {
+          throw new Error("integrated facts are stale or mismatched");
+        }
+        this.#putGitRunRow(input.run);
+        this.#putGitWorkspaceRow(input.integrationWorkspace);
       }
       this.#putIntegrationAttemptRow(input.attempt);
       this.#putGitSubmissionRow(input.submission);
-      this.#putTaskRow(run.companyId, input.task);
+      this.#putTaskRow(input.companyId ?? currentRun.companyId, input.task);
       return input.events.map((event) => this.#insertEventRow(event));
     });
     this.#publishEvents(insertedEvents);

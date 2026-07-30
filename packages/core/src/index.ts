@@ -95,3 +95,11 @@ export {
   type GitWorkflowCoordinatorOptions,
   type SubmitTaskOutcome
 } from "./git/git-workflow-coordinator.js";
+export {
+  IntegrationService,
+  orderIntegrations,
+  type IntegrationFaultHooks,
+  type IntegrationResult,
+  type IntegrationServiceOptions,
+  type OrderedIntegration
+} from "./git/integration-service.js";

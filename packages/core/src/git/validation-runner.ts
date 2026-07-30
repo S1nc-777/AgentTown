@@ -917,8 +917,23 @@ export class ValidationRunner {
     const run = this.#store.getGitRun(scope.runId);
     const workspace = this.#store.getGitWorkspace(scope.workspaceId);
     if (run === null || workspace === null || workspace.runId !== scope.runId
-      || workspace.taskId !== scope.taskId || pathKey(workspace.path) !== pathKey(scope.workspaceRoot)) {
+      || pathKey(workspace.path) !== pathKey(scope.workspaceRoot)) {
       throw new Error("validation scope workspace is not registered");
+    }
+    if (scope.integrationAttemptId === null) {
+      if (workspace.taskId !== scope.taskId) {
+        throw new Error("validation scope workspace is not registered");
+      }
+    } else {
+      const attempt = this.#store.getIntegrationAttempt(scope.integrationAttemptId);
+      if (attempt === null
+        || attempt.runId !== scope.runId
+        || attempt.taskId !== scope.taskId) {
+        throw new Error("validation scope integration attempt ownership does not match");
+      }
+      if (workspace.kind !== "candidate" || workspace.taskId !== null) {
+        throw new Error("integration validation requires a candidate workspace");
+      }
     }
     this.#assertCompanyBinding(scope.runId);
     if (run.status !== "active" || workspace.status !== "active") {
