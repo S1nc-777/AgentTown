@@ -3,12 +3,12 @@
 - 更新日期：2026-07-30
 - 当前开发分支：`codex/p1b-git-collaboration`
 - P1B 基线：`2ea80ab`
-- 当前功能提交：`589c5ea`
-- 下一项任务：P1B Task 7
+- 当前功能提交：`632a13e`
+- 下一项任务：P1B Task 8
 
 ## 一句话状态
 
-AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前六项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
+AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前七项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
 
 ## 已完成
 
@@ -27,7 +27,7 @@ P1A 是架构验证切片，不包含真实 Agent、Git worktree 协作或桌面
 
 ### P1B：Git 协作闭环
 
-P1B 计划共有 12 项。目前 Task 1–6 已完成并通过独立规格/代码质量审查，Task 7–12 尚未开始。
+P1B 计划共有 12 项。目前 Task 1–7 已完成并通过独立规格/代码质量审查，Task 8–12 尚未开始。
 
 | 任务 | 状态 | 提交范围 | 结果 |
 | --- | --- | --- | --- |
@@ -37,15 +37,17 @@ P1B 计划共有 12 项。目前 Task 1–6 已完成并通过独立规格/代�
 | 4. Run/Task worktree 生命周期 | 完成 | `ef29598..bf01269` | 审查通过 |
 | 5. 结构化验证与证据日志 | 完成 | `1b27f2e..baad570` | 审查通过 |
 | 6. 提交验证与不可变审核包 | 完成 | `31ce670..589c5ea` | 审查通过 |
-| 7–12. 审核、集成、恢复、CLI、E2E | 待办 | — | 尚未开始 |
+| 7. 审核状态与 Git 工作流协调器 | 完成 | `39a34d5..632a13e` | 审查通过 |
+| 8–12. 集成、恢复、CLI、E2E | 待办 | — | 尚未开始 |
 
-Task 6 最终验证证据：
+Task 7 最终验证证据：
 
-- 提交与审核包定向测试：50/50 通过；
-- Core：15 个测试文件、297 个测试通过；
+- Task 7 定向测试：73/73 通过；
+- 相关扩展测试：113/113 通过；
+- Core：17 个测试文件、319 个测试通过；
 - 工作区类型检查：全部适用项目通过；
 - 独立复审：Spec Approved、Code-quality Approved；
-- 没有启动 Task 7。
+- 没有启动 Task 8。
 
 ## 当前架构边界
 
@@ -147,27 +149,39 @@ PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/
 
 `--no-ext-diff` 不会关闭 textconv。权威 patch 还必须使用 `--no-textconv`，否则仓库或用户配置可能把二进制文件转换成文本并混入审核证据。
 
+### 16. 兼容流程的选择必须失败关闭
+
+只要活跃 Git run 中的任务归属于 `git_worktree` 员工，就必须由 Git 工作流协调器处理。工作区记录缺失或异常时应直接报错，不能回落到 Fake 工作流，否则结构化提交、独立审核和集成门禁都会被绕过。
+
+### 17. 先验证 Git 事实，再执行项目命令
+
+即使验证命令来自公司固定配置，也不能在确认工作区、提交范围、HEAD 和干净状态前执行。权威 Git 校验失败时，项目命令调用次数必须为零；完整证据校验则在命令执行后再次绑定实际结果。
+
+### 18. 原子事务入口也必须验证完整身份
+
+事务内部读取到正确的 run 和 task 还不够，调用者提交的新记录也必须精确匹配 `runId`、`taskId`、revision 和决定对应状态。否则一次“原子提交”仍可能把属于其他审查的对象一起写入。
+
 ## 已知问题与环境残留
 
 - 真实 Claude Code、OpenCode、Hermes Agent 适配尚未开始。
 - 根目录 `pnpm typecheck` 的依赖构建顺序仍值得后续整理；各包脚本目前承担部分预构建责任。
-- 截至本次复核，Windows 临时目录中有 24 个历史 `agenttown-git-*` 和 26 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
+- 截至本次复核，Windows 临时目录中有 25 个历史 `agenttown-git-*` 和 26 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
 - 仓库包元数据声明 `AGPL-3.0-only`，独立 `LICENSE` 文件和贡献指南仍待补齐。
 
-## 下一步：Task 7
+## 下一步：Task 8
 
-下一次开发从 [P1B 实施计划的 Task 7](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-7-review-state-and-git-workflow-coordinator) 继续：
+下一次开发从 [P1B 实施计划的 Task 8](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-8-deterministic-candidate-integration-and-atomic-ref-progress) 继续：
 
-> Review State and Git Workflow Coordinator
+> Deterministic Candidate Integration and Atomic Ref Progress
 
-目标是把提交、权威验证、审核包、独立审核决定和任务状态串成一个确定性的 Git 工作流，并在审核包发生变化时立即停止。
+目标是按 DAG 层级、创建顺序和任务 ID 确定性排队，把已审核提交放入候选 worktree 验证，并通过 Git ref compare-and-swap 与数据库事务安全推进 integration ref。
 
 恢复开发前应确认：
 
 1. 分支为 `codex/p1b-git-collaboration`；
 2. `git status --short` 为空；
-3. HEAD 至少包含 `589c5ea`；
-4. Task 1–6 不重新实现；
+3. HEAD 至少包含 `632a13e`；
+4. Task 1–7 不重新实现；
 5. 先读 P1B 设计、实施计划和本文；
 6. 使用 TDD 和独立只读复审；
 7. 不在同一 Windows 工作区并发运行多套真实 Git 测试。
@@ -177,10 +191,10 @@ PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/
 如果后续对话上下文被压缩，只需保留以下事实：
 
 - 产品：AgentTown，本地“赛博公司”式多 Agent 调度器；
-- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–6；
+- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–7；
 - 当前分支：`codex/p1b-git-collaboration`；
-- 当前功能提交：`589c5ea`；
-- Task 6 已经完整测试并通过独立复审；
-- Task 7–12 尚未开始；
-- 下一步只做 Task 7，不重做之前任务；
+- 当前功能提交：`632a13e`；
+- Task 7 已经完整测试并通过独立复审；
+- Task 8–12 尚未开始；
+- 下一步只做 Task 8，不重做之前任务；
 - README 与本文是面向用户和开发者的当前权威摘要，详细规则以 P1B spec/plan 为准。

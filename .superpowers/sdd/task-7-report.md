@@ -218,13 +218,22 @@ Node's experimental SQLite warning is expected and pre-existing.
 
 ## Concerns
 
-The pre-existing evidence-package Windows fixture cleanup race prevents a
-fully green Core full command on this host even though its functional tamper
-assertion passes. It is outside Task 7 scope and was deliberately left
-unchanged.
+The pre-existing evidence-package Windows fixture cleanup race caused the
+implementer's first Core full command to fail even though its functional
+tamper assertion passed. It is outside Task 7 scope and was deliberately left
+unchanged; the controller's later fresh full run completed without reproducing
+it.
 
 One exact current-run fixture directory,
 `C:\Users\S1nc\AppData\Local\Temp\agenttown-git-5ERaGc`, remained after the
 full-run timeout/cleanup failure. It was resolved and verified under the system
 temporary root, but the environment blocked the literal PowerShell recursive
 removal command. No historical fixture directory was enumerated or touched.
+
+## Controller Final Verification
+
+After the independent re-review approved both specification compliance and
+code quality, the controller ran a fresh Core suite with one worker. This run
+completed with 17/17 test files and 319/319 tests passing, so the earlier
+Windows fixture noise did not recur. The controller also reran the root
+workspace typecheck and `git diff --check`; both completed successfully.
