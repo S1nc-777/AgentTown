@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GitWorkflowCoordinator
 } from "../src/git/git-workflow-coordinator.js";
+import type { ValidatedSubmission } from "../src/git/submission-validator.js";
 import { CoreStore } from "../src/storage/core-store.js";
 import { TaskService } from "../src/tasks/task-service.js";
 import { companyDefinitionFixture } from "./helpers.js";
@@ -64,6 +65,10 @@ function createHarness(options: {
   sendMessage?: (employeeId: string, message: AgentMessage) => Promise<void>;
   requestGrant?: (command: ValidationCommand) => Promise<ValidationCommandGrant>;
   runValidation?: (command: ValidationCommand) => Promise<ValidationRunRecord>;
+  validateSubmission?: (
+    workspace: GitWorkspaceRecord,
+    submission: GitTaskSubmission
+  ) => Promise<ValidatedSubmission>;
 } = {}) {
   const company = companyDefinitionFixture();
   company.validation.commands = options.commands ?? [];
@@ -124,7 +129,7 @@ function createHarness(options: {
     store.putGitWorkspace(workspace);
     return workspace;
   });
-  const validate = vi.fn(async (
+  const defaultValidate = async (
     _workspace: GitWorkspaceRecord,
     parsed: GitTaskSubmission
   ) => ({
@@ -146,7 +151,8 @@ function createHarness(options: {
     knownRisks: parsed.knownRisks,
     reportedResults: parsed.reportedResults,
     validations: []
-  }));
+  });
+  const validate = vi.fn(options.validateSubmission ?? defaultValidate);
   const requestGrant = vi.fn(options.requestGrant ?? (async (command) => ({
     grantId: `grant-${command.id}`,
     runId: "run-1",
@@ -232,6 +238,51 @@ function createHarness(options: {
 }
 
 describe("GitWorkflowCoordinator", () => {
+  it("claims an active Git owner's submission even when its workspace is missing", async () => {
+    const harness = createHarness();
+    harness.tasks.assign("task-a", "developer");
+    harness.tasks.transition("task-a", "running", "developer");
+    const submit = action({
+      type: "task.submit",
+      actor: "developer",
+      taskId: "task-a",
+      payload: { submission: submission() }
+    });
+
+    expect(harness.coordinator.handles(submit)).toBe(true);
+    await expect(harness.coordinator.submitTask(submit))
+      .rejects.toThrow("workspace");
+    expect(harness.tasks.get("task-a").status).toBe("running");
+  });
+
+  it("claims an active Git owner's approval without a workspace so Fake completion is unreachable", async () => {
+    const harness = createHarness();
+    harness.tasks.assign("task-a", "developer");
+    harness.tasks.transition("task-a", "running", "developer");
+    harness.tasks.submit("task-a", "developer", ["legacy.patch"], ["legacy evidence"]);
+    const approve = action({
+      type: "task.approve",
+      actor: "reviewer",
+      taskId: "task-a",
+      payload: {
+        revision: 1,
+        decision: {
+          schemaVersion: 1,
+          decision: "approve",
+          findings: [],
+          coverageGaps: [],
+          summary: "Ready",
+          reviewedManifestHash: "d".repeat(64)
+        }
+      }
+    });
+
+    expect(harness.coordinator.handles(approve)).toBe(true);
+    await harness.coordinator.recordReview(approve);
+    expect(harness.tasks.get("task-a").status).toBe("review");
+    expect(harness.recordDecision).toHaveBeenCalledOnce();
+  });
+
   it("persists the task worktree before sending exact WritableTaskContext", async () => {
     const order: string[] = [];
     const harness = createHarness({
@@ -483,7 +534,13 @@ describe("GitWorkflowCoordinator", () => {
         integrationAttemptId: null
       })
     );
-    expect(harness.validate).toHaveBeenCalledOnce();
+    expect(harness.validate).toHaveBeenCalledTimes(2);
+    expect(harness.validate.mock.calls[0]?.[1]).toMatchObject({
+      validationCommandIds: []
+    });
+    expect(harness.validate.mock.calls[1]?.[1]).toMatchObject({
+      validationCommandIds: ["core-test"]
+    });
     expect(harness.create).toHaveBeenCalledWith(
       expect.objectContaining({ revision: 1 })
     );
@@ -551,10 +608,65 @@ describe("GitWorkflowCoordinator", () => {
       payload: { submission: submission(["core-test"]) }
     }))).rejects.toThrow("validation failed");
 
-    expect(harness.validate).not.toHaveBeenCalled();
+    expect(harness.validate).toHaveBeenCalledOnce();
+    expect(harness.validate.mock.calls[0]?.[1]).toMatchObject({
+      validationCommandIds: []
+    });
     expect(harness.create).not.toHaveBeenCalled();
     expect(harness.store.listGitSubmissions("run-1", "task-a")).toHaveLength(0);
     expect(harness.tasks.get("task-a").status).toBe("running");
+  });
+
+  it("validates authoritative Git facts before running validation commands", async () => {
+    const configured: ValidationCommand = {
+      id: "core-test",
+      executable: "pnpm",
+      args: ["test"],
+      cwd: ".",
+      timeoutSeconds: 600
+    };
+    const order: string[] = [];
+    const harness = createHarness({
+      commands: [configured],
+      validateSubmission: async () => {
+        order.push("validate");
+        throw new Error("authoritative Git facts rejected");
+      },
+      runValidation: async (command) => {
+        order.push("run");
+        return {
+          validationId: randomUUID(),
+          runId: "run-1",
+          taskId: "task-a",
+          integrationAttemptId: null,
+          command,
+          workspaceId: "run-1:task:developer:task-a",
+          outcome: "passed",
+          exitCode: 0,
+          startedAt: "2026-07-30T00:00:00.000Z",
+          completedAt: "2026-07-30T00:00:01.000Z",
+          logPath: "C:\\logs\\passed.log",
+          logHash: "f".repeat(64)
+        };
+      }
+    });
+    await harness.coordinator.assignTask(action({
+      type: "task.assign",
+      actor: "leader",
+      taskId: "task-a",
+      payload: { assignee: "developer" }
+    }));
+
+    await expect(harness.coordinator.submitTask(action({
+      type: "task.submit",
+      actor: "developer",
+      taskId: "task-a",
+      payload: { submission: submission(["core-test"]) }
+    }))).rejects.toThrow("authoritative Git facts rejected");
+
+    expect(order).toEqual(["validate"]);
+    expect(harness.run).not.toHaveBeenCalled();
+    expect(harness.store.listGitSubmissions("run-1", "task-a")).toHaveLength(0);
   });
 
   it("delegates a parsed review decision with bound task and revision", async () => {

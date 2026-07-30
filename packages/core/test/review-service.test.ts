@@ -349,4 +349,59 @@ describe("ReviewService", () => {
     })).toThrow("immutable");
     expect(store.getReviewDecision("run-1", "task-a", 1)).toEqual(approved);
   });
+
+  it.each([
+    {
+      label: "foreign submission run",
+      mutate: (submission: GitSubmissionRecord): GitSubmissionRecord => ({
+        ...submission,
+        runId: "run-other",
+        status: "approved"
+      })
+    },
+    {
+      label: "decision-inconsistent submission status",
+      mutate: (submission: GitSubmissionRecord): GitSubmissionRecord => ({
+        ...submission,
+        status: "changes_requested"
+      })
+    }
+  ])("atomically rejects $label in direct review commits", ({ mutate }) => {
+    const { packageRecord, store, tasks } = createHarness();
+    const taskBefore = tasks.get("task-a");
+    const submissionBefore = store.getGitSubmission("run-1", "task-a", 1)!;
+    const taskEventId = randomUUID();
+
+    expect(() => store.commitGitReviewDecision({
+      companyId: "company-1",
+      runId: "run-1",
+      task: {
+        ...taskBefore,
+        status: "review",
+        updatedEventId: taskEventId
+      },
+      submission: mutate(submissionBefore),
+      decision: decision(packageRecord.manifestHash),
+      events: [{
+        id: randomUUID(),
+        type: "review.approved",
+        actorId: "reviewer",
+        taskId: "task-a",
+        causationEventId: null,
+        payload: {}
+      }, {
+        id: taskEventId,
+        type: "task.review_approved",
+        actorId: "reviewer",
+        taskId: "task-a",
+        causationEventId: null,
+        payload: {}
+      }]
+    })).toThrow(/submission|review decision|mismatch/u);
+
+    expect(store.getReviewDecision("run-1", "task-a", 1)).toBeNull();
+    expect(store.getGitSubmission("run-1", "task-a", 1)).toEqual(submissionBefore);
+    expect(store.getGitSubmission("run-other", "task-a", 1)).toBeNull();
+    expect(tasks.get("task-a")).toEqual(taskBefore);
+  });
 });

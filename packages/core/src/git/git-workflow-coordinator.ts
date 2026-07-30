@@ -172,8 +172,7 @@ export class GitWorkflowCoordinator {
     if (task?.ownerEmployeeId === null || task?.ownerEmployeeId === undefined) {
       return false;
     }
-    return this.#employee(task.ownerEmployeeId).workspace === "git_worktree"
-      && this.#taskWorkspace(task.id, task.ownerEmployeeId) !== null;
+    return this.#employee(task.ownerEmployeeId).workspace === "git_worktree";
   }
 
   async assignTask(action: ActionProposal): Promise<AssignTaskOutcome> {
@@ -350,6 +349,10 @@ export class GitWorkflowCoordinator {
         );
       }
     }
+    const gitFacts = await this.#submissionValidator.validate(workspace, {
+      ...parsed,
+      validationCommandIds: []
+    });
     for (const command of validationCommands) {
       const result = await this.#validationRunner.run(command, scope);
       if (result.runId !== this.#runId
@@ -363,7 +366,9 @@ export class GitWorkflowCoordinator {
       }
     }
 
-    const validated = await this.#submissionValidator.validate(workspace, parsed);
+    const validated = validationCommands.length === 0
+      ? gitFacts
+      : await this.#submissionValidator.validate(workspace, parsed);
     const latest = this.#store.listGitSubmissions(this.#runId, taskId).at(-1);
     const revision = (latest?.revision ?? 0) + 1;
     const validatedRecord: GitSubmissionRecord = {

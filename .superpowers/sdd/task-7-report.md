@@ -86,7 +86,7 @@ implementation.
   targeted run failed 2/2, then passed 2/2 after conflict rejection and
   immutable decision insertion.
 
-### Final focused GREEN
+### Initial focused GREEN
 
 ```powershell
 pnpm exec vitest run test/review-service.test.ts test/git-workflow-coordinator.test.ts test/orchestrator.test.ts test/action-policy.test.ts test/task-service.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1
@@ -98,6 +98,51 @@ pnpm exec vitest run test/review-service.test.ts test/git-workflow-coordinator.t
 
 The wider storage/migration/workflow focused run passed 108/108 tests across
 seven files.
+
+### Independent review follow-up
+
+An independent review found one Critical and two Important Task 7 issues. Each
+was reproduced before production changes:
+
+1. **Git workflow fail-open**
+   - RED: an active Git run with a `git_worktree` task owner and no registered
+     workspace made `GitWorkflowCoordinator.handles()` return false for both
+     submission and approval, allowing `CompanyOrchestrator` to select the Fake
+     workflow.
+   - GREEN: workflow ownership now depends only on the authoritative active run
+     and configured Git assignee/owner. Missing or non-unique workspaces remain
+     coordinator validation errors, so Fake submission/completion is
+     unreachable.
+2. **Validation ordering**
+   - RED: the order spy observed `run, validate`; a rejecting authoritative Git
+     validator still allowed a validation command to execute.
+   - GREEN: after grant resolution and before any command execution, the
+     coordinator calls `SubmissionValidator` with validation evidence IDs
+     removed to validate authoritative Git/task/workspace/commit facts. Only
+     after that succeeds does it run commands, followed by the exact full
+     validation that binds the newly persisted evidence. The rejection test
+     observes only `validate`, with zero runner calls.
+3. **Atomic review submission binding**
+   - RED: the direct CoreStore review commit accepted a decision-inconsistent
+     submission status; a foreign submission run reached a foreign-key failure
+     only after transaction work began.
+   - GREEN: the atomic API now rejects before its transaction unless submission
+     run/task/revision are bound and its status exactly matches the decision
+     (`approve -> approved`, `reject -> changes_requested`). Direct-call tests
+     verify no decision, task, original submission, or foreign submission
+     mutation.
+
+Post-review focused verification:
+
+- Task 7 + orchestrator/policy/task-service: 5 files, 73/73 passed.
+- Task 7 + CoreStore/migrations + orchestrator/policy/task-service: 7 files,
+  113/113 passed.
+- Root `pnpm typecheck`: passed after correcting the new test dependency type.
+- `git diff --check`: passed.
+
+Per the controller instruction, the full Core suite was not rerun during this
+follow-up because the previous full-run failures were already isolated to the
+pre-existing Windows fixture cleanup/timeout noise.
 
 ## Verification
 

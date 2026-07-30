@@ -1115,6 +1115,16 @@ export class CoreStore {
     if (input.events.length === 0) {
       throw new Error("commitGitReviewDecision requires events");
     }
+    const expectedSubmissionStatus = input.decision.decision === "approve"
+      ? "approved"
+      : "changes_requested";
+    if (input.submission.runId !== input.runId
+      || input.submission.taskId !== input.task.id
+      || !Number.isSafeInteger(input.submission.revision)
+      || input.submission.revision < 1
+      || input.submission.status !== expectedSubmissionStatus) {
+      throw new Error("review decision submission identity or status mismatch");
+    }
     assertTaskScopedEvents(input.task.id, input.events);
     const insertedEvents = this.inTransaction(() => {
       const run = this.getGitRun(input.runId);
