@@ -23,9 +23,11 @@ were not implemented or changed.
 - Rebinds the persisted company definition, active company-owned run, review
   task, exact latest submission, approval decision/package hash, formal ref,
   and unique registered integration workspace before Git mutation.
-- Persists `prepared` attempt + queued submission + event in one transaction
-  before candidate creation. Candidate workspaces are exact attempt-owned
-  WorkspaceManager assets at the expected old integration SHA.
+- Persists the queued submission transition and one idempotent
+  `integration.queued` event before selection, then persists the `prepared`
+  attempt + queued submission + event in one transaction before candidate
+  creation. Candidate workspaces are exact attempt-owned WorkspaceManager
+  assets at the expected old integration SHA.
 - Cherry-picks the reviewed commit list in declared order with an actual
   `GIT_EDITOR=true` process environment and never mutates the formal
   integration worktree for candidate application.
@@ -53,8 +55,10 @@ were not implemented or changed.
 - Wired approved Git reviews through coordinator `enqueue` then `drain`, while
   leaving the optional boundary absent for existing P1A/Fake workflow callers.
 - Extended ValidationRunner's existing exact scope rules so an attempt-bound
-  integration validation can use a registered task-null candidate workspace
-  while still binding the validation record to the exact task and attempt.
+  integration validation must use the one active task-null candidate workspace
+  whose ref, base commit, and head commit exactly match the durable attempt.
+  Final integration independently rebinds every durable validation to that same
+  unique workspace.
 
 ## TDD Evidence
 
@@ -111,7 +115,30 @@ Focused coverage was extended to 15 tests for:
 - actual `GIT_EDITOR=true`;
 - coordinator enqueue/drain wiring.
 
-Final focused behavior is included in the 165-test relevant-suite run below.
+### Independent-review fixes RED/GREEN
+
+Three independent-review findings received regression tests before production
+changes:
+
+- Strict CoreStore boundary: two omission tests failed 2/17 because unsafe
+  callers could omit company/run/workspace context and still mutate facts.
+  Making the prepared and final bundle context mandatory at both type and
+  runtime boundaries made the focused suite pass 17/17.
+- Exact candidate binding: two tests failed 2/19 because attempt-bound
+  validation could run in another registered candidate workspace and the final
+  bundle accepted its record. Requiring one exact active candidate workspace
+  at execution and final commit made the focused suite pass 19/19.
+- Durable enqueue: one test failed 1/20 because a blocked same-layer submission
+  stayed `approved` and emitted no queue event. An atomic idempotent queued
+  submission + event bundle made the focused suite pass 20/20.
+
+The stricter signatures also exposed ten legacy storage-test callers at
+typecheck. All callers were migrated to explicit context, successful fixtures
+were upgraded to the real approved → queued → prepared → validated lifecycle,
+and immutable-attempt error ordering was retained. The storage suite passed
+30/30.
+
+Final focused behavior is included in the 170-test relevant-suite run below.
 
 ## Verification
 
@@ -122,7 +149,7 @@ pnpm exec vitest run test/integration-service.test.ts test/storage-migrations.te
 ```
 
 - 9 files passed;
-- 165 tests passed;
+- 170 tests passed;
 - 0 failed;
 - all real-Git suites ran serially with one worker.
 
@@ -130,7 +157,8 @@ An earlier wider run exposed four legacy CoreStore error-order regressions and
 one ValidationRunner error-order regression. Strict Task 8 status validation
 was scoped to the new strict bundle, and missing-attempt ownership was restored
 ahead of candidate-kind validation. The two directly affected suites then
-passed 52/52 before the final 165/165 run.
+passed 52/52 before the initial 165/165 run. After the independent-review fixes,
+the storage suite passed 30/30 and the final wider run passed 170/170.
 
 ### P1A gate
 
@@ -160,10 +188,16 @@ Node's experimental SQLite warning is expected and pre-existing.
 - Confirmed prepared intent is durable before candidate ref/worktree creation
   and no candidate command can run before exact company/run/task/revision/
   decision/formal-workspace binding.
+- Confirmed enqueue durably changes only the exact latest approved review to
+  queued, emits one identity-bound queue event, and remains idempotent while
+  an earlier same-layer task blocks selection.
 - Confirmed task order never trusts mutable timestamps or Agent text; only the
   immutable task-created event sequence is used.
 - Confirmed candidate commands use only the verified candidate path and
   authoritative Git/validation facts; reported submission results are ignored.
+- Confirmed an attempt-bound validation cannot execute in a different
+  registered candidate and final commit rejects validation not bound to the one
+  exact attempt ref/base/head workspace.
 - Confirmed conflict and non-passed validation leave formal ref/worktree facts
   unchanged and all configured integration commands are attempted.
 - Confirmed CAS has exact old/new operands, no force update, no retry, and no

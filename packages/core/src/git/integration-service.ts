@@ -129,7 +129,18 @@ export class IntegrationService {
   }
 
   async enqueue(submission: GitSubmissionRecord): Promise<void> {
-    this.#bindApprovedSubmission(submission);
+    const bound = this.#bindApprovedSubmission(submission);
+    this.#store.commitQueuedIntegration({
+      companyId: this.#companyId,
+      submission: {
+        ...bound.submission,
+        status: "queued"
+      },
+      event: this.#event("integration.queued", bound.task.id, {
+        runId: this.#runId,
+        revision: bound.submission.revision
+      })
+    });
   }
 
   async drain(): Promise<IntegrationResult | null> {
@@ -139,7 +150,7 @@ export class IntegrationService {
       const submission = this.#store
         .listGitSubmissions(this.#runId, candidate.taskId)
         .at(-1);
-      if (submission?.status !== "approved") continue;
+      if (submission?.status !== "queued") continue;
       if (candidate.task.dependencies.some((dependencyId) =>
         this.#store.getTask(this.#companyId, dependencyId)?.status !== "completed"
       )) {
@@ -159,6 +170,7 @@ export class IntegrationService {
   }
 
   async integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
+    await this.enqueue(submission);
     const bound = this.#bindApprovedSubmission(submission);
     const selected = this.#select(bound.submission);
     if (selected.kind === "waiting") return selected;
@@ -455,7 +467,8 @@ export class IntegrationService {
     submission: GitSubmissionRecord
   ): { submission: GitSubmissionRecord; task: TaskRecord } {
     this.#bindRun();
-    if (submission.runId !== this.#runId || submission.status !== "approved") {
+    if (submission.runId !== this.#runId
+      || (submission.status !== "approved" && submission.status !== "queued")) {
       throw new Error("integration submission is not approved for this run");
     }
     const task = this.#store.getTask(this.#companyId, submission.taskId);
@@ -475,7 +488,12 @@ export class IntegrationService {
     if (task === null
       || task.status !== "review"
       || latest === undefined
-      || !sameJson(latest, submission)
+      || latest.revision !== submission.revision
+      || latest.runId !== submission.runId
+      || latest.taskId !== submission.taskId
+      || JSON.stringify(latest.submission)
+        !== JSON.stringify(submission.submission)
+      || (latest.status !== "approved" && latest.status !== "queued")
       || decision?.decision !== "approve"
       || reviewPackage === null
       || reviewPackage.status === "tampered"

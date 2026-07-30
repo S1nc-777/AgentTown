@@ -367,6 +367,24 @@ describe("IntegrationService", () => {
     expect(harness.store.listIntegrationAttempts("run-1")).toEqual([]);
   });
 
+  it("durably and idempotently queues an approved task before a same-layer wait", async () => {
+    const harness = await queueHarness();
+    harness.createTask("task-a");
+    const approvedB = harness.approve(harness.createTask("task-b"));
+
+    await harness.service.enqueue(approvedB);
+    await harness.service.enqueue(approvedB);
+    const result = await harness.service.drain();
+
+    expect(result).toEqual({ kind: "waiting", taskId: "task-a" });
+    expect(harness.store.getGitSubmission("run-1", "task-b", 1)?.status)
+      .toBe("queued");
+    expect(harness.store.listEvents(0).filter(
+      ({ type, taskId }) => type === "integration.queued" && taskId === "task-b"
+    )).toHaveLength(1);
+    expect(harness.store.listIntegrationAttempts("run-1")).toEqual([]);
+  });
+
   it("rejects a persisted dependency cycle before selecting a candidate", async () => {
     const harness = await queueHarness();
     const taskA = harness.createTask("task-a");
@@ -753,6 +771,298 @@ describe("IntegrationService", () => {
     expect(harness.store.listGitWorkspaces("run-1").filter(
       ({ kind }) => kind === "candidate"
     )).toEqual([]);
+  }, 20_000);
+
+  it("rejects an omitted strict prepared identity bundle without mutating any fact", async () => {
+    const harness = await realHarness();
+    const attempt: IntegrationAttemptRecord = {
+      attemptId: "attempt-omitted",
+      runId: "run-1",
+      taskId: "task-a",
+      submissionRevision: 1,
+      orderKey: "00000000:00000000000000000001:task-a",
+      expectedOldCommit: harness.oldCommit,
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-omitted",
+      candidateCommit: null,
+      status: "prepared",
+      conflictFiles: [],
+      validationRunIds: []
+    };
+    const queued: GitSubmissionRecord = {
+      ...harness.approved,
+      status: "queued"
+    };
+    const preparedEvent = event("git.integration.prepared", "task-a");
+    const unsafeCall = harness.store.commitPreparedIntegration.bind(
+      harness.store
+    ) as unknown as (input: {
+      attempt: IntegrationAttemptRecord;
+      submission: GitSubmissionRecord;
+      event: ReturnType<typeof event>;
+    }) => void;
+
+    expect(() => unsafeCall({
+      attempt,
+      submission: queued,
+      event: preparedEvent
+    })).toThrow("strict");
+
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId)).toBeNull();
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1))
+      .toEqual(harness.approved);
+    expect(harness.store.listEvents(0).some(
+      ({ id }) => id === preparedEvent.id
+    )).toBe(false);
+  }, 20_000);
+
+  it("rejects omitted or forged final bundle identities with full transaction rollback", async () => {
+    const harness = await realHarness();
+    const attempt: IntegrationAttemptRecord = {
+      attemptId: "attempt-final",
+      runId: "run-1",
+      taskId: "task-a",
+      submissionRevision: 1,
+      orderKey: "00000000:00000000000000000001:task-a",
+      expectedOldCommit: harness.oldCommit,
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-final",
+      candidateCommit: null,
+      status: "prepared",
+      conflictFiles: [],
+      validationRunIds: []
+    };
+    harness.store.commitQueuedIntegration({
+      companyId: "company-1",
+      submission: { ...harness.approved, status: "queued" },
+      event: {
+        ...event("integration.queued", "task-a"),
+        payload: { runId: "run-1", revision: 1 }
+      }
+    });
+    harness.store.commitPreparedIntegration({
+      companyId: "company-1",
+      attempt,
+      submission: { ...harness.approved, status: "queued" },
+      event: event("git.integration.prepared", "task-a")
+    });
+    const preparedWithCommit: IntegrationAttemptRecord = {
+      ...attempt,
+      candidateCommit: "d".repeat(40)
+    };
+    harness.store.putIntegrationAttempt(preparedWithCommit);
+    const completedEvent = event("task.completed", "task-a");
+    const currentTask = harness.store.getTask("company-1", "task-a")!;
+    const completedTask: TaskRecord = {
+      ...currentTask,
+      status: "completed",
+      updatedEventId: completedEvent.id
+    };
+    const unsafeCall = harness.store.commitIntegratedTask.bind(
+      harness.store
+    ) as unknown as (input: {
+      attempt: IntegrationAttemptRecord;
+      submission: GitSubmissionRecord;
+      task: TaskRecord;
+      events: ReturnType<typeof event>[];
+    }) => void;
+
+    expect(() => unsafeCall({
+      attempt: { ...preparedWithCommit, status: "committed" },
+      submission: { ...harness.approved, status: "integrated" },
+      task: completedTask,
+      events: [
+        event("git.integration.committed", "task-a"),
+        completedEvent
+      ]
+    })).toThrow("strict");
+
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId))
+      .toEqual(preparedWithCommit);
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.status)
+      .toBe("queued");
+    expect(harness.store.getTask("company-1", "task-a")).toEqual(currentTask);
+    expect(harness.store.getGitRun("run-1")?.integrationCommit)
+      .toBe(harness.oldCommit);
+  }, 20_000);
+
+  it("rejects attempt-bound validation in another registered candidate workspace", async () => {
+    const harness = await realHarness();
+    const attempt: IntegrationAttemptRecord = {
+      attemptId: "attempt-owner",
+      runId: "run-1",
+      taskId: "task-a",
+      submissionRevision: 1,
+      orderKey: "00000000:00000000000000000001:task-a",
+      expectedOldCommit: harness.oldCommit,
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-owner",
+      candidateCommit: harness.oldCommit,
+      status: "prepared",
+      conflictFiles: [],
+      validationRunIds: []
+    };
+    harness.store.commitQueuedIntegration({
+      companyId: "company-1",
+      submission: { ...harness.approved, status: "queued" },
+      event: {
+        ...event("integration.queued", "task-a"),
+        payload: { runId: "run-1", revision: 1 }
+      }
+    });
+    harness.store.commitPreparedIntegration({
+      companyId: "company-1",
+      attempt: { ...attempt, candidateCommit: null },
+      submission: { ...harness.approved, status: "queued" },
+      event: event("git.integration.prepared", "task-a")
+    });
+    harness.store.putIntegrationAttempt(attempt);
+    await harness.manager.createCandidateWorkspace({
+      runId: "run-1",
+      attemptId: "attempt-owner",
+      baseCommit: harness.oldCommit
+    });
+    const foreignCandidate = await harness.manager.createCandidateWorkspace({
+      runId: "run-1",
+      attemptId: "attempt-foreign",
+      baseCommit: harness.oldCommit
+    });
+    const marker = resolve(foreignCandidate.path, "validation-ran.txt");
+    const command = {
+      id: "cross-candidate",
+      executable: process.execPath,
+      args: [
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`
+      ],
+      cwd: ".",
+      timeoutSeconds: 10
+    };
+    harness.store.putValidationCommandGrant({
+      grantId: "cross-candidate-grant",
+      runId: "run-1",
+      taskId: "task-a",
+      workspaceId: foreignCandidate.workspaceId,
+      command,
+      status: "approved",
+      decisionReason: "test"
+    });
+
+    await expect(harness.validationRunner.run(command, {
+      runId: "run-1",
+      taskId: "task-a",
+      integrationAttemptId: attempt.attemptId,
+      workspaceId: foreignCandidate.workspaceId,
+      workspaceRoot: foreignCandidate.path
+    })).rejects.toThrow("candidate workspace");
+
+    await expect(import("node:fs/promises").then(({ stat }) => stat(marker)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect(harness.store.listValidationRuns("run-1", "task-a")).toEqual([]);
+  }, 20_000);
+
+  it("rejects final facts whose validation came from another candidate workspace", async () => {
+    const harness = await realHarness();
+    const attempt: IntegrationAttemptRecord = {
+      attemptId: "attempt-final-owner",
+      runId: "run-1",
+      taskId: "task-a",
+      submissionRevision: 1,
+      orderKey: "00000000:00000000000000000001:task-a",
+      expectedOldCommit: harness.oldCommit,
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-final-owner",
+      candidateCommit: null,
+      status: "prepared",
+      conflictFiles: [],
+      validationRunIds: []
+    };
+    harness.store.commitQueuedIntegration({
+      companyId: "company-1",
+      submission: { ...harness.approved, status: "queued" },
+      event: {
+        ...event("integration.queued", "task-a"),
+        payload: { runId: "run-1", revision: 1 }
+      }
+    });
+    harness.store.commitPreparedIntegration({
+      companyId: "company-1",
+      attempt,
+      submission: { ...harness.approved, status: "queued" },
+      event: event("git.integration.prepared", "task-a")
+    });
+    await harness.manager.createCandidateWorkspace({
+      runId: "run-1",
+      attemptId: "attempt-final-owner",
+      baseCommit: harness.oldCommit
+    });
+    const foreignCandidate = await harness.manager.createCandidateWorkspace({
+      runId: "run-1",
+      attemptId: "attempt-final-foreign",
+      baseCommit: harness.oldCommit
+    });
+    const candidateCommit = "d".repeat(40);
+    const validationId = "validation-cross-candidate";
+    const preparedWithValidation: IntegrationAttemptRecord = {
+      ...attempt,
+      candidateCommit,
+      validationRunIds: [validationId]
+    };
+    harness.store.putIntegrationAttempt({
+      ...attempt,
+      candidateCommit
+    });
+    harness.store.putValidationRun({
+      validationId,
+      runId: "run-1",
+      taskId: "task-a",
+      integrationAttemptId: attempt.attemptId,
+      command: harness.company.validation.commands[0]!,
+      workspaceId: foreignCandidate.workspaceId,
+      outcome: "passed",
+      exitCode: 0,
+      startedAt: "2026-07-30T00:00:00.000Z",
+      completedAt: "2026-07-30T00:00:01.000Z",
+      logPath: resolve(harness.repo.root, "validation.log"),
+      logHash: "e".repeat(64)
+    });
+    harness.store.putIntegrationAttempt(preparedWithValidation);
+    const currentTask = harness.store.getTask("company-1", "task-a")!;
+    const completedEvent = event("task.completed", "task-a");
+    const integration = harness.store.getGitWorkspace(
+      harness.integrationWorkspaceId
+    )!;
+    const commitEvent = event("git.integration.committed", "task-a");
+
+    expect(() => harness.store.commitIntegratedTask({
+      companyId: "company-1",
+      attempt: {
+        ...preparedWithValidation,
+        status: "committed"
+      },
+      submission: { ...harness.approved, status: "integrated" },
+      task: {
+        ...currentTask,
+        status: "completed",
+        updatedEventId: completedEvent.id
+      },
+      run: {
+        ...harness.store.getGitRun("run-1")!,
+        integrationCommit: candidateCommit
+      },
+      integrationWorkspace: {
+        ...integration,
+        headCommit: candidateCommit
+      },
+      events: [commitEvent, completedEvent]
+    })).toThrow("candidate workspace");
+
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId))
+      .toEqual(preparedWithValidation);
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.status)
+      .toBe("queued");
+    expect(harness.store.getTask("company-1", "task-a")).toEqual(currentTask);
+    expect(harness.store.getGitRun("run-1")?.integrationCommit)
+      .toBe(harness.oldCommit);
+    expect(harness.store.listEvents(0).some(
+      ({ id }) => id === commitEvent.id || id === completedEvent.id
+    )).toBe(false);
   }, 20_000);
 
   it("drains an approved coordinator review through IntegrationService", async () => {

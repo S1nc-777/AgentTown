@@ -356,6 +356,40 @@ function gitWorkspace(): GitWorkspaceRecord {
   };
 }
 
+function integrationWorkspace(
+  headCommit = "a".repeat(40)
+): GitWorkspaceRecord {
+  return {
+    workspaceId: "run-1:integration",
+    runId: "run-1",
+    taskId: null,
+    employeeId: null,
+    kind: "integration",
+    path: "C:\\project\\.agenttown\\runs\\run-1\\worktrees\\integration",
+    branchRef: "refs/agenttown/runs/run-1/integration",
+    baseCommit: "a".repeat(40),
+    headCommit,
+    status: "active"
+  };
+}
+
+function candidateWorkspace(
+  headCommit = "c".repeat(40)
+): GitWorkspaceRecord {
+  return {
+    workspaceId: "run-1:candidate:attempt-1",
+    runId: "run-1",
+    taskId: null,
+    employeeId: null,
+    kind: "candidate",
+    path: "C:\\project\\.agenttown\\runs\\run-1\\worktrees\\candidate\\attempt-1",
+    branchRef: "refs/agenttown/candidates/attempt-1",
+    baseCommit: "a".repeat(40),
+    headCommit,
+    status: "active"
+  };
+}
+
 function gitSubmission(
   overrides: Partial<GitSubmissionRecord> = {}
 ): GitSubmissionRecord {
@@ -493,6 +527,30 @@ function preparedAttempt(): IntegrationAttemptRecord {
     conflictFiles: [],
     validationRunIds: []
   };
+}
+
+function seedApprovedQueuedIntegration(store: CoreStore): GitSubmissionRecord {
+  store.putTask("company", task("review"), [
+    event("task-review", "task.review")
+  ]);
+  store.putGitSubmission(gitSubmission({ status: "approved" }));
+  store.putReviewPackage(reviewPackage());
+  store.putReviewDecision({
+    runId: "run-1",
+    taskId: "task-1",
+    revision: 1,
+    decision: reviewDecision()
+  });
+  const queued = gitSubmission({ status: "queued" });
+  store.commitQueuedIntegration({
+    companyId: "company",
+    submission: queued,
+    event: {
+      ...event("integration-queued", "integration.queued"),
+      payload: { runId: "run-1", revision: 1 }
+    }
+  });
+  return queued;
 }
 
 describe("Core schema migrations", () => {
@@ -856,8 +914,9 @@ describe("typed Git fact storage", () => {
     const store = initializedStore();
     try {
       const attempt = preparedAttempt();
-      const submission = gitSubmission({ status: "queued" });
+      const submission = seedApprovedQueuedIntegration(store);
       store.commitPreparedIntegration({
+        companyId: "company",
         attempt,
         submission,
         event: event("integration-prepared", "git.integration.prepared")
@@ -866,10 +925,13 @@ describe("typed Git fact storage", () => {
       expect(store.getGitSubmission("run-1", "task-1", 1)).toEqual(submission);
       expect(store.listEvents(0).map(({ id }) => id)).toEqual([
         "company-created",
+        "task-review",
+        "integration-queued",
         "integration-prepared"
       ]);
 
       expect(() => store.commitPreparedIntegration({
+        companyId: "company",
         attempt: { ...attempt, status: "aborted" },
         submission: { ...submission, status: "rejected" },
         event: event("integration-prepared", "git.integration.aborted")
@@ -885,6 +947,7 @@ describe("typed Git fact storage", () => {
     const store = initializedStore();
     try {
       expect(() => store.commitPreparedIntegration({
+        companyId: "company",
         attempt: preparedAttempt(),
         submission: gitSubmission({ taskId: "different-task" }),
         event: event("mismatched-integration", "git.integration.prepared")
@@ -915,6 +978,7 @@ describe("typed Git fact storage", () => {
         taskId: "task-2"
       };
       expect(() => store.commitPreparedIntegration({
+        companyId: "company",
         attempt: reparentedAttempt,
         submission: gitSubmission({ taskId: "task-2" }),
         event: {
@@ -942,6 +1006,7 @@ describe("typed Git fact storage", () => {
       store.putGitSubmission(gitSubmission());
 
       expect(() => store.commitPreparedIntegration({
+        companyId: "company",
         attempt: {
           ...originalAttempt,
           submissionRevision: 2
@@ -962,6 +1027,7 @@ describe("typed Git fact storage", () => {
     const store = initializedStore();
     try {
       expect(() => store.commitPreparedIntegration({
+        companyId: "company",
         attempt: preparedAttempt(),
         submission: gitSubmission(),
         event: {
@@ -1009,20 +1075,40 @@ describe("typed Git fact storage", () => {
   it("commits an integrated task, attempt, submission and events atomically", () => {
     const store = initializedStore();
     try {
-      store.putTask("company", task("running"), [
-        event("task-running", "task.running")
-      ]);
-      const attempt = {
+      const queuedSubmission = seedApprovedQueuedIntegration(store);
+      store.putGitWorkspace(integrationWorkspace());
+      store.commitPreparedIntegration({
+        companyId: "company",
+        attempt: preparedAttempt(),
+        submission: queuedSubmission,
+        event: event("integration-prepared", "git.integration.prepared")
+      });
+      const candidate = candidateWorkspace();
+      store.putGitWorkspace(candidate);
+      const preparedWithValidation = {
         ...preparedAttempt(),
         candidateCommit: "c".repeat(40),
+        validationRunIds: ["validation-1"]
+      };
+      store.putIntegrationAttempt(preparedWithValidation);
+      store.putValidationRun({
+        ...validationRun(),
+        integrationAttemptId: "attempt-1",
+        workspaceId: candidate.workspaceId
+      });
+      const attempt = {
+        ...preparedWithValidation,
         status: "committed" as const
       };
       const submission = gitSubmission({ status: "integrated" });
       const completedTask = task("completed");
       store.commitIntegratedTask({
+        companyId: "company",
         attempt,
         submission,
         task: completedTask,
+        run: gitRun({ integrationCommit: "c".repeat(40) }),
+        integrationWorkspace: integrationWorkspace("c".repeat(40)),
         events: [
           event("integration-committed", "git.integration.committed"),
           event("task-completed", "task.completed")
@@ -1033,7 +1119,9 @@ describe("typed Git fact storage", () => {
       expect(store.getTask("company", "task-1")).toEqual(completedTask);
       expect(store.listEvents(0).map(({ id }) => id)).toEqual([
         "company-created",
-        "task-running",
+        "task-review",
+        "integration-queued",
+        "integration-prepared",
         "integration-committed",
         "task-completed"
       ]);
@@ -1053,9 +1141,11 @@ describe("typed Git fact storage", () => {
       store.putGitSubmission(originalSubmission);
 
       expect(() => store.commitIntegratedTask({
+        companyId: "company",
         attempt: {
           ...originalAttempt,
           taskId: "task-2",
+          candidateCommit: "c".repeat(40),
           status: "committed"
         },
         submission: gitSubmission({
@@ -1066,6 +1156,8 @@ describe("typed Git fact storage", () => {
           ...task("completed"),
           id: "task-2"
         },
+        run: gitRun({ integrationCommit: "c".repeat(40) }),
+        integrationWorkspace: integrationWorkspace("c".repeat(40)),
         events: [{
           ...event("reparented-commit", "git.integration.committed"),
           taskId: "task-2"
@@ -1097,9 +1189,11 @@ describe("typed Git fact storage", () => {
       store.putGitSubmission(gitSubmission({ status: "queued" }));
 
       expect(() => store.commitIntegratedTask({
+        companyId: "company",
         attempt: {
           ...originalAttempt,
           submissionRevision: 2,
+          candidateCommit: "c".repeat(40),
           status: "committed"
         },
         submission: gitSubmission({
@@ -1107,6 +1201,8 @@ describe("typed Git fact storage", () => {
           status: "integrated"
         }),
         task: task("completed"),
+        run: gitRun({ integrationCommit: "c".repeat(40) }),
+        integrationWorkspace: integrationWorkspace("c".repeat(40)),
         events: [event("revised-commit", "git.integration.committed")]
       })).toThrow("immutable");
 
@@ -1138,6 +1234,7 @@ describe("typed Git fact storage", () => {
       store.putValidationRun(linkedValidation);
 
       expect(() => store.commitIntegratedTask({
+        companyId: "company",
         attempt: {
           ...originalAttempt,
           status: "committed",
@@ -1145,6 +1242,8 @@ describe("typed Git fact storage", () => {
         },
         submission: gitSubmission({ status: "integrated" }),
         task: task("completed"),
+        run: gitRun({ integrationCommit: "c".repeat(40) }),
+        integrationWorkspace: integrationWorkspace("c".repeat(40)),
         events: [
           event("integration-commit", "git.integration.committed"),
           {

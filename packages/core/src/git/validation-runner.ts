@@ -931,8 +931,30 @@ export class ValidationRunner {
         || attempt.taskId !== scope.taskId) {
         throw new Error("validation scope integration attempt ownership does not match");
       }
-      if (workspace.kind !== "candidate" || workspace.taskId !== null) {
-        throw new Error("integration validation requires a candidate workspace");
+      const expectedHead = attempt.candidateCommit
+        ?? attempt.expectedOldCommit;
+      const exactCandidates = this.#store.listGitWorkspaces(scope.runId).filter(
+        (candidate) => candidate.kind === "candidate"
+          && candidate.runId === attempt.runId
+          && candidate.taskId === null
+          && candidate.employeeId === null
+          && candidate.status === "active"
+          && candidate.branchRef === attempt.candidateRef
+          && candidate.baseCommit === attempt.expectedOldCommit
+          && candidate.headCommit === expectedHead
+      );
+      if (exactCandidates.length !== 1
+        || exactCandidates[0]?.workspaceId !== workspace.workspaceId
+        || workspace.kind !== "candidate"
+        || workspace.taskId !== null
+        || workspace.employeeId !== null
+        || workspace.status !== "active"
+        || workspace.branchRef !== attempt.candidateRef
+        || workspace.baseCommit !== attempt.expectedOldCommit
+        || workspace.headCommit !== expectedHead) {
+        throw new Error(
+          "integration validation candidate workspace does not match attempt"
+        );
       }
     }
     this.#assertCompanyBinding(scope.runId);
