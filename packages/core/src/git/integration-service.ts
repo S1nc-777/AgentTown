@@ -151,6 +151,8 @@ export class IntegrationService {
         .listGitSubmissions(this.#runId, candidate.taskId)
         .at(-1);
       if (submission?.status !== "queued") continue;
+      const existing = this.#existingAttemptResult(submission);
+      if (existing !== null) return existing;
       if (candidate.task.dependencies.some((dependencyId) =>
         this.#store.getTask(this.#companyId, dependencyId)?.status !== "completed"
       )) {
@@ -170,6 +172,8 @@ export class IntegrationService {
   }
 
   async integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
+    const existing = this.#existingAttemptResult(submission);
+    if (existing !== null) return existing;
     await this.enqueue(submission);
     const bound = this.#bindApprovedSubmission(submission);
     const selected = this.#select(bound.submission);
@@ -461,6 +465,133 @@ export class IntegrationService {
       throw new Error("integration company or run binding is not active");
     }
     return run;
+  }
+
+  #existingAttemptResult(
+    submission: GitSubmissionRecord
+  ): IntegrationResult | null {
+    const run = this.#bindRun();
+    if (submission.runId !== this.#runId
+      || !Number.isSafeInteger(submission.revision)
+      || submission.revision < 1) {
+      throw new Error("integration submission identity does not match run");
+    }
+    const taskAttempts = this.#store.listIntegrationAttempts(
+      this.#runId,
+      submission.taskId
+    );
+    if (taskAttempts.some((attempt) =>
+      attempt.runId !== this.#runId
+      || attempt.taskId !== submission.taskId
+    )) {
+      throw new Error("integration attempt identity does not match lookup");
+    }
+    const attempts = taskAttempts.filter(
+      ({ submissionRevision }) => submissionRevision === submission.revision
+    );
+    if (attempts.length === 0) return null;
+    if (attempts.length !== 1) {
+      throw new Error("integration attempt identity is not unique");
+    }
+    const attempt = attempts[0]!;
+    const task = this.#store.getTask(this.#companyId, submission.taskId);
+    const durableSubmission = this.#store.getGitSubmission(
+      this.#runId,
+      submission.taskId,
+      submission.revision
+    );
+    const latest = this.#store
+      .listGitSubmissions(this.#runId, submission.taskId)
+      .at(-1);
+    const ordered = this.#orderedTasks().find(
+      ({ taskId }) => taskId === submission.taskId
+    );
+    if (attempt.runId !== this.#runId
+      || attempt.taskId !== submission.taskId
+      || attempt.submissionRevision !== submission.revision
+      || attempt.candidateRef
+        !== candidateRef(this.#runId, attempt.attemptId)
+      || ordered === undefined
+      || attempt.orderKey !== this.#orderKey(ordered)
+      || task === null
+      || durableSubmission === null
+      || latest?.revision !== submission.revision
+      || durableSubmission.runId !== submission.runId
+      || durableSubmission.taskId !== submission.taskId
+      || JSON.stringify(durableSubmission.submission)
+        !== JSON.stringify(submission.submission)) {
+      throw new Error("integration attempt facts do not match submission");
+    }
+    if (attempt.status === "committed") {
+      const integrationWorkspaces = this.#store.listGitWorkspaces(
+        this.#runId
+      ).filter((workspace) =>
+        workspace.kind === "integration"
+        && workspace.runId === this.#runId
+        && workspace.taskId === null
+        && workspace.employeeId === null
+        && workspace.status === "active"
+        && workspace.branchRef === run.integrationRef
+      );
+      const workspace = integrationWorkspaces[0];
+      const completedEvent = this.#store.listEvents(0).find(
+        ({ id }) => id === task.updatedEventId
+      );
+      if (attempt.candidateCommit === null
+        || durableSubmission.status !== "integrated"
+        || task.status !== "completed"
+        || run.integrationCommit !== attempt.candidateCommit
+        || integrationWorkspaces.length !== 1
+        || workspace?.workspaceId !== `${this.#runId}:integration`
+        || workspace.baseCommit !== run.baseCommit
+        || workspace.headCommit !== attempt.candidateCommit
+        || completedEvent?.type !== "task.completed"
+        || completedEvent.taskId !== attempt.taskId
+        || completedEvent.payload.attemptId !== attempt.attemptId
+        || completedEvent.payload.runId !== attempt.runId
+        || completedEvent.payload.revision !== attempt.submissionRevision
+        || completedEvent.payload.integrationCommit
+          !== attempt.candidateCommit) {
+        throw new Error("committed integration facts are stale or mismatched");
+      }
+      return { kind: "integrated", attempt };
+    }
+    const decision = this.#store.getReviewDecision(
+      this.#runId,
+      submission.taskId,
+      submission.revision
+    );
+    const reviewPackage = this.#store.getReviewPackage(
+      this.#runId,
+      submission.taskId,
+      submission.revision
+    );
+    if (durableSubmission.status !== "queued"
+      || task.status !== "review"
+      || run.integrationCommit !== attempt.expectedOldCommit
+      || decision?.decision !== "approve"
+      || reviewPackage === null
+      || reviewPackage.status === "tampered"
+      || reviewPackage.status === "deleted"
+      || reviewPackage.manifestHash !== decision.reviewedManifestHash) {
+      throw new Error("integration attempt facts do not match queued review");
+    }
+    switch (attempt.status) {
+      case "prepared":
+      case "aborted":
+        return {
+          kind: "reconciliation_required",
+          attemptId: attempt.attemptId
+        };
+      case "conflicted":
+        return {
+          kind: "conflicted",
+          attempt,
+          files: [...attempt.conflictFiles]
+        };
+      case "validation_failed":
+        return { kind: "validation_failed", attempt };
+    }
   }
 
   #bindApprovedSubmission(

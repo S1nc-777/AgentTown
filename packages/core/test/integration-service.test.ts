@@ -340,6 +340,94 @@ async function realHarness(
   };
 }
 
+function replayService(
+  harness: Awaited<ReturnType<typeof realHarness>>
+): {
+  assertNoMutationCalls(): void;
+  service: IntegrationService;
+} {
+  const calls = {
+    createCandidate: 0,
+    git: 0,
+    removeCandidate: 0,
+    validation: 0
+  };
+  const service = new IntegrationService({
+    store: harness.store,
+    companyId: "company-1",
+    company: harness.company,
+    runId: "run-1",
+    workspaceManager: {
+      createCandidateWorkspace: async () => {
+        calls.createCandidate += 1;
+        throw new Error("replay must not create a candidate");
+      },
+      removeVerifiedWorkspace: async () => {
+        calls.removeCandidate += 1;
+        throw new Error("replay must not remove a candidate");
+      }
+    },
+    validationRunner: {
+      run: async () => {
+        calls.validation += 1;
+        throw new Error("replay must not run validation");
+      }
+    },
+    git: {
+      run: async () => {
+        calls.git += 1;
+        throw new Error("replay must not run Git");
+      }
+    }
+  });
+  return {
+    assertNoMutationCalls: () => {
+      expect(calls).toEqual({
+        createCandidate: 0,
+        git: 0,
+        removeCandidate: 0,
+        validation: 0
+      });
+    },
+    service
+  };
+}
+
+async function formalRef(
+  harness: Awaited<ReturnType<typeof realHarness>>
+): Promise<string> {
+  return (await harness.repo.git([
+    "rev-parse",
+    "refs/heads/agenttown/run-1/integration"
+  ])).stdout.trim();
+}
+
+async function expectReplayIsStable(
+  harness: Awaited<ReturnType<typeof realHarness>>,
+  expected: object,
+  options: { drain?: boolean } = { drain: true }
+): Promise<void> {
+  const beforeAttempts = harness.store.listIntegrationAttempts("run-1");
+  const beforeValidationCount = harness.store
+    .listValidationRuns("run-1", "task-a").length;
+  const beforeRef = await formalRef(harness);
+  const replay = replayService(harness);
+
+  await expect(replay.service.integrate(harness.approved)).resolves.toEqual(
+    expected
+  );
+  if (options.drain !== false) {
+    await expect(replay.service.drain()).resolves.toEqual(expected);
+  }
+
+  expect(harness.store.listIntegrationAttempts("run-1"))
+    .toEqual(beforeAttempts);
+  expect(harness.store.listValidationRuns("run-1", "task-a"))
+    .toHaveLength(beforeValidationCount);
+  expect(await formalRef(harness)).toBe(beforeRef);
+  replay.assertNoMutationCalls();
+}
+
 describe("IntegrationService", () => {
   it("orders ready submissions by DAG layer, creation sequence, then task id", () => {
     expect(orderIntegrations([
@@ -476,6 +564,18 @@ describe("IntegrationService", () => {
       attempt.candidateRef
     ], [0, 1])).exitCode).toBe(1);
     expect(throwingListener).toHaveBeenCalled();
+    await expectReplayIsStable(harness, {
+      kind: "integrated",
+      attempt
+    }, { drain: false });
+    harness.store.putGitWorkspace({
+      ...integration!,
+      headCommit: harness.oldCommit
+    });
+    const staleReplay = replayService(harness);
+    await expect(staleReplay.service.integrate(harness.approved))
+      .rejects.toThrow("committed integration facts");
+    staleReplay.assertNoMutationCalls();
   }, 20_000);
 
   it("keeps the formal ref and worktree unchanged when candidate validation fails", async () => {
@@ -508,6 +608,10 @@ describe("IntegrationService", () => {
     expect(harness.store.getTask("company-1", "task-a")?.status).toBe("review");
     expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.status)
       .toBe("queued");
+    await expectReplayIsStable(harness, {
+      kind: "validation_failed",
+      attempt
+    });
   }, 20_000);
 
   it("runs every configured integration command even after a non-passed result", async () => {
@@ -565,6 +669,15 @@ describe("IntegrationService", () => {
       "HEAD"
     ])).stdout.trim()).toBe(harness.oldCommit);
     expect(harness.store.getTask("company-1", "task-a")?.status).toBe("review");
+    const attempt = (result as {
+      kind: "conflicted";
+      attempt: IntegrationAttemptRecord;
+    }).attempt;
+    await expectReplayIsStable(harness, {
+      kind: "conflicted",
+      attempt,
+      files: ["shared.txt"]
+    });
   }, 20_000);
 
   it("does not retry a compare-and-swap mismatch and leaves a prepared recovery intent", async () => {
@@ -608,6 +721,56 @@ describe("IntegrationService", () => {
     expect(harness.store.getGitRun("run-1")?.integrationCommit)
       .toBe(harness.oldCommit);
     expect(harness.store.getTask("company-1", "task-a")?.status).toBe("review");
+    await expectReplayIsStable(harness, {
+      kind: "reconciliation_required",
+      attemptId: attempt.attemptId
+    });
+    const aborted = {
+      ...attempt,
+      status: "aborted" as const
+    };
+    harness.store.commitIntegrationAttemptOutcome({
+      attempt: aborted,
+      event: event("git.integration.aborted", attempt.taskId)
+    });
+    await expectReplayIsStable(harness, {
+      kind: "reconciliation_required",
+      attemptId: attempt.attemptId
+    });
+  }, 20_000);
+
+  it("fails closed for mismatched or duplicate exact attempts", async () => {
+    const stop = new Error("afterPrepared crash");
+    let harness!: Awaited<ReturnType<typeof realHarness>>;
+    harness = await realHarness({
+      faultHooks: { afterPrepared: () => { throw stop; } }
+    });
+    await expect(harness.service.integrate(harness.approved)).rejects.toBe(stop);
+    const attempt = harness.store.listIntegrationAttempts("run-1")[0]!;
+    const mismatched = {
+      ...attempt,
+      expectedOldCommit: "f".repeat(40)
+    };
+    harness.store.putIntegrationAttempt(mismatched);
+    const mismatchedReplay = replayService(harness);
+
+    await expect(mismatchedReplay.service.integrate(harness.approved))
+      .rejects.toThrow("attempt facts do not match");
+    mismatchedReplay.assertNoMutationCalls();
+
+    harness.store.putIntegrationAttempt(attempt);
+    harness.store.putIntegrationAttempt({
+      ...attempt,
+      attemptId: "attempt-duplicate",
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-duplicate"
+    });
+    const duplicateReplay = replayService(harness);
+    await expect(duplicateReplay.service.integrate(harness.approved))
+      .rejects.toThrow("attempt identity is not unique");
+    await expect(duplicateReplay.service.drain())
+      .rejects.toThrow("attempt identity is not unique");
+    expect(harness.store.listIntegrationAttempts("run-1")).toHaveLength(2);
+    duplicateReplay.assertNoMutationCalls();
   }, 20_000);
 
   it("rolls back every SQLite fact when the final fact transaction fails", async () => {
@@ -640,6 +803,10 @@ describe("IntegrationService", () => {
       ({ type }) => type === "git.integration.committed"
         || type === "task.completed"
     )).toBe(false);
+    await expectReplayIsStable(harness, {
+      kind: "reconciliation_required",
+      attemptId: attempt.attemptId
+    });
   }, 20_000);
 
   it("persists prepared intent before any candidate mutation and survives afterPrepared", async () => {
@@ -668,6 +835,11 @@ describe("IntegrationService", () => {
       kind: "reconciliation_required",
       attemptId: harness.store.listIntegrationAttempts("run-1")[0]!.attemptId
     }]);
+    const attempt = harness.store.listIntegrationAttempts("run-1")[0]!;
+    await expectReplayIsStable(harness, {
+      kind: "reconciliation_required",
+      attemptId: attempt.attemptId
+    });
   }, 20_000);
 
   it("leaves old durable facts and a new ref when afterRefUpdated crashes", async () => {
@@ -689,6 +861,10 @@ describe("IntegrationService", () => {
     ])).stdout.trim()).toBe(attempt.candidateCommit);
     expect(harness.store.getGitRun("run-1")?.integrationCommit)
       .toBe(harness.oldCommit);
+    await expectReplayIsStable(harness, {
+      kind: "reconciliation_required",
+      attemptId: attempt.attemptId
+    });
   }, 20_000);
 
   it("leaves exact new Git state and old durable facts when beforeFactsCommitted crashes", async () => {
@@ -721,6 +897,10 @@ describe("IntegrationService", () => {
     expect(harness.store.getGitRun("run-1")?.integrationCommit)
       .toBe(harness.oldCommit);
     expect(integration.headCommit).toBe(harness.oldCommit);
+    await expectReplayIsStable(harness, {
+      kind: "reconciliation_required",
+      attemptId: attempt.attemptId
+    });
   }, 20_000);
 
   it("sets GIT_EDITOR=true for every cherry-pick mutation", async () => {

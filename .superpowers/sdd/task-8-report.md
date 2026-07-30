@@ -52,6 +52,12 @@ were not implemented or changed.
   than force-deleted.
 - Added `afterPrepared`, `afterRefUpdated`, and `beforeFactsCommitted` crash
   hooks. Prepared facts retain enough old/new SHA evidence for Task 10.
+- Added an exact durable-attempt gate to both direct integration and queue
+  draining before enqueue, UUID allocation, workspace inspection, Git,
+  validation, or cleanup. Prepared and aborted attempts require
+  reconciliation; conflicted, validation-failed, and exactly committed
+  attempts return their durable result idempotently. Ambiguous or mismatched
+  attempt identities fail closed.
 - Wired approved Git reviews through coordinator `enqueue` then `drain`, while
   leaving the optional boundary absent for existing P1A/Fake workflow callers.
 - Extended ValidationRunner's existing exact scope rules so an attempt-bound
@@ -138,7 +144,35 @@ were upgraded to the real approved → queued → prepared → validated lifecyc
 and immutable-attempt error ordering was retained. The storage suite passed
 30/30.
 
-Final focused behavior is included in the 170-test relevant-suite run below.
+Final focused behavior is included in the 171-test relevant-suite run below.
+
+### Second-review replay gate RED/GREEN
+
+The Critical replay finding was reproduced by extending the existing real-Git
+tests rather than constructing synthetic success paths:
+
+- the focused suite failed 8/20;
+- committed replay was rejected at enqueue because the durable submission was
+  already integrated;
+- validation failure, conflict, CAS mismatch, final fact rollback, and all
+  three crash windows reached the poison Git runner on their second call.
+
+A separate mismatched-attempt test failed because replay again reached the
+poison Git runner instead of rejecting the stale expected-old SHA. After adding
+the single pre-mutation durable-attempt gate, the focused suite passed 21/21.
+
+Every requested replay window now invokes both direct `integrate()` and
+`drain()` where a queued submission remains. Assertions prove:
+
+- attempt and validation counts do not increase;
+- candidate creation/removal, Git, and validation receive zero replay calls;
+- the formal ref does not change again;
+- prepared windows and aborted attempts return reconciliation-required;
+- conflict and validation failure return the existing durable attempt;
+- committed replay returns integrated only after exact durable
+  submission/task/run/workspace/completion-event rebinding;
+- duplicate exact attempts, tampered attempt facts, and tampered committed
+  facts fail closed without choosing a latest attempt.
 
 ## Verification
 
@@ -149,7 +183,7 @@ pnpm exec vitest run test/integration-service.test.ts test/storage-migrations.te
 ```
 
 - 9 files passed;
-- 170 tests passed;
+- 171 tests passed;
 - 0 failed;
 - all real-Git suites ran serially with one worker.
 
@@ -157,8 +191,9 @@ An earlier wider run exposed four legacy CoreStore error-order regressions and
 one ValidationRunner error-order regression. Strict Task 8 status validation
 was scoped to the new strict bundle, and missing-attempt ownership was restored
 ahead of candidate-kind validation. The two directly affected suites then
-passed 52/52 before the initial 165/165 run. After the independent-review fixes,
-the storage suite passed 30/30 and the final wider run passed 170/170.
+passed 52/52 before the initial 165/165 run. After the first independent-review
+fixes, the storage suite passed 30/30 and the wider run passed 170/170. After
+the replay gate, the final wider run passed 171/171.
 
 ### P1A gate
 
@@ -191,6 +226,12 @@ Node's experimental SQLite warning is expected and pre-existing.
 - Confirmed enqueue durably changes only the exact latest approved review to
   queued, emits one identity-bound queue event, and remains idempotent while
   an earlier same-layer task blocks selection.
+- Confirmed a durable attempt for the exact run/task/revision prevents all
+  second-attempt and Git activity across conflict, validation failure, CAS
+  mismatch, final transaction rollback, and every crash hook.
+- Confirmed committed replay requires exact integrated submission, completed
+  task/completion event, run SHA, and unique formal workspace facts; it does not
+  infer success from attempt status alone.
 - Confirmed task order never trusts mutable timestamps or Agent text; only the
   immutable task-created event sequence is used.
 - Confirmed candidate commands use only the verified candidate path and
