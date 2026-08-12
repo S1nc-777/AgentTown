@@ -1299,6 +1299,38 @@ export class CoreStore {
     }));
   }
 
+  getApproval(approvalId: string): ApprovalRecord | null {
+    const row = this.#database.prepare(`
+      SELECT id, company_id, task_id, status, request_json,
+             decision_json, created_at, decided_at
+      FROM approvals
+      WHERE id = ?
+    `).get(approvalId) as DatabaseRow | undefined;
+    if (row === undefined) return null;
+    return {
+      id: readString(row, "id"),
+      companyId: readString(row, "company_id"),
+      taskId: readNullableString(row, "task_id"),
+      status: readEnum(
+        readString(row, "status"),
+        ["pending", "approved", "rejected"],
+        "approval status"
+      ),
+      request: parseJsonObject<Record<string, unknown>>(
+        readString(row, "request_json"),
+        "approval request"
+      ),
+      decision: readNullableString(row, "decision_json") === null
+        ? null
+        : parseJsonObject<Record<string, unknown>>(
+            readString(row, "decision_json"),
+            "approval decision"
+          ),
+      createdAt: readString(row, "created_at"),
+      decidedAt: readNullableString(row, "decided_at")
+    };
+  }
+
   commitApprovalRequest(input: {
     approval: ApprovalRecord;
     event: NewEvent;
@@ -1309,7 +1341,11 @@ export class CoreStore {
       || input.event.type !== "user.approval.requested"
       || input.event.actorId !== "core"
       || input.event.taskId !== input.approval.taskId
-      || input.event.payload.approvalId !== input.approval.id) {
+      || input.event.causationEventId !== null
+      || !jsonValuesEqual(input.event.payload, {
+        approvalId: input.approval.id,
+        ...input.approval.request
+      })) {
       throw new Error("approval request bundle is invalid");
     }
     const inserted = this.inTransaction(() => {

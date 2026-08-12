@@ -199,7 +199,7 @@ export class IntegrationService {
         }
         if (linkedConflicts.length === 1) continue;
       }
-      const existing = this.#existingAttemptResult(submission);
+      const existing = await this.#existingAttemptResult(submission);
       if (existing !== null) return existing;
       if (candidate.task.dependencies.some((dependencyId) =>
         this.#store.getTask(this.#companyId, dependencyId)?.status !== "completed"
@@ -220,7 +220,7 @@ export class IntegrationService {
   }
 
   async integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
-    const existing = this.#existingAttemptResult(submission);
+    const existing = await this.#existingAttemptResult(submission);
     if (existing !== null) return existing;
     await this.#assertResolutionSupersession(submission);
     await this.enqueue(submission);
@@ -534,9 +534,9 @@ export class IntegrationService {
     return run;
   }
 
-  #existingAttemptResult(
+  async #existingAttemptResult(
     submission: GitSubmissionRecord
-  ): IntegrationResult | null {
+  ): Promise<IntegrationResult | null> {
     const run = this.#bindRun();
     if (submission.runId !== this.#runId
       || !Number.isSafeInteger(submission.revision)
@@ -721,6 +721,9 @@ export class IntegrationService {
         };
       case "conflicted":
         if (task.conflictForTaskId !== null) {
+          await this.#requiredConflictService().recordResolutionConflict(
+            attempt
+          );
           return {
             kind: "reconciliation_required",
             attemptId: attempt.attemptId

@@ -113,3 +113,34 @@ Review-fix evidence:
 - Runtime contract: 3 files, 30 tests passed.
 - P1A E2E: 2 files, 9 tests passed.
 - Root typecheck and `git diff --check`: passed.
+
+## Terminal approval repair review pass
+
+- The existing-attempt gate is now asynchronous for terminal resolution
+  conflicts and invokes the same strict, idempotent approval-fact ensure path.
+  If Git conflict capture and candidate cleanup completed but the approval
+  transaction crashed, a later `integrate`/`drain` call creates only the missing
+  deterministic approval and authenticated event. It does not rerun candidate
+  creation, validation, cleanup, or mutate the terminal attempt/ref.
+- Existing approvals are accepted only with exact company/task/status/request/
+  decision facts and one exact Core event. Forged request or event identity
+  fails closed; correct replay creates no duplicate approval/event.
+- Resolution conflict recording now binds the attempt to the current run's
+  unique task/revision attempt list, latest queued resolution and exact
+  supersession chain, current formal old commit, deterministic candidate ref,
+  and verified missing candidate workspace/ref. Foreign run or candidate facts
+  cannot create approval/event records.
+
+Third-pass evidence:
+
+- Focused ConflictService: 1 file, 14 tests passed.
+- Required serial gate: 3 files, 53 tests passed.
+- Affected combined gate: 181 of 183 tests passed. The two failures were the
+  existing Windows fixture issues: redirected-parent cleanup `EPERM` and the
+  historical submission-validator 5-second timeout followed by cleanup
+  `EBUSY`. EvidencePackage standalone then passed 26/26; SubmissionValidator
+  standalone remained 23/24 at the same historical timeout. No timeout, retry,
+  sleep, fixture cleanup, or unrelated production behavior was changed.
+- Runtime contract: 3 files, 30 tests passed.
+- P1A E2E: 2 files, 9 tests passed.
+- Root typecheck and `git diff --check`: passed.

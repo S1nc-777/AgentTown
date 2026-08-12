@@ -783,5 +783,88 @@ describe("ConflictService", () => {
     expect(await integration.integrate(revisedApproved)).toEqual(result);
     expect(harness.store.listIntegrationAttempts("run-1", conflict.id))
       .toEqual(attempts);
+    const beforeForeign = harness.store.listEvents(0);
+    await expect(harness.service.recordResolutionConflict({
+      ...attempts[0]!,
+      runId: "foreign-run"
+    })).rejects.toThrow(/stale|run|conflict/u);
+    await expect(harness.service.recordResolutionConflict({
+      ...attempts[0]!,
+      candidateRef: "refs/heads/agenttown/foreign/candidate/forged"
+    })).rejects.toThrow(/stale|candidate|conflict/u);
+    expect(harness.store.listEvents(0)).toEqual(beforeForeign);
+  }, 40_000);
+
+  it("repairs a missing resolution-conflict approval without replaying Git", async () => {
+    const harness = await conflictHarness();
+    const { approved, conflict, integration } = await reviewedResolution(harness);
+    const formal = harness.store.getGitWorkspace("run-1:integration")!;
+    await harness.repo.write(
+      relative(harness.repo.root, resolve(formal.path, "shared.txt")),
+      "later\n"
+    );
+    await harness.repo.git(["-C", formal.path, "commit", "-am", "advance formal"]);
+    const laterHead = (await harness.repo.git([
+      "-C", formal.path, "rev-parse", "HEAD"
+    ])).stdout.trim();
+    harness.store.putGitRun({
+      ...harness.store.getGitRun("run-1")!,
+      integrationCommit: laterHead,
+      updatedAt: new Date().toISOString()
+    });
+    harness.store.putGitWorkspace({ ...formal, headCommit: laterHead });
+    const originalCommit = harness.store.commitApprovalRequest.bind(harness.store);
+    vi.spyOn(harness.store, "commitApprovalRequest")
+      .mockImplementationOnce(() => {
+        throw new Error("approval commit crash");
+      })
+      .mockImplementation(originalCommit);
+
+    await expect(integration.integrate(approved)).rejects.toThrow(
+      "approval commit crash"
+    );
+    const attempts = harness.store.listIntegrationAttempts("run-1", conflict.id);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.status).toBe("conflicted");
+    expect(harness.store.listPendingApprovals("company-1")).toEqual([]);
+    const createCandidate = vi.spyOn(harness.manager, "createCandidateWorkspace")
+      .mockRejectedValue(new Error("Git replayed"));
+    const removeCandidate = vi.spyOn(harness.manager, "removeVerifiedWorkspace")
+      .mockRejectedValue(new Error("cleanup replayed"));
+
+    await expect(integration.integrate(approved)).resolves.toEqual({
+      kind: "reconciliation_required",
+      attemptId: attempts[0]!.attemptId
+    });
+
+    expect(createCandidate).not.toHaveBeenCalled();
+    expect(removeCandidate).not.toHaveBeenCalled();
+    expect(harness.store.listPendingApprovals("company-1")).toHaveLength(1);
+    const eventsAfterRepair = harness.store.listEvents(0);
+    await integration.integrate(approved);
+    expect(harness.store.listPendingApprovals("company-1")).toHaveLength(1);
+    expect(harness.store.listEvents(0)).toEqual(eventsAfterRepair);
+
+    const attempt = attempts[0]!;
+    const realGetApproval = harness.store.getApproval.bind(harness.store);
+    const approvalId = harness.store.listPendingApprovals("company-1")[0]!.id;
+    vi.spyOn(harness.store, "getApproval").mockImplementation((id) => {
+      const approval = realGetApproval(id);
+      return id === approvalId && approval !== null
+        ? { ...approval, request: { ...approval.request, actualFiles: ["forged"] } }
+        : approval;
+    });
+    await expect(harness.service.recordResolutionConflict(attempt))
+      .rejects.toThrow(/approval replay|stale/u);
+    vi.restoreAllMocks();
+
+    const realEvents = harness.store.listEvents.bind(harness.store);
+    vi.spyOn(harness.store, "listEvents").mockImplementation((after) =>
+      realEvents(after).map((record) => record.payload.approvalId === approvalId
+        ? { ...record, actorId: "forged" }
+        : record)
+    );
+    await expect(harness.service.recordResolutionConflict(attempt))
+      .rejects.toThrow(/approval replay|stale/u);
   }, 40_000);
 });

@@ -16,6 +16,7 @@ import { GitCommandRunner } from "./git-command.js";
 import type {
   CreateTaskWorkspaceInput
 } from "./workspace-manager.js";
+import { candidateRef } from "./workspace-manager.js";
 
 interface ConflictWorkspaceManager {
   createTaskWorkspace(
@@ -273,24 +274,63 @@ export class ConflictService {
     attemptInput: IntegrationAttemptRecord
   ): Promise<void> {
     const bound = await this.#bindResolutionTask(attemptInput.taskId);
+    const run = this.#store.getGitRun(this.#runId);
     const attempt = this.#store.getIntegrationAttempt(attemptInput.attemptId);
+    const matchingAttempts = this.#store.listIntegrationAttempts(
+      this.#runId,
+      attemptInput.taskId
+    ).filter(({ submissionRevision }) =>
+      submissionRevision === attemptInput.submissionRevision
+    );
     const resolutionSubmission = this.#store.getGitSubmission(
       this.#runId,
       attemptInput.taskId,
       attemptInput.submissionRevision
+    );
+    const latestResolution = this.#store.listGitSubmissions(
+      this.#runId,
+      attemptInput.taskId
+    ).at(-1);
+    const candidate = this.#store.getGitWorkspace(
+      `${this.#runId}:candidate:${attemptInput.attemptId}`
     );
     const expectedSupersedes = {
       taskId: bound.original.id,
       revision: bound.submission.revision,
       attemptId: bound.attempt.attemptId
     };
-    if (attempt === null
+    if (run === null
+      || run.companyId !== this.#companyId
+      || run.status !== "active"
+      || attemptInput.runId !== this.#runId
+      || attemptInput.expectedOldCommit !== run.integrationCommit
+      || attemptInput.candidateRef
+        !== candidateRef(this.#runId, attemptInput.attemptId)
+      || matchingAttempts.length !== 1
+      || attempt === null
       || !sameJson(attempt, attemptInput)
       || attempt.status !== "conflicted"
+      || attempt.conflictFiles.length === 0
       || resolutionSubmission === null
       || resolutionSubmission.status !== "queued"
+      || latestResolution === undefined
+      || latestResolution.revision !== resolutionSubmission.revision
       || !sameJson(resolutionSubmission.supersedes, expectedSupersedes)) {
       throw new Error("resolution integration conflict facts are stale");
+    }
+    if (candidate === null
+      || candidate.runId !== this.#runId
+      || candidate.workspaceId
+        !== `${this.#runId}:candidate:${attempt.attemptId}`
+      || candidate.kind !== "candidate"
+      || candidate.taskId !== null
+      || candidate.employeeId !== null
+      || candidate.status !== "missing"
+      || candidate.branchRef !== attempt.candidateRef
+      || candidate.baseCommit !== attempt.expectedOldCommit
+      || candidate.headCommit !== attempt.expectedOldCommit
+      || await this.#readRef(run.projectRoot, attempt.candidateRef) !== null) {
+      throw new Error("resolution conflict candidate cleanup is stale");
     }
     const approvalId = [
       "resolution-conflict",
@@ -314,12 +354,27 @@ export class ConflictService {
       question: "Should the repeated resolution conflict be reviewed?",
       options: ["review_changed_scope", "stop_task"]
     };
-    const existing = this.#store.listPendingApprovals(this.#companyId).find(
-      ({ id }) => id === approvalId
-    );
-    if (existing !== undefined) {
-      if (existing.taskId !== bound.conflict.id
-        || !sameJson(existing.request, request)) {
+    const existing = this.#store.getApproval(approvalId);
+    if (existing !== null) {
+      const approvalEvents = this.#store.listEvents(0).filter((event) =>
+        event.type === "user.approval.requested"
+        && event.payload.approvalId === approvalId
+      );
+      const approvalEvent = approvalEvents[0];
+      if (existing.companyId !== this.#companyId
+        || existing.taskId !== bound.conflict.id
+        || existing.status !== "pending"
+        || existing.decision !== null
+        || existing.decidedAt !== null
+        || !sameJson(existing.request, request)
+        || approvalEvents.length !== 1
+        || approvalEvent?.actorId !== "core"
+        || approvalEvent.taskId !== bound.conflict.id
+        || approvalEvent.causationEventId !== null
+        || !sameJson(approvalEvent.payload, {
+          approvalId,
+          ...request
+        })) {
         throw new Error("resolution conflict approval replay is stale");
       }
       return;
