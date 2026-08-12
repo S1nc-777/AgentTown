@@ -269,6 +269,81 @@ export class ConflictService {
     };
   }
 
+  async recordResolutionConflict(
+    attemptInput: IntegrationAttemptRecord
+  ): Promise<void> {
+    const bound = await this.#bindResolutionTask(attemptInput.taskId);
+    const attempt = this.#store.getIntegrationAttempt(attemptInput.attemptId);
+    const resolutionSubmission = this.#store.getGitSubmission(
+      this.#runId,
+      attemptInput.taskId,
+      attemptInput.submissionRevision
+    );
+    const expectedSupersedes = {
+      taskId: bound.original.id,
+      revision: bound.submission.revision,
+      attemptId: bound.attempt.attemptId
+    };
+    if (attempt === null
+      || !sameJson(attempt, attemptInput)
+      || attempt.status !== "conflicted"
+      || resolutionSubmission === null
+      || resolutionSubmission.status !== "queued"
+      || !sameJson(resolutionSubmission.supersedes, expectedSupersedes)) {
+      throw new Error("resolution integration conflict facts are stale");
+    }
+    const approvalId = [
+      "resolution-conflict",
+      this.#companyId,
+      this.#runId,
+      bound.conflict.id,
+      String(resolutionSubmission.revision)
+    ].join(":");
+    const request = {
+      reason: "resolution_integration_conflicted",
+      runId: this.#runId,
+      taskId: bound.conflict.id,
+      originalTaskId: bound.original.id,
+      attemptId: attempt.attemptId,
+      expectedFiles: [...bound.attempt.conflictFiles],
+      actualFiles: [...attempt.conflictFiles],
+      operation: `review repeated resolution conflict for ${bound.conflict.id}`,
+      impact: "The reviewed resolution conflicted during final integration.",
+      alternatives: ["review_changed_scope", "stop_task"],
+      consequenceOfNonApproval: "The resolution remains queued and blocked from retry.",
+      question: "Should the repeated resolution conflict be reviewed?",
+      options: ["review_changed_scope", "stop_task"]
+    };
+    const existing = this.#store.listPendingApprovals(this.#companyId).find(
+      ({ id }) => id === approvalId
+    );
+    if (existing !== undefined) {
+      if (existing.taskId !== bound.conflict.id
+        || !sameJson(existing.request, request)) {
+        throw new Error("resolution conflict approval replay is stale");
+      }
+      return;
+    }
+    const createdAt = new Date().toISOString();
+    const approval: ApprovalRecord = {
+      id: approvalId,
+      companyId: this.#companyId,
+      taskId: bound.conflict.id,
+      status: "pending",
+      request,
+      decision: null,
+      createdAt,
+      decidedAt: null
+    };
+    this.#store.commitApprovalRequest({
+      approval,
+      event: this.#event("user.approval.requested", bound.conflict.id, {
+        approvalId: approval.id,
+        ...approval.request
+      })
+    });
+  }
+
   async completeResolution(input: CompleteResolutionInput): Promise<void> {
     // The integration ref and formal worktree have already advanced under CAS
     // when this final durable commit is invoked. Re-bind the immutable Core

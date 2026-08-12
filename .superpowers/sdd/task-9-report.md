@@ -83,3 +83,33 @@ constructors. No unresolved Task 9 correctness issue found.
   standalone. No timeout, retry, sleep, cleanup implementation, or historical
   fixture was changed, as required.
 - Task 10 restart reconciliation is intentionally not implemented.
+
+## Independent review fix pass
+
+Resolved four Important findings in a second TDD pass:
+
+- Resolution submissions that conflict again now preserve the new attempt as
+  terminal `conflicted`, clean the verified candidate, create one deterministic
+  pending user-review request containing the original and authoritative new
+  conflict sets, and return `reconciliation_required`. They never create a
+  nested conflict task. Replay returns the same attempt without running Git or
+  producing another approval.
+- Review-start, review-decision, queue, and prepared-integration bundles now
+  compare the complete immutable submission record (normalizing only the exact
+  status transition) so callers cannot clear or replace `supersedes`.
+- Resolution completion now binds submission run/task/revision directly to the
+  attempt, compares the complete durable submission record, and requires an
+  exact active formal integration-workspace record with null task/employee
+  ownership and the expected advanced head.
+- Conflict creation now authenticates exactly two distinct Core events, their
+  types, task identities, null causation, event-ID links, and exact payloads.
+  Omitted, extra, duplicate-ID, and forged-payload bundles roll back.
+
+Review-fix evidence:
+
+- Focused four-file gate: 4 files, 61 tests passed.
+- Required serial gate: 3 files, 52 tests passed.
+- Directly affected serial gate: 8 files, 183 tests passed.
+- Runtime contract: 3 files, 30 tests passed.
+- P1A E2E: 2 files, 9 tests passed.
+- Root typecheck and `git diff --check`: passed.

@@ -367,6 +367,18 @@ describe("ReviewService", () => {
         ...submission,
         status: "changes_requested"
       })
+    },
+    {
+      label: "forged supersession metadata",
+      mutate: (submission: GitSubmissionRecord): GitSubmissionRecord => ({
+        ...submission,
+        status: "approved",
+        supersedes: {
+          taskId: "original-task",
+          revision: 1,
+          attemptId: "attempt-original"
+        }
+      })
     }
   ])("atomically rejects $label in direct review commits", ({ mutate }) => {
     const { packageRecord, store, tasks } = createHarness();

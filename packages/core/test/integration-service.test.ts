@@ -1051,6 +1051,53 @@ describe("IntegrationService", () => {
     )).toBe(false);
   }, 20_000);
 
+  it("rejects forged supersession at queue and prepared bundle boundaries", async () => {
+    const harness = await realHarness();
+    const forged = {
+      taskId: "original-task",
+      revision: 1,
+      attemptId: "attempt-original"
+    };
+    expect(() => harness.store.commitQueuedIntegration({
+      companyId: "company-1",
+      submission: { ...harness.approved, status: "queued", supersedes: forged },
+      event: {
+        ...event("integration.queued", "task-a"),
+        payload: { runId: "run-1", revision: 1 }
+      }
+    })).toThrow(/stale|mismatch/u);
+    harness.store.commitQueuedIntegration({
+      companyId: "company-1",
+      submission: { ...harness.approved, status: "queued" },
+      event: {
+        ...event("integration.queued", "task-a"),
+        payload: { runId: "run-1", revision: 1 }
+      }
+    });
+    const attempt: IntegrationAttemptRecord = {
+      attemptId: "attempt-supersedes-forged",
+      runId: "run-1",
+      taskId: "task-a",
+      submissionRevision: 1,
+      orderKey: "00000000:00000000000000000001:task-a",
+      expectedOldCommit: harness.oldCommit,
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-supersedes-forged",
+      candidateCommit: null,
+      status: "prepared",
+      conflictFiles: [],
+      validationRunIds: []
+    };
+    expect(() => harness.store.commitPreparedIntegration({
+      companyId: "company-1",
+      attempt,
+      submission: { ...harness.approved, status: "queued", supersedes: forged },
+      event: event("git.integration.prepared", "task-a")
+    })).toThrow(/stale|mismatch/u);
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId)).toBeNull();
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.supersedes)
+      .toBeNull();
+  }, 20_000);
+
   it("rejects omitted or forged final bundle identities with full transaction rollback", async () => {
     const harness = await realHarness();
     const attempt: IntegrationAttemptRecord = {

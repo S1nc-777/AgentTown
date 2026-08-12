@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import type {
   CompanyDefinition,
   GitSubmissionRecord,
@@ -355,6 +355,39 @@ describe("ConflictService", () => {
     expect(harness.store.listEvents(0)).toEqual(beforeEvents);
   }, 20_000);
 
+  it("rolls back omitted, duplicate, extra, or forged conflict events", async () => {
+    const harness = await conflictHarness();
+    const beforeTasks = harness.store.listTasks("company-1");
+    const beforeEvents = harness.store.listEvents(0);
+    const commit = harness.store.commitConflictTaskCreation.bind(harness.store);
+    let mode: "omitted" | "duplicate" | "extra" | "forged" = "omitted";
+    vi.spyOn(harness.store, "commitConflictTaskCreation").mockImplementation(
+      (input) => {
+        const events = mode === "omitted"
+          ? [input.events[0]]
+          : mode === "duplicate"
+            ? [input.events[0], { ...input.events[1], id: input.events[0].id }]
+            : mode === "extra"
+              ? [...input.events, coreEvent("task.created", input.conflictTask.id)]
+              : [input.events[0], {
+                ...input.events[1],
+                payload: { ...input.events[1].payload, files: ["forged.txt"] }
+              }];
+        commit({
+          ...input,
+          events: events as unknown as typeof input.events
+        });
+      }
+    );
+
+    for (mode of ["omitted", "duplicate", "extra", "forged"] as const) {
+      await expect(harness.service.createTask(harness.attempt)).rejects.toThrow();
+    }
+
+    expect(harness.store.listTasks("company-1")).toEqual(beforeTasks);
+    expect(harness.store.listEvents(0)).toEqual(beforeEvents);
+  }, 20_000);
+
   it("isolates listener failures after the conflict facts commit", async () => {
     const harness = await conflictHarness();
     const listener = vi.fn(() => {
@@ -614,6 +647,21 @@ describe("ConflictService", () => {
     expect(() => harness.store.commitResolvedConflict({
       companyId: "company-1",
       attempt: committedAttempt,
+      submission: { ...integratedSubmission, taskId: "forged-task" },
+      conflictTask: completedConflict,
+      originalAttempt,
+      originalSubmission: supersededSubmission,
+      originalTask: completedOriginal,
+      run: advancedRun,
+      integrationWorkspace: { ...advancedWorkspace, taskId: conflict.id },
+      events: [committedEvent, conflictCompletedEvent, originalCompletedEvent]
+    })).toThrow();
+    expect(harness.store.getGitSubmission("run-1", "forged-task", 1))
+      .toBeNull();
+
+    expect(() => harness.store.commitResolvedConflict({
+      companyId: "company-1",
+      attempt: committedAttempt,
       submission: integratedSubmission,
       conflictTask: completedConflict,
       originalAttempt,
@@ -660,4 +708,80 @@ describe("ConflictService", () => {
     expect(harness.store.getTask("company-1", "task-a")?.status)
       .toBe("blocked");
   }, 30_000);
+
+  it("fails closed with user review when resolution integration conflicts again", async () => {
+    const harness = await conflictHarness();
+    const { approved, conflict, integration } = await reviewedResolution(harness);
+    const resolutionWorkspace = harness.store.listGitWorkspaces("run-1").find(
+      ({ taskId, kind }) => taskId === conflict.id && kind === "task"
+    )!;
+    await harness.repo.write(
+      relative(harness.repo.root, resolve(resolutionWorkspace.path, "other.txt")),
+      "resolution\n"
+    );
+    await harness.repo.git(["-C", resolutionWorkspace.path, "add", "other.txt"]);
+    await harness.repo.git([
+      "-C", resolutionWorkspace.path, "commit", "--amend", "--no-edit"
+    ]);
+    const resolutionHead = (await harness.repo.git([
+      "-C", resolutionWorkspace.path, "rev-parse", "HEAD"
+    ])).stdout.trim();
+    harness.store.putGitWorkspace({
+      ...resolutionWorkspace,
+      headCommit: resolutionHead
+    });
+    const revisedApproved = {
+      ...approved,
+      submission: {
+        ...approved.submission,
+        headCommit: resolutionHead,
+        commits: [resolutionHead]
+      }
+    };
+    harness.store.putGitSubmission(revisedApproved);
+
+    const formal = harness.store.getGitWorkspace("run-1:integration")!;
+    await harness.repo.write(
+      relative(harness.repo.root, resolve(formal.path, "shared.txt")),
+      "later\n"
+    );
+    await harness.repo.write(
+      relative(harness.repo.root, resolve(formal.path, "other.txt")),
+      "formal\n"
+    );
+    await harness.repo.git(["-C", formal.path, "add", "shared.txt", "other.txt"]);
+    await harness.repo.git(["-C", formal.path, "commit", "-m", "advance formal"]);
+    const laterHead = (await harness.repo.git([
+      "-C", formal.path, "rev-parse", "HEAD"
+    ])).stdout.trim();
+    harness.store.putGitRun({
+      ...harness.store.getGitRun("run-1")!,
+      integrationCommit: laterHead,
+      updatedAt: new Date().toISOString()
+    });
+    harness.store.putGitWorkspace({ ...formal, headCommit: laterHead });
+
+    const result = await integration.integrate(revisedApproved);
+
+    expect(result.kind).toBe("reconciliation_required");
+    expect(harness.store.listPendingApprovals("company-1")).toEqual([
+      expect.objectContaining({
+        taskId: conflict.id,
+        request: expect.objectContaining({
+          reason: "resolution_integration_conflicted",
+          expectedFiles: ["shared.txt"],
+          actualFiles: ["other.txt", "shared.txt"]
+        })
+      })
+    ]);
+    expect(harness.store.listTasks("company-1").filter(
+      ({ conflictForTaskId }) => conflictForTaskId === conflict.id
+    )).toEqual([]);
+    const attempts = harness.store.listIntegrationAttempts("run-1", conflict.id);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.status).toBe("conflicted");
+    expect(await integration.integrate(revisedApproved)).toEqual(result);
+    expect(harness.store.listIntegrationAttempts("run-1", conflict.id))
+      .toEqual(attempts);
+  }, 40_000);
 });

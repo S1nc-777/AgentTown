@@ -59,6 +59,9 @@ interface ResolutionConflictService {
     integrationWorkspace: GitWorkspaceRecord;
     events: readonly [NewEvent, NewEvent];
   }): Promise<void>;
+  recordResolutionConflict(
+    attempt: IntegrationAttemptRecord
+  ): Promise<void>;
 }
 
 export interface IntegrationFaultHooks {
@@ -310,6 +313,12 @@ export class IntegrationService {
       try {
         await this.#cleanupCandidate(candidate, actualOldCommit);
       } catch {
+        return { kind: "reconciliation_required", attemptId };
+      }
+      if (bound.task.conflictForTaskId !== null) {
+        await this.#requiredConflictService().recordResolutionConflict(
+          conflicted
+        );
         return { kind: "reconciliation_required", attemptId };
       }
       return { kind: "conflicted", attempt: conflicted, files };
@@ -711,6 +720,12 @@ export class IntegrationService {
           attemptId: attempt.attemptId
         };
       case "conflicted":
+        if (task.conflictForTaskId !== null) {
+          return {
+            kind: "reconciliation_required",
+            attemptId: attempt.attemptId
+          };
+        }
         return {
           kind: "conflicted",
           attempt,

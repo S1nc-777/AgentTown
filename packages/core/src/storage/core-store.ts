@@ -758,8 +758,10 @@ export class CoreStore {
         || input.task.status !== "review"
         || currentSubmission === null || currentSubmission.status !== "validated"
         || currentSubmission.revision !== latest?.revision
-        || JSON.stringify(currentSubmission.submission)
-          !== JSON.stringify(input.submission.submission)
+        || !jsonValuesEqual(currentSubmission, {
+          ...input.submission,
+          status: currentSubmission.status
+        })
         || input.submission.status !== "in_review"
         || reviewPackage === null
         || JSON.stringify(reviewPackage) !== JSON.stringify(input.reviewPackage)
@@ -1199,8 +1201,10 @@ export class CoreStore {
         || currentTask.ownerEmployeeId !== input.task.ownerEmployeeId
         || currentSubmission === null || currentSubmission.status !== "in_review"
         || latest?.revision !== input.submission.revision
-        || JSON.stringify(currentSubmission.submission)
-          !== JSON.stringify(input.submission.submission)
+        || !jsonValuesEqual(currentSubmission, {
+          ...input.submission,
+          status: currentSubmission.status
+        })
         || reviewPackage === null
         || reviewPackage.manifestHash !== input.decision.reviewedManifestHash
         || this.getReviewDecision(
@@ -1441,7 +1445,11 @@ export class CoreStore {
     events: readonly [NewEvent, NewEvent];
   }): void {
     const [blockedEvent, createdEvent] = input.events;
-    if (input.attempt.status !== "conflicted"
+    if (input.events.length !== 2
+      || blockedEvent === undefined
+      || createdEvent === undefined
+      || blockedEvent.id === createdEvent.id
+      || input.attempt.status !== "conflicted"
       || input.attempt.conflictFiles.length === 0
       || input.submission.status !== "queued"
       || input.submission.supersedes !== null
@@ -1460,7 +1468,21 @@ export class CoreStore {
       || blockedEvent.taskId !== input.originalTask.id
       || createdEvent.taskId !== input.conflictTask.id
       || blockedEvent.causationEventId !== null
-      || createdEvent.causationEventId !== null) {
+      || createdEvent.causationEventId !== null
+      || !jsonValuesEqual(blockedEvent.payload, {
+        attemptId: input.attempt.attemptId,
+        runId: input.attempt.runId,
+        revision: input.submission.revision,
+        conflictTaskId: input.conflictTask.id,
+        files: input.attempt.conflictFiles
+      })
+      || !jsonValuesEqual(createdEvent.payload, {
+        attemptId: input.attempt.attemptId,
+        runId: input.attempt.runId,
+        originalTaskId: input.originalTask.id,
+        originalRevision: input.submission.revision,
+        files: input.attempt.conflictFiles
+      })) {
       throw new Error("conflict task creation bundle is invalid");
     }
     const inserted = this.inTransaction(() => {
@@ -1585,8 +1607,10 @@ export class CoreStore {
         || current === null
         || (current.status !== "approved" && current.status !== "queued")
         || latest?.revision !== input.submission.revision
-        || JSON.stringify(current.submission)
-          !== JSON.stringify(input.submission.submission)
+        || !jsonValuesEqual(current, {
+          ...input.submission,
+          status: current.status
+        })
         || decision?.decision !== "approve"
         || reviewPackage === null
         || reviewPackage.manifestHash !== decision.reviewedManifestHash
@@ -1664,8 +1688,7 @@ export class CoreStore {
         || currentSubmission === null
         || currentSubmission.status !== "queued"
         || latest?.revision !== input.attempt.submissionRevision
-        || JSON.stringify(currentSubmission.submission)
-          !== JSON.stringify(input.submission.submission)
+        || !jsonValuesEqual(currentSubmission, input.submission)
         || decision?.decision !== "approve"
         || this.getIntegrationAttempt(input.attempt.attemptId) !== null) {
         throw new Error("prepared integration facts are stale or mismatched");
@@ -1884,6 +1907,9 @@ export class CoreStore {
       = input.events;
     const supersedes = input.submission.supersedes;
     if (supersedes === null
+      || input.submission.runId !== input.attempt.runId
+      || input.submission.taskId !== input.attempt.taskId
+      || input.submission.revision !== input.attempt.submissionRevision
       || supersedes.taskId !== input.originalTask.id
       || supersedes.revision !== input.originalSubmission.revision
       || supersedes.attemptId !== input.originalAttempt.attemptId
@@ -2005,14 +2031,10 @@ export class CoreStore {
         }, currentAttempt)
         || currentSubmission === null
         || currentSubmission.status !== "queued"
-        || !jsonValuesEqual(
-          currentSubmission.submission,
-          input.submission.submission
-        )
-        || !jsonValuesEqual(
-          currentSubmission.supersedes,
-          input.submission.supersedes
-        )
+        || !jsonValuesEqual(currentSubmission, {
+          ...input.submission,
+          status: currentSubmission.status
+        })
         || latestResolution?.revision !== input.submission.revision
         || currentConflict === null
         || currentConflict.status !== "review"
@@ -2038,12 +2060,23 @@ export class CoreStore {
         }, currentOriginal)
         || decision?.decision !== "approve"
         || currentWorkspace === null
+        || input.integrationWorkspace.runId !== input.attempt.runId
+        || input.integrationWorkspace.workspaceId
+          !== `${input.attempt.runId}:integration`
+        || input.integrationWorkspace.taskId !== null
+        || input.integrationWorkspace.employeeId !== null
+        || input.integrationWorkspace.kind !== "integration"
+        || input.integrationWorkspace.status !== "active"
         || currentWorkspace.runId !== currentRun.runId
         || currentWorkspace.kind !== "integration"
         || currentWorkspace.status !== "active"
         || currentWorkspace.branchRef !== currentRun.integrationRef
         || currentWorkspace.headCommit !== input.attempt.expectedOldCommit
         || input.integrationWorkspace.workspaceId !== currentWorkspace.workspaceId
+        || !jsonValuesEqual(input.integrationWorkspace, {
+          ...currentWorkspace,
+          headCommit: input.attempt.candidateCommit
+        })
         || input.integrationWorkspace.path !== currentWorkspace.path
         || input.integrationWorkspace.branchRef !== currentWorkspace.branchRef
         || input.integrationWorkspace.baseCommit !== currentWorkspace.baseCommit

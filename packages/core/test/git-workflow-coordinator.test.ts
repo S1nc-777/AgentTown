@@ -480,6 +480,38 @@ describe("GitWorkflowCoordinator", () => {
 
     expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.supersedes)
       .toEqual(supersedes);
+
+    const reviewed = harness.store.getGitSubmission("run-1", "task-a", 1)!;
+    const packageRecord = harness.store.getReviewPackage("run-1", "task-a", 1)!;
+    const reviewedTask = harness.tasks.get("task-a");
+    harness.store.putGitSubmission({ ...reviewed, status: "validated" });
+    harness.store.putTask("company-1", {
+      ...reviewedTask,
+      status: "running"
+    }, [{
+      id: randomUUID(),
+      type: "fixture.review_start_reset",
+      actorId: "core",
+      taskId: "task-a",
+      causationEventId: null,
+      payload: {}
+    }]);
+    expect(() => harness.store.commitGitSubmissionReviewStart({
+      companyId: "company-1",
+      submission: { ...reviewed, supersedes: null },
+      task: reviewedTask,
+      reviewPackage: packageRecord,
+      events: [{
+        id: randomUUID(),
+        type: "fixture.forged_review_start",
+        actorId: "core",
+        taskId: "task-a",
+        causationEventId: null,
+        payload: {}
+      }]
+    })).toThrow(/stale|mismatch/u);
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.supersedes)
+      .toEqual(supersedes);
   });
 
   it("turns a conflicted drain result into one durable conflict task request", async () => {
