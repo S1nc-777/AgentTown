@@ -119,6 +119,7 @@ beforeEach(async () => {
     reviewLoopCount: 0,
     artifacts: [],
     evidence: [],
+    conflictForTaskId: null,
     createdEventId: "task-created",
     updatedEventId: "task-running"
   }, [{

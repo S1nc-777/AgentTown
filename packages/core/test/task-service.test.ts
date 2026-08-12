@@ -18,7 +18,8 @@ function task(id: string, dependencies: string[]): NewTask {
     retryCount: 0,
     reviewLoopCount: 0,
     artifacts: [],
-    evidence: []
+    evidence: [],
+    conflictForTaskId: null
   };
 }
 
@@ -163,7 +164,8 @@ describe("TaskService", () => {
     expect(service.get("build")).toMatchObject({
       status: "running",
       artifacts: [],
-      evidence: []
+      evidence: [],
+      conflictForTaskId: null
     });
   });
 

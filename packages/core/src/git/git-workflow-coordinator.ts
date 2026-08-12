@@ -63,6 +63,18 @@ interface ApprovedIntegrationService {
   drain(): Promise<IntegrationResult | null>;
 }
 
+interface ConflictWorkflowService {
+  createTask(
+    attempt: Extract<IntegrationResult, { kind: "conflicted" }>["attempt"]
+  ): Promise<TaskRecord>;
+  prepareResolutionWorkspace(input: {
+    taskId: string;
+    actorEmployeeId: string;
+    employeeId: string;
+  }): Promise<GitWorkspaceRecord>;
+  supersessionFor(taskId: string): Promise<GitSubmissionRecord["supersedes"]>;
+}
+
 export interface GitWorkflowCoordinatorOptions {
   store: CoreStore;
   companyId: string;
@@ -75,6 +87,7 @@ export interface GitWorkflowCoordinatorOptions {
   evidenceBuilder: TaskEvidenceBuilder;
   reviewService: TaskReviewService;
   integrationService?: ApprovedIntegrationService;
+  conflictService?: ConflictWorkflowService;
   reviewerIds: ReadonlySet<string>;
   sendMessage(employeeId: string, message: AgentMessage): Promise<void>;
   leaderId?: string;
@@ -145,6 +158,7 @@ export class GitWorkflowCoordinator {
   readonly #evidenceBuilder: TaskEvidenceBuilder;
   readonly #reviewService: TaskReviewService;
   readonly #integrationService: ApprovedIntegrationService | undefined;
+  readonly #conflictService: ConflictWorkflowService | undefined;
   readonly #reviewerIds: ReadonlySet<string>;
   readonly #sendMessage: GitWorkflowCoordinatorOptions["sendMessage"];
   readonly #leaderId: string;
@@ -161,6 +175,7 @@ export class GitWorkflowCoordinator {
     this.#evidenceBuilder = options.evidenceBuilder;
     this.#reviewService = options.reviewService;
     this.#integrationService = options.integrationService;
+    this.#conflictService = options.conflictService;
     this.#reviewerIds = options.reviewerIds;
     this.#sendMessage = options.sendMessage;
     this.#leaderId = options.leaderId ?? this.#deriveLeaderId();
@@ -205,14 +220,24 @@ export class GitWorkflowCoordinator {
       throw new Error("Git task assignment is stale or belongs to another employee");
     }
 
-    let workspace = this.#taskWorkspace(taskId, assigneeId);
-    if (workspace === null) {
-      workspace = await this.#workspaceManager.createTaskWorkspace({
-        runId: this.#runId,
-        employeeId: assigneeId,
+    let workspace: GitWorkspaceRecord;
+    if (before.conflictForTaskId !== null) {
+      if (this.#conflictService === undefined) {
+        throw new Error("conflict workflow service is required");
+      }
+      workspace = await this.#conflictService.prepareResolutionWorkspace({
         taskId,
-        baseCommit: run.integrationCommit
+        actorEmployeeId: action.actorEmployeeId,
+        employeeId: assigneeId
       });
+    } else {
+      workspace = this.#taskWorkspace(taskId, assigneeId)
+        ?? await this.#workspaceManager.createTaskWorkspace({
+          runId: this.#runId,
+          employeeId: assigneeId,
+          taskId,
+          baseCommit: run.integrationCommit
+        });
     }
     this.#assertWorkspace(workspace, taskId, assigneeId);
     const assigned = before.status === "draft"
@@ -380,12 +405,16 @@ export class GitWorkflowCoordinator {
       : await this.#submissionValidator.validate(workspace, parsed);
     const latest = this.#store.listGitSubmissions(this.#runId, taskId).at(-1);
     const revision = (latest?.revision ?? 0) + 1;
+    const supersedes = task.conflictForTaskId === null
+      ? null
+      : await this.#requiredConflictService().supersessionFor(taskId);
     const validatedRecord: GitSubmissionRecord = {
       runId: this.#runId,
       taskId,
       revision,
       submission: parsed,
-      status: "validated"
+      status: "validated",
+      supersedes
     };
     this.#store.commitGitSubmissionCreation({
       submission: validatedRecord,
@@ -485,7 +514,10 @@ export class GitWorkflowCoordinator {
     });
     if (outcome.kind === "approved" && this.#integrationService !== undefined) {
       await this.#integrationService.enqueue(outcome.submission);
-      await this.#integrationService.drain();
+      const integration = await this.#integrationService.drain();
+      if (integration?.kind === "conflicted") {
+        await this.#requiredConflictService().createTask(integration.attempt);
+      }
     }
     return outcome;
   }
@@ -512,6 +544,13 @@ export class GitWorkflowCoordinator {
     const employee = this.#company.employees.find(({ id }) => id === employeeId);
     if (employee === undefined) throw new Error(`unknown employee: ${employeeId}`);
     return employee;
+  }
+
+  #requiredConflictService(): ConflictWorkflowService {
+    if (this.#conflictService === undefined) {
+      throw new Error("conflict workflow service is required");
+    }
+    return this.#conflictService;
   }
 
   #deriveLeaderId(): string {

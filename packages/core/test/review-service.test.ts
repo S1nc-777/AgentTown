@@ -101,7 +101,8 @@ function createHarness(maxReviewLoops: 0 | 1 | 2 = 2): {
     retryCount: 0,
     reviewLoopCount: 0,
     artifacts: [],
-    evidence: []
+    evidence: [],
+    conflictForTaskId: null
   });
   tasks.assign("task-a", "developer");
   tasks.transition("task-a", "running", "developer");
@@ -120,7 +121,8 @@ function createHarness(maxReviewLoops: 0 | 1 | 2 = 2): {
       reportedResults: [],
       knownRisks: []
     },
-    status: "in_review"
+    status: "in_review",
+    supersedes: null
   };
   store.putGitSubmission(submission);
   const packageRecord: ReviewPackageRecord = {

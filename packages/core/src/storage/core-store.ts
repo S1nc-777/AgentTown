@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
-  parseGitTaskSubmission,
+  parseGitSubmissionRecord as parseContractGitSubmissionRecord,
   parseReviewDecision,
+  parseTaskRecord,
   validationCommandSchema,
   type CompanyDefinition,
   type GitSubmissionRecord,
@@ -142,21 +143,7 @@ function readEnum<T extends string>(
 }
 
 function parseGitSubmissionRecord(json: string): GitSubmissionRecord {
-  const value = parseJsonObject<DatabaseRow>(json, "Git submission");
-  return {
-    runId: readObjectString(value, "runId", "Git submission"),
-    taskId: readObjectString(value, "taskId", "Git submission"),
-    revision: readObjectNumber(value, "revision", "Git submission"),
-    submission: parseGitTaskSubmission(value.submission),
-    status: readEnum(
-      readObjectString(value, "status", "Git submission"),
-      [
-        "received", "validated", "rejected", "in_review", "approved",
-        "changes_requested", "queued", "integrated"
-      ],
-      "Git submission status"
-    )
-  };
+  return parseContractGitSubmissionRecord(JSON.parse(json));
 }
 
 function parseValidationCommandGrant(json: string): ValidationCommandGrant {
@@ -1308,6 +1295,65 @@ export class CoreStore {
     }));
   }
 
+  commitApprovalRequest(input: {
+    approval: ApprovalRecord;
+    event: NewEvent;
+  }): ApprovalRecord {
+    if (input.approval.status !== "pending"
+      || input.approval.decision !== null
+      || input.approval.decidedAt !== null
+      || input.event.type !== "user.approval.requested"
+      || input.event.actorId !== "core"
+      || input.event.taskId !== input.approval.taskId
+      || input.event.payload.approvalId !== input.approval.id) {
+      throw new Error("approval request bundle is invalid");
+    }
+    const inserted = this.inTransaction(() => {
+      const company = this.getCompany(input.approval.companyId);
+      const existing = this.#database.prepare(`
+        SELECT id, company_id, task_id, status, request_json,
+               decision_json, created_at, decided_at
+        FROM approvals
+        WHERE id = ?
+      `).get(input.approval.id) as DatabaseRow | undefined;
+      if (company === null) {
+        throw new Error("approval request company does not exist");
+      }
+      if (existing !== undefined) {
+        const same = readString(existing, "company_id")
+            === input.approval.companyId
+          && readNullableString(existing, "task_id") === input.approval.taskId
+          && readString(existing, "status") === input.approval.status
+          && readString(existing, "request_json")
+            === JSON.stringify(input.approval.request)
+          && readNullableString(existing, "decision_json") === null
+          && readString(existing, "created_at") === input.approval.createdAt
+          && readNullableString(existing, "decided_at") === null;
+        if (!same) {
+          throw new Error("approval request identity is not idempotent");
+        }
+        return null;
+      }
+      this.#database.prepare(`
+        INSERT INTO approvals (
+          id, company_id, task_id, status, request_json,
+          decision_json, created_at, decided_at
+        )
+        VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
+      `).run(
+        input.approval.id,
+        input.approval.companyId,
+        input.approval.taskId,
+        input.approval.status,
+        JSON.stringify(input.approval.request),
+        input.approval.createdAt
+      );
+      return this.#insertEventRow(input.event);
+    });
+    if (inserted !== null) this.#publishEvents([inserted]);
+    return input.approval;
+  }
+
   getReviewDecision(
     runId: string,
     taskId: string,
@@ -1384,6 +1430,116 @@ export class CoreStore {
     return rows.map((row) =>
       parseIntegrationAttemptRecord(readString(row, "record_json"))
     );
+  }
+
+  commitConflictTaskCreation(input: {
+    companyId: string;
+    attempt: IntegrationAttemptRecord;
+    submission: GitSubmissionRecord;
+    originalTask: TaskRecord;
+    conflictTask: TaskRecord;
+    events: readonly [NewEvent, NewEvent];
+  }): void {
+    const [blockedEvent, createdEvent] = input.events;
+    if (input.attempt.status !== "conflicted"
+      || input.attempt.conflictFiles.length === 0
+      || input.submission.status !== "queued"
+      || input.submission.supersedes !== null
+      || input.originalTask.status !== "blocked"
+      || input.conflictTask.status !== "draft"
+      || input.conflictTask.ownerEmployeeId !== null
+      || input.conflictTask.conflictForTaskId !== input.originalTask.id
+      || input.conflictTask.dependencies.includes(input.originalTask.id)
+      || input.originalTask.updatedEventId !== blockedEvent.id
+      || input.conflictTask.createdEventId !== createdEvent.id
+      || input.conflictTask.updatedEventId !== createdEvent.id
+      || blockedEvent.type !== "task.blocked"
+      || createdEvent.type !== "task.created"
+      || blockedEvent.actorId !== "core"
+      || createdEvent.actorId !== "core"
+      || blockedEvent.taskId !== input.originalTask.id
+      || createdEvent.taskId !== input.conflictTask.id
+      || blockedEvent.causationEventId !== null
+      || createdEvent.causationEventId !== null) {
+      throw new Error("conflict task creation bundle is invalid");
+    }
+    const inserted = this.inTransaction(() => {
+      const run = this.getGitRun(input.attempt.runId);
+      const currentAttempt = this.getIntegrationAttempt(input.attempt.attemptId);
+      const currentSubmission = this.getGitSubmission(
+        input.attempt.runId,
+        input.attempt.taskId,
+        input.attempt.submissionRevision
+      );
+      const latestSubmission = this.listGitSubmissions(
+        input.attempt.runId,
+        input.attempt.taskId
+      ).at(-1);
+      const currentOriginal = this.getTask(
+        input.companyId,
+        input.originalTask.id
+      );
+      const existingConflict = this.getTask(
+        input.companyId,
+        input.conflictTask.id
+      );
+      const linkedConflicts = this.listTasks(input.companyId).filter(
+        ({ conflictForTaskId }) =>
+          conflictForTaskId === input.originalTask.id
+      );
+      const completedDependencies = currentOriginal?.dependencies.filter(
+        (dependencyId) =>
+          this.getTask(input.companyId, dependencyId)?.status === "completed"
+      );
+      const decision = this.getReviewDecision(
+        input.attempt.runId,
+        input.attempt.taskId,
+        input.attempt.submissionRevision
+      );
+      const reviewPackage = this.getReviewPackage(
+        input.attempt.runId,
+        input.attempt.taskId,
+        input.attempt.submissionRevision
+      );
+      if (run === null
+        || run.companyId !== input.companyId
+        || run.status !== "active"
+        || currentAttempt === null
+        || !jsonValuesEqual(currentAttempt, input.attempt)
+        || currentSubmission === null
+        || !jsonValuesEqual(currentSubmission, input.submission)
+        || latestSubmission?.revision !== input.submission.revision
+        || currentOriginal === null
+        || currentOriginal.status !== "review"
+        || currentOriginal.conflictForTaskId !== null
+        || currentOriginal.id !== input.attempt.taskId
+        || currentOriginal.createdEventId !== input.originalTask.createdEventId
+        || currentOriginal.updatedEventId === input.originalTask.updatedEventId
+        || !jsonValuesEqual({
+          ...input.originalTask,
+          status: currentOriginal.status,
+          updatedEventId: currentOriginal.updatedEventId
+        }, currentOriginal)
+        || existingConflict !== null
+        || linkedConflicts.length !== 0
+        || completedDependencies === undefined
+        || completedDependencies.length !== currentOriginal.dependencies.length
+        || !jsonValuesEqual(
+          completedDependencies,
+          input.conflictTask.dependencies
+        )
+        || decision?.decision !== "approve"
+        || reviewPackage === null
+        || reviewPackage.status === "tampered"
+        || reviewPackage.status === "deleted"
+        || reviewPackage.manifestHash !== decision.reviewedManifestHash) {
+        throw new Error("conflict task creation facts are stale or mismatched");
+      }
+      this.#putTaskRow(input.companyId, input.originalTask);
+      this.#putTaskRow(input.companyId, input.conflictTask);
+      return input.events.map((record) => this.#insertEventRow(record));
+    });
+    this.#publishEvents(inserted);
   }
 
   commitQueuedIntegration(input: {
@@ -1712,6 +1868,213 @@ export class CoreStore {
     this.#publishEvents(insertedEvents);
   }
 
+  commitResolvedConflict(input: {
+    companyId: string;
+    attempt: IntegrationAttemptRecord;
+    submission: GitSubmissionRecord;
+    conflictTask: TaskRecord;
+    originalAttempt: IntegrationAttemptRecord;
+    originalSubmission: GitSubmissionRecord;
+    originalTask: TaskRecord;
+    run: GitRunRecord;
+    integrationWorkspace: GitWorkspaceRecord;
+    events: readonly [NewEvent, NewEvent, NewEvent];
+  }): void {
+    const [committedEvent, conflictCompletedEvent, originalCompletedEvent]
+      = input.events;
+    const supersedes = input.submission.supersedes;
+    if (supersedes === null
+      || supersedes.taskId !== input.originalTask.id
+      || supersedes.revision !== input.originalSubmission.revision
+      || supersedes.attemptId !== input.originalAttempt.attemptId
+      || input.attempt.status !== "committed"
+      || input.attempt.candidateCommit === null
+      || input.submission.status !== "integrated"
+      || input.conflictTask.status !== "completed"
+      || input.conflictTask.conflictForTaskId !== input.originalTask.id
+      || input.originalAttempt.status !== "conflicted"
+      || input.originalAttempt.taskId !== input.originalTask.id
+      || input.originalAttempt.submissionRevision
+        !== input.originalSubmission.revision
+      || input.originalSubmission.status !== "superseded"
+      || input.originalSubmission.supersedes !== null
+      || input.originalTask.status !== "completed"
+      || input.conflictTask.updatedEventId !== conflictCompletedEvent.id
+      || input.originalTask.updatedEventId !== originalCompletedEvent.id
+      || committedEvent.type !== "git.integration.committed"
+      || conflictCompletedEvent.type !== "task.completed"
+      || originalCompletedEvent.type !== "task.completed"
+      || input.events.some(({ actorId, causationEventId }) =>
+        actorId !== "core" || causationEventId !== null
+      )
+      || committedEvent.taskId !== input.conflictTask.id
+      || conflictCompletedEvent.taskId !== input.conflictTask.id
+      || originalCompletedEvent.taskId !== input.originalTask.id
+      || !jsonValuesEqual(committedEvent.payload, {
+        attemptId: input.attempt.attemptId,
+        oldCommit: input.attempt.expectedOldCommit,
+        newCommit: input.attempt.candidateCommit,
+        validationRunIds: input.attempt.validationRunIds
+      })
+      || !jsonValuesEqual(conflictCompletedEvent.payload, {
+        attemptId: input.attempt.attemptId,
+        runId: input.attempt.runId,
+        revision: input.submission.revision,
+        integrationCommit: input.attempt.candidateCommit
+      })
+      || !jsonValuesEqual(originalCompletedEvent.payload, {
+        resolutionTaskId: input.conflictTask.id,
+        resolutionAttemptId: input.attempt.attemptId,
+        supersededAttemptId: input.originalAttempt.attemptId,
+        revision: input.originalSubmission.revision,
+        integrationCommit: input.attempt.candidateCommit
+      })) {
+      throw new Error("resolved conflict bundle is invalid");
+    }
+
+    const insertedEvents = this.inTransaction(() => {
+      const currentRun = this.getGitRun(input.attempt.runId);
+      const currentAttempt = this.getIntegrationAttempt(input.attempt.attemptId);
+      const currentSubmission = this.getGitSubmission(
+        input.attempt.runId,
+        input.attempt.taskId,
+        input.attempt.submissionRevision
+      );
+      const latestResolution = this.listGitSubmissions(
+        input.attempt.runId,
+        input.attempt.taskId
+      ).at(-1);
+      const currentConflict = this.getTask(
+        input.companyId,
+        input.conflictTask.id
+      );
+      const currentOriginalAttempt = this.getIntegrationAttempt(
+        input.originalAttempt.attemptId
+      );
+      const currentOriginalSubmission = this.getGitSubmission(
+        input.originalAttempt.runId,
+        input.originalAttempt.taskId,
+        input.originalAttempt.submissionRevision
+      );
+      const currentOriginal = this.getTask(
+        input.companyId,
+        input.originalTask.id
+      );
+      const currentWorkspace = this.getGitWorkspace(
+        input.integrationWorkspace.workspaceId
+      );
+      const decision = this.getReviewDecision(
+        input.attempt.runId,
+        input.attempt.taskId,
+        input.attempt.submissionRevision
+      );
+      const candidateWorkspaces = this.listGitWorkspaces(
+        input.attempt.runId
+      ).filter((workspace) =>
+        workspace.kind === "candidate"
+        && workspace.runId === input.attempt.runId
+        && workspace.taskId === null
+        && workspace.employeeId === null
+        && workspace.status === "active"
+        && workspace.branchRef === input.attempt.candidateRef
+        && workspace.baseCommit === input.attempt.expectedOldCommit
+        && workspace.headCommit === input.attempt.candidateCommit
+      );
+      const candidate = candidateWorkspaces[0];
+      const validations = input.attempt.validationRunIds.map(
+        (validationId) => this.getValidationRun(validationId)
+      );
+      if (currentRun === null
+        || currentRun.companyId !== input.companyId
+        || currentRun.status !== "active"
+        || currentRun.integrationCommit !== input.attempt.expectedOldCommit
+        || input.run.runId !== currentRun.runId
+        || input.run.companyId !== currentRun.companyId
+        || input.run.projectRoot !== currentRun.projectRoot
+        || input.run.originalBranch !== currentRun.originalBranch
+        || input.run.baseCommit !== currentRun.baseCommit
+        || input.run.integrationRef !== currentRun.integrationRef
+        || input.run.integrationCommit !== input.attempt.candidateCommit
+        || input.run.status !== currentRun.status
+        || input.run.createdAt !== currentRun.createdAt
+        || currentAttempt === null
+        || currentAttempt.status !== "prepared"
+        || !jsonValuesEqual({
+          ...input.attempt,
+          status: currentAttempt.status
+        }, currentAttempt)
+        || currentSubmission === null
+        || currentSubmission.status !== "queued"
+        || !jsonValuesEqual(
+          currentSubmission.submission,
+          input.submission.submission
+        )
+        || !jsonValuesEqual(
+          currentSubmission.supersedes,
+          input.submission.supersedes
+        )
+        || latestResolution?.revision !== input.submission.revision
+        || currentConflict === null
+        || currentConflict.status !== "review"
+        || !jsonValuesEqual({
+          ...input.conflictTask,
+          status: currentConflict.status,
+          updatedEventId: currentConflict.updatedEventId
+        }, currentConflict)
+        || currentOriginalAttempt === null
+        || !jsonValuesEqual(currentOriginalAttempt, input.originalAttempt)
+        || currentOriginalSubmission === null
+        || currentOriginalSubmission.status !== "queued"
+        || !jsonValuesEqual(
+          currentOriginalSubmission.submission,
+          input.originalSubmission.submission
+        )
+        || currentOriginal === null
+        || currentOriginal.status !== "blocked"
+        || !jsonValuesEqual({
+          ...input.originalTask,
+          status: currentOriginal.status,
+          updatedEventId: currentOriginal.updatedEventId
+        }, currentOriginal)
+        || decision?.decision !== "approve"
+        || currentWorkspace === null
+        || currentWorkspace.runId !== currentRun.runId
+        || currentWorkspace.kind !== "integration"
+        || currentWorkspace.status !== "active"
+        || currentWorkspace.branchRef !== currentRun.integrationRef
+        || currentWorkspace.headCommit !== input.attempt.expectedOldCommit
+        || input.integrationWorkspace.workspaceId !== currentWorkspace.workspaceId
+        || input.integrationWorkspace.path !== currentWorkspace.path
+        || input.integrationWorkspace.branchRef !== currentWorkspace.branchRef
+        || input.integrationWorkspace.baseCommit !== currentWorkspace.baseCommit
+        || input.integrationWorkspace.headCommit
+          !== input.attempt.candidateCommit
+        || candidateWorkspaces.length !== 1
+        || candidate === undefined
+        || new Set(input.attempt.validationRunIds).size
+          !== input.attempt.validationRunIds.length
+        || validations.some((validation) =>
+          validation === null
+          || validation.runId !== input.attempt.runId
+          || validation.taskId !== input.attempt.taskId
+          || validation.integrationAttemptId !== input.attempt.attemptId
+          || validation.workspaceId !== candidate.workspaceId
+          || validation.outcome !== "passed"
+        )) {
+        throw new Error("resolved conflict facts are stale or mismatched");
+      }
+      this.#putGitRunRow(input.run);
+      this.#putGitWorkspaceRow(input.integrationWorkspace);
+      this.#putIntegrationAttemptRow(input.attempt);
+      this.#putGitSubmissionRow(input.submission);
+      this.#putGitSubmissionRow(input.originalSubmission);
+      this.#putTaskRow(input.companyId, input.conflictTask);
+      this.#putTaskRow(input.companyId, input.originalTask);
+      return input.events.map((record) => this.#insertEventRow(record));
+    });
+    this.#publishEvents(insertedEvents);
+  }
+
   setCompanyStatus(companyId: string, status: string, event: NewEvent): void {
     const insertedEvent = this.inTransaction(() => {
       const result = this.#database.prepare(`
@@ -1746,7 +2109,7 @@ export class CoreStore {
       WHERE company_id = ? AND id = ?
     `).get(companyId, taskId) as DatabaseRow | undefined;
     if (row === undefined) return null;
-    return parseJsonObject<TaskRecord>(readString(row, "record_json"), "task record");
+    return parseTaskRecord(JSON.parse(readString(row, "record_json")));
   }
 
   listTasks(companyId: string): TaskRecord[] {
@@ -1757,7 +2120,7 @@ export class CoreStore {
       ORDER BY id ASC
     `).all(companyId) as DatabaseRow[];
     return rows.map((row) =>
-      parseJsonObject<TaskRecord>(readString(row, "record_json"), "task record")
+      parseTaskRecord(JSON.parse(readString(row, "record_json")))
     );
   }
 

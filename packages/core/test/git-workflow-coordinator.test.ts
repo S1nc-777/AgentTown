@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto";
 import type {
   ActionProposal,
   AgentMessage,
+  GitSubmissionRecord,
   GitTaskSubmission,
   GitWorkspaceRecord,
+  IntegrationAttemptRecord,
   ReviewDecision,
   ReviewPackageRecord,
+  TaskRecord,
   ValidationCommand,
   ValidationCommandGrant,
   ValidationRunRecord
@@ -14,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GitWorkflowCoordinator
 } from "../src/git/git-workflow-coordinator.js";
+import type { IntegrationResult } from "../src/git/integration-service.js";
 import type { ValidatedSubmission } from "../src/git/submission-validator.js";
 import { CoreStore } from "../src/storage/core-store.js";
 import { TaskService } from "../src/tasks/task-service.js";
@@ -69,6 +73,19 @@ function createHarness(options: {
     workspace: GitWorkspaceRecord,
     submission: GitTaskSubmission
   ) => Promise<ValidatedSubmission>;
+  conflictService?: {
+    createTask(attempt: IntegrationAttemptRecord): Promise<TaskRecord>;
+    prepareResolutionWorkspace(input: {
+      taskId: string;
+      actorEmployeeId: string;
+      employeeId: string;
+    }): Promise<GitWorkspaceRecord>;
+    supersessionFor(taskId: string): Promise<GitSubmissionRecord["supersedes"]>;
+  };
+  integrationService?: {
+    enqueue(submission: GitSubmissionRecord): Promise<void>;
+    drain(): Promise<IntegrationResult | null>;
+  };
 } = {}) {
   const company = companyDefinitionFixture();
   company.validation.commands = options.commands ?? [];
@@ -111,7 +128,8 @@ function createHarness(options: {
     retryCount: 0,
     reviewLoopCount: 0,
     artifacts: [],
-    evidence: []
+    evidence: [],
+    conflictForTaskId: null
   });
   const workspace: GitWorkspaceRecord = {
     workspaceId: "run-1:task:developer:task-a",
@@ -197,7 +215,8 @@ function createHarness(options: {
       taskId: "task-a",
       revision: 1,
       submission: submission(),
-      status: "approved" as const
+      status: "approved" as const,
+      supersedes: null
     }
   }));
   const messages: Array<{ employeeId: string; message: AgentMessage }> = [];
@@ -215,6 +234,12 @@ function createHarness(options: {
     validationRunner: { requestGrant, run },
     evidenceBuilder: { create, verify },
     reviewService: { recordDecision },
+    ...(options.conflictService === undefined
+      ? {}
+      : { conflictService: options.conflictService }),
+    ...(options.integrationService === undefined
+      ? {}
+      : { integrationService: options.integrationService }),
     reviewerIds: new Set(["reviewer"]),
     sendMessage
   });
@@ -356,6 +381,156 @@ describe("GitWorkflowCoordinator", () => {
     });
     expect(failedSend.store.getGitWorkspace(failedSend.workspace.workspaceId)?.status)
       .toBe("active");
+  });
+
+  it("prepares a conflict workspace before assignment and employee delivery", async () => {
+    const order: string[] = [];
+    const prepareResolutionWorkspace = vi.fn(async () => {
+      order.push("prepare");
+      harness.store.putGitWorkspace(harness.workspace);
+      return harness.workspace;
+    });
+    const harness = createHarness({
+      conflictService: {
+        createTask: vi.fn(),
+        prepareResolutionWorkspace,
+        supersessionFor: vi.fn()
+      },
+      sendMessage: async () => {
+        order.push("send");
+      }
+    });
+    harness.store.putTask("company-1", {
+      ...harness.tasks.get("task-a"),
+      conflictForTaskId: "original-task"
+    }, [{
+      id: randomUUID(),
+      type: "fixture.conflict_linked",
+      actorId: "core",
+      taskId: "task-a",
+      causationEventId: null,
+      payload: {}
+    }]);
+
+    await harness.coordinator.assignTask(action({
+      type: "task.assign",
+      actor: "leader",
+      taskId: "task-a",
+      payload: { assignee: "developer" }
+    }));
+
+    expect(prepareResolutionWorkspace).toHaveBeenCalledWith({
+      taskId: "task-a",
+      actorEmployeeId: "leader",
+      employeeId: "developer"
+    });
+    expect(harness.createTaskWorkspace).not.toHaveBeenCalled();
+    expect(order).toEqual(["prepare", "send"]);
+  });
+
+  it("derives durable resolution supersession from Core facts, never Agent text", async () => {
+    const supersedes = {
+      taskId: "original-task",
+      revision: 2,
+      attemptId: "attempt-original"
+    };
+    const harness = createHarness({
+      conflictService: {
+        createTask: vi.fn(),
+        prepareResolutionWorkspace: vi.fn(async () => {
+          harness.store.putGitWorkspace(harness.workspace);
+          return harness.workspace;
+        }),
+        supersessionFor: vi.fn(async () => supersedes)
+      }
+    });
+    harness.store.putTask("company-1", {
+      ...harness.tasks.get("task-a"),
+      conflictForTaskId: "original-task"
+    }, [{
+      id: randomUUID(),
+      type: "fixture.conflict_linked",
+      actorId: "core",
+      taskId: "task-a",
+      causationEventId: null,
+      payload: {}
+    }]);
+    await harness.coordinator.assignTask(action({
+      type: "task.assign",
+      actor: "leader",
+      taskId: "task-a",
+      payload: { assignee: "developer" }
+    }));
+
+    await harness.coordinator.submitTask(action({
+      type: "task.submit",
+      actor: "developer",
+      taskId: "task-a",
+      payload: {
+        submission: {
+          ...submission(),
+          supersedes: {
+            taskId: "forged-task",
+            revision: 99,
+            attemptId: "forged-attempt"
+          }
+        }
+      }
+    }));
+
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.supersedes)
+      .toEqual(supersedes);
+  });
+
+  it("turns a conflicted drain result into one durable conflict task request", async () => {
+    const attempt = {
+      attemptId: "attempt-original",
+      runId: "run-1",
+      taskId: "task-a",
+      submissionRevision: 1,
+      orderKey: "00000000:00000000000000000001:task-a",
+      expectedOldCommit: "1".repeat(40),
+      candidateRef: "refs/heads/agenttown/run-1/candidate/attempt-original",
+      candidateCommit: null,
+      status: "conflicted" as const,
+      conflictFiles: ["shared.txt"],
+      validationRunIds: []
+    };
+    const createTask = vi.fn(async () => harness.tasks.get("task-a"));
+    const harness = createHarness({
+      conflictService: {
+        createTask,
+        prepareResolutionWorkspace: vi.fn(),
+        supersessionFor: vi.fn()
+      },
+      integrationService: {
+        enqueue: vi.fn(async () => undefined),
+        drain: vi.fn(async () => ({
+          kind: "conflicted" as const,
+          attempt,
+          files: ["shared.txt"]
+        }))
+      }
+    });
+
+    await harness.coordinator.recordReview(action({
+      type: "task.approve",
+      actor: "reviewer",
+      taskId: "task-a",
+      payload: {
+        revision: 1,
+        decision: {
+          schemaVersion: 1,
+          decision: "approve",
+          findings: [],
+          coverageGaps: [],
+          summary: "Ready",
+          reviewedManifestHash: "d".repeat(64)
+        }
+      }
+    }));
+
+    expect(createTask).toHaveBeenCalledWith(attempt);
   });
 
   it("requests one idempotent grant and pauses before validation or package creation", async () => {
@@ -707,7 +882,8 @@ describe("GitWorkflowCoordinator", () => {
       taskId: "task-a",
       revision: 1,
       submission: submission(),
-      status: "approved"
+      status: "approved",
+      supersedes: null
     });
 
     expect(() => harness.tasks.transition("task-a", "completed", "reviewer"))

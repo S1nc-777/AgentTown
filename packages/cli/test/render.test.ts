@@ -19,6 +19,7 @@ function task(id: string): TaskRecord {
     reviewLoopCount: 0,
     artifacts: [],
     evidence: [],
+    conflictForTaskId: null,
     createdEventId: `created-${id}`,
     updatedEventId: `updated-${id}`
   };

@@ -243,7 +243,8 @@ describe("CheckpointService", () => {
       retryCount: 0,
       reviewLoopCount: 0,
       artifacts: [],
-      evidence: []
+      evidence: [],
+      conflictForTaskId: null
     });
     tasks.assign("task-active", "developer");
     tasks.transition("task-active", "running", "developer");
@@ -732,7 +733,8 @@ describe("CheckpointService", () => {
       retryCount: 0,
       reviewLoopCount: 0,
       artifacts: [],
-      evidence: []
+      evidence: [],
+      conflictForTaskId: null
     });
     tasks.assign("task-fenced", "developer");
     tasks.transition("task-fenced", "running", "developer");

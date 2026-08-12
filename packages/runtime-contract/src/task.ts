@@ -24,8 +24,30 @@ export interface TaskRecord {
   reviewLoopCount: number;
   artifacts: string[];
   evidence: string[];
+  conflictForTaskId: string | null;
   createdEventId: string;
   updatedEventId: string;
+}
+
+const taskRecordSchema = z.object({
+  id: z.string().trim().min(1),
+  title: z.string().trim().min(1),
+  objective: z.string().trim().min(1),
+  ownerEmployeeId: z.string().trim().min(1).nullable(),
+  dependencies: z.array(z.string().trim().min(1)),
+  acceptanceCriteria: z.array(z.string().trim().min(1)),
+  status: z.enum(taskStates),
+  retryCount: z.number().int().min(0),
+  reviewLoopCount: z.number().int().min(0),
+  artifacts: z.array(z.string()),
+  evidence: z.array(z.string()),
+  conflictForTaskId: z.string().trim().min(1).nullable(),
+  createdEventId: z.string().trim().min(1),
+  updatedEventId: z.string().trim().min(1)
+});
+
+export function parseTaskRecord(value: unknown): TaskRecord {
+  return taskRecordSchema.parse(value);
 }
 
 export const actionTypes = [

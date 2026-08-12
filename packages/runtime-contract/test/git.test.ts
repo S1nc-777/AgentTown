@@ -1,14 +1,87 @@
 import { describe, expect, it } from "vitest";
 import {
   parseCompanyYaml,
+  parseGitSubmissionRecord,
   parseGitTaskSubmission,
-  parseReviewDecision
+  parseReviewDecision,
+  parseTaskRecord
 } from "../src/index.js";
 
 const commit = "a".repeat(40);
 const manifestHash = "b".repeat(64);
 
 describe("P1B Git contract", () => {
+  it("requires an explicit nullable conflict-task link", () => {
+    const record = {
+      id: "task-a",
+      title: "Task A",
+      objective: "Resolve the conflict",
+      ownerEmployeeId: null,
+      dependencies: [],
+      acceptanceCriteria: ["Conflict is resolved"],
+      status: "draft",
+      retryCount: 0,
+      reviewLoopCount: 0,
+      artifacts: [],
+      evidence: [],
+      conflictForTaskId: null,
+      createdEventId: "event-created",
+      updatedEventId: "event-created"
+    };
+
+    expect(parseTaskRecord(record).conflictForTaskId).toBeNull();
+    expect(() => parseTaskRecord({
+      ...record,
+      conflictForTaskId: undefined
+    })).toThrow();
+  });
+
+  it("requires explicit durable supersession metadata on submission records", () => {
+    const record = {
+      runId: "run-1",
+      taskId: "conflict-task-a-1",
+      revision: 1,
+      submission: {
+        schemaVersion: 1,
+        headCommit: commit,
+        commits: [commit],
+        changeSummary: "Resolve the reviewed conflict",
+        validationCommandIds: [],
+        suggestedValidationCommands: [],
+        reportedResults: [],
+        knownRisks: []
+      },
+      status: "validated",
+      supersedes: {
+        taskId: "task-a",
+        revision: 2,
+        attemptId: "attempt-a"
+      }
+    };
+
+    expect(parseGitSubmissionRecord(record).supersedes).toEqual(
+      record.supersedes
+    );
+    expect(parseGitSubmissionRecord({
+      ...record,
+      supersedes: null
+    }).supersedes).toBeNull();
+    expect(parseGitSubmissionRecord({
+      ...record,
+      taskId: "task-a",
+      status: "superseded",
+      supersedes: null
+    }).status).toBe("superseded");
+    expect(() => parseGitSubmissionRecord({
+      ...record,
+      supersedes: undefined
+    })).toThrow();
+    expect(() => parseGitSubmissionRecord({
+      ...record,
+      supersedes: { ...record.supersedes, revision: 0 }
+    })).toThrow();
+  });
+
   it("parses a continuous declared submission shape", () => {
     expect(parseGitTaskSubmission({
       schemaVersion: 1,

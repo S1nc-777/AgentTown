@@ -412,6 +412,7 @@ function gitSubmission(
       knownRisks: []
     },
     status: "received",
+    supersedes: null,
     ...overrides
   };
 }
@@ -497,6 +498,7 @@ function task(status: TaskRecord["status"]): TaskRecord {
     reviewLoopCount: 0,
     artifacts: [],
     evidence: [],
+    conflictForTaskId: null,
     createdEventId: "task-created",
     updatedEventId: `task-${status}`
   };
@@ -917,6 +919,61 @@ describe("typed Git fact storage", () => {
       reopened.initialize();
       expect(() => reopened.getGitSubmission("run-1", "task-1", 1)).toThrow();
       expect(() => reopened.getReviewDecision("run-1", "task-1", 1)).toThrow();
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("rejects persisted tasks and submissions with omitted Task 9 metadata", () => {
+    const databasePath = temporaryDatabasePath();
+    const store = new CoreStore(databasePath);
+    store.initialize();
+    store.createCompany({
+      id: "company",
+      definition: companyDefinitionFixture(),
+      event: {
+        id: "company-created",
+        type: "company.created",
+        actorId: "owner",
+        taskId: null,
+        causationEventId: null,
+        payload: {}
+      }
+    });
+    store.putGitRun(gitRun());
+    store.putTask("company", task("review"), [
+      event("task-review", "task.review")
+    ]);
+    store.putGitSubmission(gitSubmission());
+    store.close();
+
+    const database = new DatabaseSync(databasePath);
+    const taskWithoutConflict = { ...task("review") } as Record<string, unknown>;
+    delete taskWithoutConflict.conflictForTaskId;
+    const submissionWithoutSupersession = {
+      ...gitSubmission()
+    } as Record<string, unknown>;
+    delete submissionWithoutSupersession.supersedes;
+    database.prepare(`
+      UPDATE tasks SET record_json = ? WHERE company_id = ? AND id = ?
+    `).run(JSON.stringify(taskWithoutConflict), "company", "task-1");
+    database.prepare(`
+      UPDATE git_submissions
+      SET record_json = ?
+      WHERE run_id = ? AND task_id = ? AND revision = ?
+    `).run(
+      JSON.stringify(submissionWithoutSupersession),
+      "run-1",
+      "task-1",
+      1
+    );
+    database.close();
+
+    const reopened = new CoreStore(databasePath);
+    try {
+      reopened.initialize();
+      expect(() => reopened.getTask("company", "task-1")).toThrow();
+      expect(() => reopened.getGitSubmission("run-1", "task-1", 1)).toThrow();
     } finally {
       reopened.close();
     }

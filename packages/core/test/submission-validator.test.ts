@@ -116,6 +116,7 @@ async function setup(options: {
       reviewLoopCount: 0,
       artifacts: [],
       evidence: [],
+      conflictForTaskId: null,
       createdEventId: "task-created",
       updatedEventId: "task-running"
     }, [{

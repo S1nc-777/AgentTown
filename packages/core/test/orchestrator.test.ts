@@ -438,7 +438,8 @@ describe("CompanyOrchestrator", () => {
         retryCount: 0,
         reviewLoopCount: 0,
         artifacts: [],
-        evidence: []
+        evidence: [],
+        conflictForTaskId: null
       });
       tasks.assign(taskId, owner);
       tasks.transition(taskId, "running", owner);

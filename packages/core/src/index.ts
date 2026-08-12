@@ -103,3 +103,9 @@ export {
   type IntegrationServiceOptions,
   type OrderedIntegration
 } from "./git/integration-service.js";
+export {
+  ConflictService,
+  type CompleteResolutionInput,
+  type ConflictServiceOptions,
+  type PrepareResolutionWorkspaceInput
+} from "./git/conflict-service.js";

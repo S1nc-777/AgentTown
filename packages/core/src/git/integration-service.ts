@@ -47,6 +47,20 @@ interface IntegrationGitRunner {
   run: GitCommandRunner["run"];
 }
 
+interface ResolutionConflictService {
+  supersessionFor(
+    taskId: string
+  ): Promise<GitSubmissionRecord["supersedes"]>;
+  completeResolution(input: {
+    attempt: IntegrationAttemptRecord;
+    submission: GitSubmissionRecord;
+    task: TaskRecord;
+    run: GitRunRecord;
+    integrationWorkspace: GitWorkspaceRecord;
+    events: readonly [NewEvent, NewEvent];
+  }): Promise<void>;
+}
+
 export interface IntegrationFaultHooks {
   afterPrepared?(): void;
   afterRefUpdated?(): void;
@@ -62,6 +76,7 @@ export interface IntegrationServiceOptions {
   validationRunner: IntegrationValidationRunner;
   faultHooks?: IntegrationFaultHooks;
   git?: IntegrationGitRunner;
+  conflictService?: ResolutionConflictService;
 }
 
 export type IntegrationResult =
@@ -135,6 +150,7 @@ export class IntegrationService {
   readonly #validationRunner: IntegrationValidationRunner;
   readonly #faultHooks: IntegrationFaultHooks;
   readonly #git: IntegrationGitRunner;
+  readonly #conflictService: ResolutionConflictService | undefined;
 
   constructor(options: IntegrationServiceOptions) {
     this.#store = options.store;
@@ -145,6 +161,7 @@ export class IntegrationService {
     this.#validationRunner = options.validationRunner;
     this.#faultHooks = options.faultHooks ?? {};
     this.#git = options.git ?? new GitCommandRunner();
+    this.#conflictService = options.conflictService;
   }
 
   async enqueue(submission: GitSubmissionRecord): Promise<void> {
@@ -170,6 +187,15 @@ export class IntegrationService {
         .listGitSubmissions(this.#runId, candidate.taskId)
         .at(-1);
       if (submission?.status !== "queued") continue;
+      const linkedConflicts = this.#store.listTasks(this.#companyId).filter(
+        ({ conflictForTaskId }) => conflictForTaskId === candidate.taskId
+      );
+      if (candidate.task.status === "blocked") {
+        if (linkedConflicts.length > 1) {
+          throw new Error("conflict task identity is not unique");
+        }
+        if (linkedConflicts.length === 1) continue;
+      }
       const existing = this.#existingAttemptResult(submission);
       if (existing !== null) return existing;
       if (candidate.task.dependencies.some((dependencyId) =>
@@ -193,6 +219,7 @@ export class IntegrationService {
   async integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
     const existing = this.#existingAttemptResult(submission);
     if (existing !== null) return existing;
+    await this.#assertResolutionSupersession(submission);
     await this.enqueue(submission);
     const bound = this.#bindApprovedSubmission(submission);
     const selected = this.#select(bound.submission);
@@ -440,18 +467,30 @@ export class IntegrationService {
       updatedEventId: completedEvent.id
     };
     try {
-      this.#store.commitIntegratedTask({
-        companyId: this.#companyId,
-        attempt: committed,
-        submission: {
-          ...bound.submission,
-          status: "integrated"
-        },
-        task: completedTask,
-        run: advancedRun,
-        integrationWorkspace: advancedIntegration,
-        events: [committedEvent, completedEvent]
-      });
+      const integratedSubmission: GitSubmissionRecord = {
+        ...bound.submission,
+        status: "integrated"
+      };
+      if (integratedSubmission.supersedes === null) {
+        this.#store.commitIntegratedTask({
+          companyId: this.#companyId,
+          attempt: committed,
+          submission: integratedSubmission,
+          task: completedTask,
+          run: advancedRun,
+          integrationWorkspace: advancedIntegration,
+          events: [committedEvent, completedEvent]
+        });
+      } else {
+        await this.#requiredConflictService().completeResolution({
+          attempt: committed,
+          submission: integratedSubmission,
+          task: completedTask,
+          run: advancedRun,
+          integrationWorkspace: advancedIntegration,
+          events: [committedEvent, completedEvent]
+        });
+      }
     } catch {
       return { kind: "reconciliation_required", attemptId };
     }
@@ -538,7 +577,8 @@ export class IntegrationService {
       || durableSubmission.runId !== submission.runId
       || durableSubmission.taskId !== submission.taskId
       || JSON.stringify(durableSubmission.submission)
-        !== JSON.stringify(submission.submission)) {
+        !== JSON.stringify(submission.submission)
+      || !sameJson(durableSubmission.supersedes, submission.supersedes)) {
       throw new Error("integration attempt facts do not match submission");
     }
     if (attempt.status === "committed") {
@@ -564,6 +604,23 @@ export class IntegrationService {
         ({ id }) => id === task.updatedEventId
       );
       const completedEvent = completedEvents[0];
+      const supersedes = durableSubmission.supersedes;
+      const originalAttempt = supersedes === null
+        ? null
+        : this.#store.getIntegrationAttempt(supersedes.attemptId);
+      const originalSubmission = supersedes === null
+        ? null
+        : this.#store.getGitSubmission(
+          this.#runId,
+          supersedes.taskId,
+          supersedes.revision
+        );
+      const originalTask = supersedes === null
+        ? null
+        : this.#store.getTask(this.#companyId, supersedes.taskId);
+      const originalCompletedEvent = originalTask === null
+        ? undefined
+        : events.find(({ id }) => id === originalTask.updatedEventId);
       if (attempt.candidateCommit === null
         || durableSubmission.status !== "integrated"
         || task.status !== "completed"
@@ -595,7 +652,33 @@ export class IntegrationService {
           runId: attempt.runId,
           revision: attempt.submissionRevision,
           integrationCommit: attempt.candidateCommit
-        })) {
+        })
+        || supersedes !== null && (
+          task.conflictForTaskId !== supersedes.taskId
+          || originalAttempt === null
+          || originalAttempt.runId !== this.#runId
+          || originalAttempt.taskId !== supersedes.taskId
+          || originalAttempt.submissionRevision !== supersedes.revision
+          || originalAttempt.attemptId !== supersedes.attemptId
+          || originalAttempt.status !== "conflicted"
+          || originalSubmission === null
+          || originalSubmission.status !== "superseded"
+          || originalSubmission.supersedes !== null
+          || originalTask === null
+          || originalTask.status !== "completed"
+          || originalTask.conflictForTaskId !== null
+          || originalCompletedEvent?.type !== "task.completed"
+          || originalCompletedEvent.actorId !== "core"
+          || originalCompletedEvent.taskId !== originalTask.id
+          || originalCompletedEvent.causationEventId !== null
+          || !sameJson(originalCompletedEvent.payload, {
+            resolutionTaskId: task.id,
+            resolutionAttemptId: attempt.attemptId,
+            supersededAttemptId: originalAttempt.attemptId,
+            revision: originalSubmission.revision,
+            integrationCommit: attempt.candidateCommit
+          })
+        )) {
         throw new Error("committed integration facts are stale or mismatched");
       }
       return { kind: "integrated", attempt };
@@ -755,6 +838,7 @@ export class IntegrationService {
     const blocker = ordered.find((candidate) =>
       candidate.layer === selected.layer
       && this.#compareOrdered(candidate, selected) < 0
+      && candidate.taskId !== submission.supersedes?.taskId
       && !this.#isIntegrated(candidate.task)
     );
     return blocker === undefined
@@ -768,6 +852,34 @@ export class IntegrationService {
       String(task.createdSequence).padStart(20, "0"),
       task.taskId
     ].join(":");
+  }
+
+  async #assertResolutionSupersession(
+    submission: GitSubmissionRecord
+  ): Promise<void> {
+    const task = this.#store.getTask(this.#companyId, submission.taskId);
+    if (task === null) {
+      throw new Error("integration task is not persisted");
+    }
+    if (task.conflictForTaskId === null) {
+      if (submission.supersedes !== null) {
+        throw new Error("normal integration submission cannot supersede");
+      }
+      return;
+    }
+    const expected = await this.#requiredConflictService()
+      .supersessionFor(task.id);
+    if (submission.supersedes === null
+      || !sameJson(submission.supersedes, expected)) {
+      throw new Error("resolution supersession facts are stale or mismatched");
+    }
+  }
+
+  #requiredConflictService(): ResolutionConflictService {
+    if (this.#conflictService === undefined) {
+      throw new Error("conflict workflow service is required");
+    }
+    return this.#conflictService;
   }
 
   async #integrationWorkspace(

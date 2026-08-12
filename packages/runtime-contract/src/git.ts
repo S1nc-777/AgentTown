@@ -10,7 +10,8 @@ export type GitWorkspaceStatus =
   | "tampered";
 export type SubmissionStatus =
   | "received" | "validated" | "rejected" | "in_review"
-  | "approved" | "changes_requested" | "queued" | "integrated";
+  | "approved" | "changes_requested" | "queued" | "integrated"
+  | "superseded";
 export type IntegrationStatus =
   | "prepared" | "conflicted" | "validation_failed" | "committed" | "aborted";
 export type ReconciliationClassification =
@@ -41,6 +42,11 @@ export interface GitSubmissionRecord {
   revision: number;
   submission: GitTaskSubmission;
   status: SubmissionStatus;
+  supersedes: {
+    taskId: string;
+    revision: number;
+    attemptId: string;
+  } | null;
 }
 
 export interface GitRunRecord {
@@ -209,6 +215,22 @@ const gitTaskSubmissionSchema = z.object({
   }
 });
 
+const gitSubmissionRecordSchema = z.object({
+  runId: safeIdentifier,
+  taskId: safeIdentifier,
+  revision: z.number().int().min(1),
+  submission: gitTaskSubmissionSchema,
+  status: z.enum([
+    "received", "validated", "rejected", "in_review",
+    "approved", "changes_requested", "queued", "integrated", "superseded"
+  ]),
+  supersedes: z.object({
+    taskId: safeIdentifier,
+    revision: z.number().int().min(1),
+    attemptId: safeIdentifier
+  }).nullable()
+});
+
 const reviewDecisionSchema = z.object({
   schemaVersion: z.literal(1),
   decision: z.enum(["approve", "reject"]),
@@ -235,6 +257,10 @@ const reviewDecisionSchema = z.object({
 
 export function parseGitTaskSubmission(value: unknown): GitTaskSubmission {
   return gitTaskSubmissionSchema.parse(value);
+}
+
+export function parseGitSubmissionRecord(value: unknown): GitSubmissionRecord {
+  return gitSubmissionRecordSchema.parse(value);
 }
 
 export function parseReviewDecision(value: unknown): ReviewDecision {

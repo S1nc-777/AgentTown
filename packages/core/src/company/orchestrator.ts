@@ -465,7 +465,8 @@ export class CompanyOrchestrator {
       retryCount: 0,
       reviewLoopCount: 0,
       artifacts: [],
-      evidence: []
+      evidence: [],
+      conflictForTaskId: null
     });
   }
 

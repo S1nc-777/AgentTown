@@ -108,7 +108,8 @@ async function queueHarness() {
     retryCount: 0,
     reviewLoopCount: 0,
     artifacts: [],
-    evidence: []
+    evidence: [],
+    conflictForTaskId: null
   });
   const approve = (task: TaskRecord): GitSubmissionRecord => {
     const reviewed: TaskRecord = {
@@ -126,7 +127,8 @@ async function queueHarness() {
       taskId: task.id,
       revision: 1,
       submission: submission(),
-      status: "approved"
+      status: "approved",
+      supersedes: null
     };
     store.putGitSubmission(approved);
     store.putReviewPackage({
@@ -270,7 +272,8 @@ async function realHarness(
     retryCount: 0,
     reviewLoopCount: 0,
     artifacts: [],
-    evidence: []
+    evidence: [],
+    conflictForTaskId: null
   });
   const reviewedEvent = event("task.review_approved", "task-a");
   const reviewed: TaskRecord = {
@@ -287,7 +290,8 @@ async function realHarness(
     taskId: "task-a",
     revision: 1,
     submission: submission(candidateCommit!),
-    status: "approved"
+    status: "approved",
+    supersedes: null
   };
   store.putGitSubmission(approved);
   store.putReviewPackage({
