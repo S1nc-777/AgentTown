@@ -1,14 +1,14 @@
 # AgentTown 开发状态与经验
 
-- 更新日期：2026-07-30
+- 更新日期：2026-08-12
 - 当前开发分支：`codex/p1b-git-collaboration`
 - P1B 基线：`2ea80ab`
-- 当前功能提交：`b5dc9f1`
-- 下一项任务：P1B Task 9
+- 当前功能提交：`94ec97d`
+- 当前状态：按用户要求在 Task 9 后暂停
 
 ## 一句话状态
 
-AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前八项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
+AgentTown 已经能运行一间可暂停、恢复和观察的 Fake Agent 公司，并完成了 Git 协作底座的前九项；它还没有接入真实 Agent，暂时不能称为可日用的多 Agent 产品。
 
 ## 已完成
 
@@ -27,7 +27,7 @@ P1A 是架构验证切片，不包含真实 Agent、Git worktree 协作或桌面
 
 ### P1B：Git 协作闭环
 
-P1B 计划共有 12 项。目前 Task 1–8 已完成并通过独立规格/代码质量审查，Task 9–12 尚未开始。
+P1B 计划共有 12 项。目前 Task 1–9 已完成并通过独立规格/代码质量审查，Task 10–12 尚未开始。
 
 | 任务 | 状态 | 提交范围 | 结果 |
 | --- | --- | --- | --- |
@@ -39,16 +39,17 @@ P1B 计划共有 12 项。目前 Task 1–8 已完成并通过独立规格/代�
 | 6. 提交验证与不可变审核包 | 完成 | `31ce670..589c5ea` | 审查通过 |
 | 7. 审核状态与 Git 工作流协调器 | 完成 | `39a34d5..632a13e` | 审查通过 |
 | 8. 确定性候选集成与原子 ref 推进 | 完成 | `c2a4848..b5dc9f1` | 审查通过 |
-| 9–12. 冲突、恢复、CLI、E2E | 待办 | — | 尚未开始 |
+| 9. 冲突任务与替代提交 | 完成 | `428bce9..94ec97d` | 审查通过 |
+| 10–12. 恢复、CLI、E2E | 待办 | — | 尚未开始 |
 
-Task 8 最终验证证据：
+Task 9 最终验证证据：
 
-- Task 8 定向与存储测试：57/57 通过；
-- 相关扩展测试：177/177 通过；
-- Core：18 个测试文件、346 个测试通过；
+- ConflictService 定向测试：14/14 通过；
+- 规定冲突/集成/任务测试：53/53 通过；
+- Core：19 个测试文件、366 个测试通过；
 - 工作区类型检查：全部适用项目通过；
-- 独立复审：Spec Approved、Code-quality Approved；
-- 没有启动 Task 9。
+- 独立复审：Spec PASS、Code-quality PASS；
+- 没有启动 Task 10。
 
 ## 当前架构边界
 
@@ -174,27 +175,39 @@ PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/
 
 返回“已经集成”前，不只要看到 completed task 和 committed attempt，还要验证 exact run/ref/workspace/submission，以及唯一、由 Core 写入、payload 完整绑定的 `git.integration.committed` 与 `task.completed` 事件。幂等不是放宽校验，而是对既有事实做更严格的重放认证。
 
+### 22. 冲突应成为显式任务，而不是隐式异常状态
+
+原集成冲突必须先中止并验证候选工作区干净，再原子阻塞原任务、创建未分配的冲突任务。冲突任务只复制已完成依赖，不依赖被阻塞的原任务；解决工作区只有在当前 integration SHA 上精确重现原冲突集合后才能交付给员工。
+
+### 23. 替代关系是 Core 事实，不能信任 Agent 声明
+
+解决提交的 `supersedes` 必须由 Core 从原任务、revision 和 conflicted attempt 派生，并在验证、审核、排队、prepared 与最终集成的每个原子 bundle 中完整保留和重验。成功时，新提交 integrated、旧提交 superseded、两个任务 completed 必须一次提交。
+
+### 24. 终态失败也可能缺少业务事实
+
+resolution 再冲突后，即使 attempt 已经是 terminal，用户审批仍可能因进程中断尚未落库。重放不能重跑 Git，但必须幂等补建或验证 exact approval/event；这属于 Task 9 的业务事实修复，不等于 Task 10 的通用仓库恢复。
+
 ## 已知问题与环境残留
 
 - 真实 Claude Code、OpenCode、Hermes Agent 适配尚未开始。
 - 根目录 `pnpm typecheck` 的依赖构建顺序仍值得后续整理；各包脚本目前承担部分预构建责任。
-- 截至本次复核，Windows 临时目录中有 25 个历史 `agenttown-git-*` 和 27 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
+- 截至本次复核，Windows 临时目录中有 28 个历史 `agenttown-git-*` 和 27 个 `agenttown-core-*` fixture，其中包含早期取消、故意 RED 和被外层命令上限终止的测试残留。没有存活的 Vitest、验证命令或相关 Git 进程占用它们。经过解析和逐项验证的 PowerShell 删除命令被环境策略在执行前拒绝；没有换用其他 shell 绕过策略，也没有声称这些目录已删除。
 - 仓库包元数据声明 `AGPL-3.0-only`，独立 `LICENSE` 文件和贡献指南仍待补齐。
 
-## 下一步：Task 9
+## 当前暂停点
 
-下一次开发从 [P1B 实施计划的 Task 9](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-9-conflict-tasks-and-superseding-submissions) 继续：
+按用户要求，本轮在 Task 9 完成后停止，尚未启动 Task 10。恢复开发时从 [P1B 实施计划的 Task 10](../superpowers/plans/2026-07-29-agenttown-p1b-git-collaboration.md#task-10-reconciliation-restart-and-cleanup) 继续：
 
-> Conflict Tasks and Superseding Submissions
+> Reconciliation, Restart and Cleanup
 
-目标是在候选 cherry-pick 冲突时保持正式 integration 干净，创建不形成依赖环的未分配冲突任务，并让经过完整审核的解决提交安全取代原 submission。
+目标是根据 durable prepared/terminal facts 与当前 Git ref/worktree 状态进行正式对账，安全处理进程重启和清理窗口，不猜测恢复。
 
 恢复开发前应确认：
 
 1. 分支为 `codex/p1b-git-collaboration`；
 2. `git status --short` 为空；
-3. HEAD 至少包含 `b5dc9f1`；
-4. Task 1–8 不重新实现；
+3. HEAD 至少包含 `94ec97d`；
+4. Task 1–9 不重新实现；
 5. 先读 P1B 设计、实施计划和本文；
 6. 使用 TDD 和独立只读复审；
 7. 不在同一 Windows 工作区并发运行多套真实 Git 测试。
@@ -204,10 +217,10 @@ PID 会重用。Windows 使用 PID 与 CreationDate，Linux 使用 `/proc/<pid>/
 如果后续对话上下文被压缩，只需保留以下事实：
 
 - 产品：AgentTown，本地“赛博公司”式多 Agent 调度器；
-- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–8；
+- 当前真实能力：P1A Fake Company + P1B Git 底座 Task 1–9；
 - 当前分支：`codex/p1b-git-collaboration`；
-- 当前功能提交：`b5dc9f1`；
-- Task 8 已经完整测试并通过独立复审；
-- Task 9–12 尚未开始；
-- 下一步只做 Task 9，不重做之前任务；
+- 当前功能提交：`94ec97d`；
+- Task 9 已经完整测试并通过独立复审；
+- Task 10–12 尚未开始；
+- 当前按用户要求暂停，后续从 Task 10 继续；
 - README 与本文是面向用户和开发者的当前权威摘要，详细规则以 P1B spec/plan 为准。
