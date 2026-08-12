@@ -109,3 +109,7 @@ export {
   type ConflictServiceOptions,
   type PrepareResolutionWorkspaceInput
 } from "./git/conflict-service.js";
+export {
+  GitReconciler,
+  type GitReconcilerOptions
+} from "./git/git-reconciler.js";

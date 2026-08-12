@@ -1,5 +1,6 @@
 import type { ActionProposal } from "./task.js";
 import type { ReviewTaskContext, WritableTaskContext } from "./git.js";
+import type { GitWorkspaceStatus } from "./git.js";
 
 export type CapabilityState = "supported" | "unsupported" | "unknown";
 
@@ -66,11 +67,26 @@ export interface SessionCheckpoint {
   handoff: string;
 }
 
+export interface GitCheckpoint {
+  runId: string;
+  integrationRef: string;
+  integrationCommit: string;
+  workspaces: Array<{
+    workspaceId: string;
+    branchRef: string;
+    headCommit: string;
+    status: GitWorkspaceStatus;
+  }>;
+  activeSubmissionRevisions: Array<{ taskId: string; revision: number }>;
+  integrationAttemptIds: string[];
+}
+
 export interface CompanyCheckpoint {
   companyId: string;
   reason: "user_requested" | "last_client_exited" | "shutdown";
   lastEventSequence: number;
   sessions: SessionCheckpoint[];
+  git: GitCheckpoint | null;
 }
 
 export interface RecoveryDecision {

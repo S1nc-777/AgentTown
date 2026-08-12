@@ -258,6 +258,70 @@ describe("CoreStore", () => {
     store.close();
   });
 
+  it("atomically rolls back a Git reconciliation pause when its event fails", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: {
+        id: "duplicate-event", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: {}
+      }
+    });
+    const run = {
+      runId: "run-1", companyId: "company-1", projectRoot: project.root,
+      originalBranch: "main", baseCommit: "a".repeat(40),
+      integrationRef: "refs/heads/agenttown/run-1/integration",
+      integrationCommit: "a".repeat(40), status: "active" as const,
+      createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z"
+    };
+    store.putGitRun(run);
+    const discrepancies = [{ kind: "integration_ref", expected: run.integrationCommit, actual: null }];
+    const request = {
+      reason: "git_reconciliation_stop",
+      runId: run.runId,
+      classification: "missing",
+      discrepancies
+    };
+
+    expect(() => store.commitGitReconciliationStop({
+      companyId: "company-1",
+      runId: run.runId,
+      classification: "missing",
+      approval: {
+        id: "git-reconciliation-run-1",
+        companyId: "company-1",
+        taskId: null,
+        status: "pending",
+        request,
+        decision: null,
+        createdAt: "2026-08-13T00:00:01.000Z",
+        decidedAt: null
+      },
+      event: {
+        id: "duplicate-event",
+        type: "git.tampering_detected",
+        actorId: "core",
+        taskId: null,
+        causationEventId: null,
+        payload: {
+          runId: run.runId,
+          classification: "missing",
+          discrepancies
+        }
+      }
+    })).toThrow();
+
+    expect(store.getCompany("company-1")?.status).toBe("active");
+    expect(store.getGitRun(run.runId)?.status).toBe("active");
+    expect(store.listPendingApprovals("company-1")).toEqual([]);
+    expect(store.listEvents(0).map(({ id }) => id)).toEqual(["duplicate-event"]);
+    store.close();
+  });
+
   it("reads the latest event sequence without loading event history", async () => {
     const project = await createTemporaryProject();
     cleanups.push(project.cleanup);

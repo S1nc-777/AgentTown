@@ -254,7 +254,8 @@ class RecordingLifecycle {
       companyId: "company-1",
       reason,
       lastEventSequence: 0,
-      sessions: []
+      sessions: [],
+      git: null
     };
   }
 

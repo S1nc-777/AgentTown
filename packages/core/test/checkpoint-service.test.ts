@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 import type {
   AgentAdapter,
   AgentCapabilities,
-  CompanyDefinition
+  CompanyDefinition,
+  GitCheckpoint,
+  ReconciliationResult
 } from "@agenttown/runtime-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeAgentAdapter } from "../src/agents/fake-adapter.js";
@@ -12,6 +14,7 @@ import { SessionManager } from "../src/agents/session-manager.js";
 import { CompanyOrchestrator } from "../src/company/orchestrator.js";
 import {
   CheckpointService,
+  parseCompanyCheckpoint,
   type CheckpointServiceOptions
 } from "../src/lifecycle/checkpoint-service.js";
 import { RecoveryBlockedError } from "../src/lifecycle/checkpoint-service.js";
@@ -85,6 +88,12 @@ async function createHarness(options: {
   forceStop?: NonNullable<AgentAdapter["forceStop"]>;
   forceStopDelayMs?: number;
   storeFactory?: (databasePath: string) => CoreStore;
+  gitLifecycle?: {
+    abortValidations(signal: AbortSignal, deadlineAt: number): Promise<void>;
+    settleIntegrationIntent(signal: AbortSignal): Promise<void>;
+    snapshot(): Promise<GitCheckpoint | null>;
+    reconcile(runId: string): Promise<ReconciliationResult>;
+  };
 } = {}): Promise<Harness> {
   const project = await createTemporaryProject();
   const company = companyDefinitionFixture();
@@ -163,7 +172,8 @@ async function createHarness(options: {
     adapterFor,
     ...(options.pauseTimeoutMs === undefined
       ? {}
-      : { pauseTimeoutMs: options.pauseTimeoutMs })
+      : { pauseTimeoutMs: options.pauseTimeoutMs }),
+    ...(options.gitLifecycle === undefined ? {} : { gitLifecycle: options.gitLifecycle })
   });
   const harness = {
     project,
@@ -180,6 +190,170 @@ async function createHarness(options: {
 }
 
 describe("CheckpointService", () => {
+  it("requires an explicit nullable Git checkpoint for P1A checkpoints", () => {
+    expect(() => parseCompanyCheckpoint({
+      companyId,
+      reason: "user_requested",
+      lastEventSequence: 0,
+      sessions: []
+    })).toThrow("checkpoint git is required");
+
+    expect(parseCompanyCheckpoint({
+      companyId,
+      reason: "user_requested",
+      lastEventSequence: 0,
+      sessions: [],
+      git: null
+    }).git).toBeNull();
+  });
+
+  it("orders Git pause boundaries before checkpoint commit and session interruption", async () => {
+    const calls: string[] = [];
+    const git: GitCheckpoint = {
+      runId: "run-1",
+      integrationRef: "refs/heads/agenttown/run-1/integration",
+      integrationCommit: "a".repeat(40),
+      workspaces: [],
+      activeSubmissionRevisions: [],
+      integrationAttemptIds: []
+    };
+    class OrderedPauseStore extends CoreStore {
+      override commitPauseFacts(...args: Parameters<CoreStore["commitPauseFacts"]>): void {
+        calls.push("commit");
+        super.commitPauseFacts(...args);
+      }
+    }
+    const harness = await createHarness({
+      interrupt: async () => {
+        calls.push("interrupt");
+        return { interrupted: true };
+      },
+      storeFactory: (path) => new OrderedPauseStore(path),
+      gitLifecycle: {
+        abortValidations: async (_signal, deadlineAt) => {
+          expect(deadlineAt).toBeGreaterThan(Date.now());
+          calls.push("abort-validations");
+        },
+        settleIntegrationIntent: async () => {
+          calls.push("settle-intent");
+        },
+        snapshot: async () => {
+          calls.push("snapshot");
+          return git;
+        },
+        reconcile: async () => ({
+          runId: "run-1",
+          classification: "verified",
+          discrepancies: []
+        })
+      }
+    });
+
+    const checkpoint = await harness.lifecycle.pause("user_requested");
+
+    expect(checkpoint.git).toEqual(git);
+    expect(calls.slice(0, 5)).toEqual([
+      "abort-validations",
+      "settle-intent",
+      "snapshot",
+      "commit",
+      "interrupt"
+    ]);
+  });
+
+  it("does not start Agent sessions when Git reconciliation stops recovery", async () => {
+    const resume = vi.fn(async () => {
+      throw new Error("session resume must not start");
+    });
+    const harness = await createHarness({ reviewerResume: resume });
+    const p1a = await harness.lifecycle.pause("user_requested");
+    harness.store.putGitRun({
+      runId: "run-1",
+      companyId,
+      projectRoot: harness.project.root,
+      originalBranch: "main",
+      baseCommit: "a".repeat(40),
+      integrationRef: "refs/heads/agenttown/run-1/integration",
+      integrationCommit: "a".repeat(40),
+      status: "paused",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z"
+    });
+    const checkpoint = {
+      ...p1a,
+      git: {
+        runId: "run-1",
+        integrationRef: "refs/heads/agenttown/run-1/integration",
+        integrationCommit: "a".repeat(40),
+        workspaces: [],
+        activeSubmissionRevisions: [],
+        integrationAttemptIds: []
+      }
+    };
+    const blocked = new CheckpointService({
+      companyId,
+      company: harness.company,
+      store: harness.store,
+      orchestrator: harness.orchestrator,
+      sessions: harness.sessions,
+      adapterFor: () => harness.cleanupAdapter,
+      gitLifecycle: {
+        abortValidations: async () => undefined,
+        settleIntegrationIntent: async () => undefined,
+        snapshot: async () => checkpoint.git,
+        reconcile: async () => ({
+          runId: "run-1",
+          classification: "tampered",
+          discrepancies: [{ kind: "integration_ref", expected: "old", actual: "third" }]
+        })
+      }
+    });
+
+    await expect(blocked.recover(checkpoint)).rejects.toThrow("Git reconciliation blocked");
+    expect(resume).not.toHaveBeenCalled();
+    expect(harness.store.getCompany(companyId)?.status).toBe("paused");
+  });
+  it("blocks a forged Git checkpoint before reconciliation or session start", async () => {
+    const harness = await createHarness();
+    const p1a = await harness.lifecycle.pause("user_requested");
+    const reconcile = vi.fn(async () => ({
+      runId: "forged-run",
+      classification: "verified" as const,
+      discrepancies: []
+    }));
+    const blocked = new CheckpointService({
+      companyId,
+      company: harness.company,
+      store: harness.store,
+      orchestrator: harness.orchestrator,
+      sessions: harness.sessions,
+      adapterFor: () => harness.cleanupAdapter,
+      gitLifecycle: {
+        abortValidations: async () => undefined,
+        settleIntegrationIntent: async () => undefined,
+        snapshot: async () => null,
+        reconcile
+      }
+    });
+
+    await expect(blocked.recover({
+      ...p1a,
+      git: {
+        runId: "forged-run",
+        integrationRef: "refs/heads/agenttown/forged-run/integration",
+        integrationCommit: "a".repeat(40),
+        workspaces: [],
+        activeSubmissionRevisions: [],
+        integrationAttemptIds: []
+      }
+    })).rejects.toMatchObject({
+      name: "RecoveryBlockedError",
+      cause: expect.objectContaining({
+        message: expect.stringContaining("checkpoint Git facts do not match durable state")
+      })
+    });
+    expect(reconcile).not.toHaveBeenCalled();
+  });
   it("stops running or paused companies as an explicit terminal state", async () => {
     const running = await createHarness();
     await running.lifecycle.stop();

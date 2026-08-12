@@ -1394,6 +1394,75 @@ export class CoreStore {
     return input.approval;
   }
 
+  commitGitReconciliationStop(input: {
+    companyId: string;
+    runId: string;
+    classification: "missing" | "tampered";
+    approval: ApprovalRecord;
+    event: NewEvent;
+  }): void {
+    if (input.approval.companyId !== input.companyId
+      || input.approval.taskId !== null
+      || input.approval.status !== "pending"
+      || input.approval.decision !== null
+      || input.approval.decidedAt !== null
+      || input.event.type !== "git.tampering_detected"
+      || input.event.actorId !== "core"
+      || input.event.taskId !== null
+      || input.event.causationEventId !== null
+      || input.event.payload.runId !== input.runId
+      || input.event.payload.classification !== input.classification
+      || !jsonValuesEqual(input.approval.request, {
+        reason: "git_reconciliation_stop",
+        runId: input.runId,
+        classification: input.classification,
+        discrepancies: input.event.payload.discrepancies
+      })) {
+      throw new Error("Git reconciliation stop bundle is invalid");
+    }
+    const inserted = this.inTransaction(() => {
+      const company = this.getCompany(input.companyId);
+      const run = this.getGitRun(input.runId);
+      if (company === null || run === null || run.companyId !== input.companyId) {
+        throw new Error("Git reconciliation stop ownership is invalid");
+      }
+      const companyUpdate = this.#database.prepare(`
+        UPDATE companies SET status = 'paused', updated_at = ? WHERE id = ?
+      `).run(new Date().toISOString(), input.companyId);
+      if (Number(companyUpdate.changes) !== 1) {
+        throw new Error("Git reconciliation company pause failed");
+      }
+      this.#putGitRunRow({
+        ...run,
+        status: input.classification === "tampered" ? "tampered" : "paused",
+        updatedAt: new Date().toISOString()
+      });
+      const existing = this.getApproval(input.approval.id);
+      if (existing === null) {
+        this.#database.prepare(`
+          INSERT INTO approvals (
+            id, company_id, task_id, status, request_json,
+            decision_json, created_at, decided_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          input.approval.id,
+          input.approval.companyId,
+          input.approval.taskId,
+          input.approval.status,
+          JSON.stringify(input.approval.request),
+          null,
+          input.approval.createdAt,
+          null
+        );
+      } else if (!jsonValuesEqual(existing.request, input.approval.request)
+        || existing.status !== "pending") {
+        throw new Error("Git reconciliation approval identity is not idempotent");
+      }
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([inserted]);
+  }
+
   getReviewDecision(
     runId: string,
     taskId: string,

@@ -4,6 +4,8 @@ import type {
   CompanyCheckpoint,
   CompanyDefinition,
   EmployeeDefinition,
+  GitCheckpoint,
+  ReconciliationResult,
   RecoveryDecision,
   SessionCheckpoint,
   SessionHandle,
@@ -43,6 +45,12 @@ export interface CheckpointServiceOptions {
   adapterFor: (agentName: string) => AgentAdapter;
   scenarios?: Readonly<Record<string, string>>;
   pauseTimeoutMs?: number;
+  gitLifecycle?: {
+    abortValidations(signal: AbortSignal, deadlineAt: number): Promise<void>;
+    settleIntegrationIntent(signal: AbortSignal): Promise<void>;
+    snapshot(): Promise<GitCheckpoint | null>;
+    reconcile(runId: string): Promise<ReconciliationResult>;
+  };
 }
 
 export class RecoveryBlockedError extends Error {
@@ -106,6 +114,48 @@ function parseHandle(value: unknown): SessionHandle {
   };
 }
 
+function parseGitCheckpoint(value: unknown): GitCheckpoint | null {
+  if (value === null) return null;
+  if (value === undefined) throw new TypeError("checkpoint git is required");
+  if (!isRecord(value)) throw new TypeError("checkpoint git must be an object or null");
+  if (!Array.isArray(value.workspaces)
+    || !Array.isArray(value.activeSubmissionRevisions)
+    || !Array.isArray(value.integrationAttemptIds)) {
+    throw new TypeError("checkpoint git collections are invalid");
+  }
+  const statuses = new Set([
+    "active", "paused", "completed", "removing", "missing", "tampered"
+  ]);
+  return {
+    runId: readString(value.runId, "checkpoint git runId"),
+    integrationRef: readString(value.integrationRef, "checkpoint git integrationRef"),
+    integrationCommit: readString(value.integrationCommit, "checkpoint git integrationCommit"),
+    workspaces: value.workspaces.map((raw) => {
+      if (!isRecord(raw) || !statuses.has(raw.status as string)) {
+        throw new TypeError("checkpoint git workspace is invalid");
+      }
+      return {
+        workspaceId: readString(raw.workspaceId, "checkpoint git workspaceId"),
+        branchRef: readString(raw.branchRef, "checkpoint git workspace branchRef"),
+        headCommit: readString(raw.headCommit, "checkpoint git workspace headCommit"),
+        status: raw.status as GitCheckpoint["workspaces"][number]["status"]
+      };
+    }),
+    activeSubmissionRevisions: value.activeSubmissionRevisions.map((raw) => {
+      if (!isRecord(raw) || !Number.isSafeInteger(raw.revision)
+        || Number(raw.revision) < 1) {
+        throw new TypeError("checkpoint git submission revision is invalid");
+      }
+      return {
+        taskId: readString(raw.taskId, "checkpoint git submission taskId"),
+        revision: Number(raw.revision)
+      };
+    }),
+    integrationAttemptIds: value.integrationAttemptIds.map((raw) =>
+      readString(raw, "checkpoint git integrationAttemptId"))
+  };
+}
+
 export function parseCompanyCheckpoint(value: unknown): CompanyCheckpoint {
   if (!isRecord(value)) throw new TypeError("checkpoint payload must be an object");
   const reason = value.reason;
@@ -124,6 +174,7 @@ export function parseCompanyCheckpoint(value: unknown): CompanyCheckpoint {
     companyId: readString(value.companyId, "checkpoint companyId"),
     reason,
     lastEventSequence: Number(value.lastEventSequence),
+    git: parseGitCheckpoint(value.git),
     sessions: value.sessions.map((raw): SessionCheckpoint => {
       if (!isRecord(raw)) throw new TypeError("checkpoint session must be an object");
       const employeeId = readString(raw.employeeId, "checkpoint session employeeId");
@@ -161,6 +212,7 @@ export class CheckpointService {
   readonly #adapterFor: CheckpointServiceOptions["adapterFor"];
   readonly #scenarios: Readonly<Record<string, string>>;
   readonly #pauseTimeoutMs: number;
+  readonly #gitLifecycle: CheckpointServiceOptions["gitLifecycle"];
   #operation: ActiveOperation | null = null;
 
   constructor(options: CheckpointServiceOptions) {
@@ -172,6 +224,7 @@ export class CheckpointService {
     this.#adapterFor = options.adapterFor;
     this.#scenarios = options.scenarios ?? {};
     this.#pauseTimeoutMs = options.pauseTimeoutMs ?? 10_000;
+    this.#gitLifecycle = options.gitLifecycle;
     if (!Number.isSafeInteger(this.#pauseTimeoutMs) || this.#pauseTimeoutMs <= 0) {
       throw new RangeError("pauseTimeoutMs must be a positive integer");
     }
@@ -271,31 +324,13 @@ export class CheckpointService {
       this.#store.commitCompanyStatusWithEvents(this.#companyId, transitioningStatus, [
         this.#event(transitioningEvent, "core", null, { reason })
       ]);
-      const interruptSignal = this.#phaseSignal(
-        deadline,
-        Math.max(1, Math.floor(this.#remaining(deadline) * 0.3))
-      );
-      const interruptOutcomes = await this.#sessions.interruptAll(interruptSignal.signal);
-      interruptSignal.dispose();
-      this.#recordInterruptOutcomes(interruptOutcomes);
-
-      const quiesceSignal = this.#phaseSignal(
-        deadline,
-        Math.max(1, Math.floor(this.#remaining(deadline) * 0.3))
-      );
-      const quiesced = await this.#orchestrator.quiesce(quiesceSignal.signal);
-      quiesceSignal.dispose();
-      const pendingReplacements = this.#sessions.cleanupOwnershipSnapshot().owners
-        .filter(({ kind }) => kind === "pending_replacement");
-      if (!quiesced || pendingReplacements.length > 0) {
-        this.#store.insertEvent(this.#event("company.pause_timeout", "core", null, {
-          phase: pendingReplacements.length > 0 ? "pending_replacement" : "quiesce",
-          timeoutMs: this.#pauseTimeoutMs,
-          pendingEmployees: pendingReplacements.map(({ employeeId }) => employeeId)
-        }));
+      let git: GitCheckpoint | null = null;
+      if (this.#gitLifecycle !== undefined) {
+        await this.#gitLifecycle.abortValidations(deadline.controller.signal, deadline.at);
+        await this.#gitLifecycle.settleIntegrationIntent(deadline.controller.signal);
+        git = await this.#gitLifecycle.snapshot();
       }
-
-      const checkpoint = this.#buildCheckpoint(reason);
+      const checkpoint = this.#buildCheckpoint(reason, git);
       const stored: StoredCheckpoint = {
         id: randomUUID(),
         companyId: this.#companyId,
@@ -322,6 +357,29 @@ export class CheckpointService {
           terminalStatus,
           terminalEvent
         );
+      }
+      const interruptSignal = this.#phaseSignal(
+        deadline,
+        Math.max(1, Math.floor(this.#remaining(deadline) * 0.3))
+      );
+      const interruptOutcomes = await this.#sessions.interruptAll(interruptSignal.signal);
+      interruptSignal.dispose();
+      this.#recordInterruptOutcomes(interruptOutcomes);
+
+      const quiesceSignal = this.#phaseSignal(
+        deadline,
+        Math.max(1, Math.floor(this.#remaining(deadline) * 0.3))
+      );
+      const quiesced = await this.#orchestrator.quiesce(quiesceSignal.signal);
+      quiesceSignal.dispose();
+      const pendingReplacements = this.#sessions.cleanupOwnershipSnapshot().owners
+        .filter(({ kind }) => kind === "pending_replacement");
+      if (!quiesced || pendingReplacements.length > 0) {
+        this.#store.insertEvent(this.#event("company.pause_timeout", "core", null, {
+          phase: pendingReplacements.length > 0 ? "pending_replacement" : "quiesce",
+          timeoutMs: this.#pauseTimeoutMs,
+          pendingEmployees: pendingReplacements.map(({ employeeId }) => employeeId)
+        }));
       }
 
       const failed = await this.#cleanupWithinDeadline(deadline);
@@ -359,6 +417,18 @@ export class CheckpointService {
       throw new Error(`company is not eligible for recovery: ${companyFact?.status ?? "missing"}`);
     }
     await this.#orchestrator.stopDispatching();
+    if (checkpoint.git !== null) {
+      if (this.#gitLifecycle === undefined) {
+        throw new Error("Git reconciliation service is required");
+      }
+      const reconciliation = await this.#gitLifecycle.reconcile(checkpoint.git.runId);
+      if (reconciliation.classification === "tampered"
+        || reconciliation.classification === "missing") {
+        throw new Error(
+          `Git reconciliation blocked: ${JSON.stringify(reconciliation.discrepancies)}`
+        );
+      }
+    }
     this.#store.commitCompanyStatusWithEvents(this.#companyId, "starting", [
       this.#event("company.starting", "core", null, {
         checkpointSequence: checkpoint.lastEventSequence
@@ -537,7 +607,7 @@ export class CheckpointService {
     return checkpoint;
   }
 
-  #buildCheckpoint(reason: PauseReason): CompanyCheckpoint {
+  #buildCheckpoint(reason: PauseReason, git: GitCheckpoint | null): CompanyCheckpoint {
     const tasks = this.#store.listTasks(this.#companyId);
     const sessions = new Map(
       this.#store.listSessions(this.#companyId).map((session) => [session.employeeId, session])
@@ -546,6 +616,7 @@ export class CheckpointService {
       companyId: this.#companyId,
       reason,
       lastEventSequence: this.#store.getLatestEventSequence(),
+      git,
       sessions: this.#company.employees.map((employee) => {
         const session = sessions.get(employee.id);
         if (session === undefined) throw new Error(`active session fact missing: ${employee.id}`);
@@ -579,6 +650,53 @@ export class CheckpointService {
   ): void {
     if (checkpoint.companyId !== this.#companyId) {
       throw new Error(`checkpoint company mismatch: ${checkpoint.companyId}`);
+    }
+    if (checkpoint.git !== null) {
+      const workspaceIds = checkpoint.git.workspaces.map(({ workspaceId }) => workspaceId);
+      const submissionTasks = checkpoint.git.activeSubmissionRevisions
+        .map(({ taskId }) => taskId);
+      if (new Set(workspaceIds).size !== workspaceIds.length
+        || new Set(submissionTasks).size !== submissionTasks.length
+        || new Set(checkpoint.git.integrationAttemptIds).size
+          !== checkpoint.git.integrationAttemptIds.length) {
+        throw new Error("checkpoint Git identities must be unique");
+      }
+      const run = this.#store.getGitRun(checkpoint.git.runId);
+      const workspaces = this.#store.listGitWorkspaces(checkpoint.git.runId).map(
+        ({ workspaceId, branchRef, headCommit, status }) => ({
+          workspaceId,
+          branchRef,
+          headCommit,
+          status
+        })
+      );
+      const submissions = new Map<string, number>();
+      for (const record of this.#store.listGitSubmissions(checkpoint.git.runId)) {
+        if (record.status === "integrated" || record.status === "superseded") continue;
+        submissions.set(
+          record.taskId,
+          Math.max(record.revision, submissions.get(record.taskId) ?? 0)
+        );
+      }
+      const activeSubmissionRevisions = [...submissions]
+        .map(([taskId, revision]) => ({ taskId, revision }))
+        .sort((left, right) => left.taskId.localeCompare(right.taskId, "en"));
+      const integrationAttemptIds = this.#store
+        .listIntegrationAttempts(checkpoint.git.runId)
+        .filter(({ status }) => status === "prepared")
+        .map(({ attemptId }) => attemptId)
+        .sort();
+      if (run === null
+        || run.companyId !== this.#companyId
+        || run.integrationRef !== checkpoint.git.integrationRef
+        || run.integrationCommit !== checkpoint.git.integrationCommit
+        || JSON.stringify(workspaces) !== JSON.stringify(checkpoint.git.workspaces)
+        || JSON.stringify(activeSubmissionRevisions)
+          !== JSON.stringify(checkpoint.git.activeSubmissionRevisions)
+        || JSON.stringify(integrationAttemptIds)
+          !== JSON.stringify(checkpoint.git.integrationAttemptIds)) {
+        throw new Error("checkpoint Git facts do not match durable state");
+      }
     }
     const expected = company.employees.map(({ id }) => id);
     const actual = checkpoint.sessions.map(({ employeeId }) => employeeId);
