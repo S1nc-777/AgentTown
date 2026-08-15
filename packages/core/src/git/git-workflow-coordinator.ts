@@ -4,10 +4,17 @@ import {
   parseReviewDecision,
   type ActionProposal,
   type AgentMessage,
+  type ApprovalView,
+  type CleanupExecuteResult,
+  type CleanupPreview,
+  type CleanupSelection,
   type CompanyDefinition,
+  type DeliveryView,
   type EmployeeDefinition,
+  type EvidenceView,
   type GitSubmissionRecord,
   type GitTaskSubmission,
+  type GitWorkspaceView,
   type GitWorkspaceRecord,
   type ReviewPackageRecord,
   type TaskRecord,
@@ -47,6 +54,11 @@ interface TaskValidationRunner {
     command: ValidationCommand,
     scope: ValidationScope
   ): Promise<ValidationRunRecord>;
+  decideGrant?(
+    grantId: string,
+    decision: "approved" | "rejected",
+    reason: string
+  ): Promise<ValidationCommandGrant>;
 }
 
 interface TaskEvidenceBuilder {
@@ -75,6 +87,11 @@ interface ConflictWorkflowService {
   supersessionFor(taskId: string): Promise<GitSubmissionRecord["supersedes"]>;
 }
 
+interface GitCleanupService {
+  preview(selection: CleanupSelection): Promise<CleanupPreview>;
+  execute(input: CleanupSelection & { fingerprint: string }): Promise<CleanupExecuteResult>;
+}
+
 export interface GitWorkflowCoordinatorOptions {
   store: CoreStore;
   companyId: string;
@@ -88,6 +105,7 @@ export interface GitWorkflowCoordinatorOptions {
   reviewService: TaskReviewService;
   integrationService?: ApprovedIntegrationService;
   conflictService?: ConflictWorkflowService;
+  cleanupService?: GitCleanupService;
   reviewerIds: ReadonlySet<string>;
   sendMessage(employeeId: string, message: AgentMessage): Promise<void>;
   leaderId?: string;
@@ -159,6 +177,7 @@ export class GitWorkflowCoordinator {
   readonly #reviewService: TaskReviewService;
   readonly #integrationService: ApprovedIntegrationService | undefined;
   readonly #conflictService: ConflictWorkflowService | undefined;
+  readonly #cleanupService: GitCleanupService | undefined;
   readonly #reviewerIds: ReadonlySet<string>;
   readonly #sendMessage: GitWorkflowCoordinatorOptions["sendMessage"];
   readonly #leaderId: string;
@@ -177,6 +196,7 @@ export class GitWorkflowCoordinator {
     this.#reviewService = options.reviewService;
     this.#integrationService = options.integrationService;
     this.#conflictService = options.conflictService;
+    this.#cleanupService = options.cleanupService;
     this.#reviewerIds = options.reviewerIds;
     this.#sendMessage = options.sendMessage;
     this.#leaderId = options.leaderId ?? this.#deriveLeaderId();
@@ -203,6 +223,202 @@ export class GitWorkflowCoordinator {
 
   stopNewActions(): void {
     this.#acceptingActions = false;
+  }
+
+  listWorkspaces(): GitWorkspaceView[] {
+    this.#requiredOwnedRun();
+    return this.#store.listGitWorkspaces(this.#runId).map((workspace) => ({
+      employeeId: workspace.employeeId,
+      taskId: workspace.taskId,
+      state: workspace.status,
+      headCommit: workspace.headCommit,
+      workspacePath: workspace.path,
+      branchRef: workspace.branchRef
+    }));
+  }
+
+  async getEvidence(taskId: string, revision?: number): Promise<EvidenceView> {
+    if (!/^[a-z][a-z0-9_-]*$/u.test(taskId)) {
+      throw new TypeError("evidence requires one exact lowercase task id");
+    }
+    this.#requiredOwnedRun();
+    if (revision !== undefined
+      && (!Number.isSafeInteger(revision) || revision < 1)) {
+      throw new TypeError("evidence revision must be a positive integer");
+    }
+    const packages = this.#store.listReviewPackages(this.#runId, taskId)
+      .filter(({ status }) => status !== "deleted" && status !== "tampered");
+    const record = revision === undefined
+      ? packages.at(-1)
+      : packages.find((candidate) => candidate.revision === revision);
+    if (record === undefined) {
+      throw new Error(`review evidence not found: ${taskId}${revision === undefined ? "" : ` revision ${revision}`}`);
+    }
+    await this.#evidenceBuilder.verify(record);
+    const submission = this.#store.getGitSubmission(
+      this.#runId,
+      taskId,
+      record.revision
+    );
+    return {
+      runId: this.#runId,
+      taskId,
+      revision: record.revision,
+      manifestHash: record.manifestHash,
+      manifestPath: record.manifestPath,
+      validationOutcomes: this.#validationOutcomes(
+        taskId,
+        submission?.submission.validationCommandIds
+      )
+    };
+  }
+
+  async getDelivery(): Promise<DeliveryView> {
+    const run = this.#requiredOwnedRun();
+    const submissions = this.#store.listGitSubmissions(this.#runId)
+      .filter(({ status }) => status === "integrated")
+      .sort((left, right) => left.taskId.localeCompare(right.taskId, "en")
+        || left.revision - right.revision);
+    const advisoryFindings: string[] = [];
+    const knownRisks: string[] = [];
+    const tasks: DeliveryView["tasks"] = [];
+    for (const submission of submissions) {
+      const task = this.#store.getTask(this.#companyId, submission.taskId);
+      const decision = this.#store.getReviewDecision(
+        this.#runId,
+        submission.taskId,
+        submission.revision
+      );
+      const reviewPackage = this.#store.getReviewPackage(
+        this.#runId,
+        submission.taskId,
+        submission.revision
+      );
+      const workspace = this.#store.listGitWorkspaces(this.#runId).find(
+        (candidate) => candidate.taskId === submission.taskId
+          && candidate.employeeId === task?.ownerEmployeeId
+          && candidate.kind === "task"
+      );
+      const expectedValidationIds = [...new Set([
+          ...submission.submission.validationCommandIds,
+          ...this.#company.validation.integrationCommandIds
+        ])];
+      const validations = this.#validationOutcomes(
+        submission.taskId,
+        expectedValidationIds
+      );
+      if (task?.ownerEmployeeId === null || task?.ownerEmployeeId === undefined
+        || workspace === undefined || decision?.decision !== "approve"
+        || reviewPackage === null || reviewPackage.status === "deleted"
+        || reviewPackage.status === "tampered"
+        || decision.reviewedManifestHash !== reviewPackage.manifestHash
+        || validations.length !== expectedValidationIds.length
+        || validations.some(({ commandId }) =>
+          !expectedValidationIds.includes(commandId))
+        || validations.some(({ outcome }) => outcome !== "passed")) {
+        throw new Error(`delivery facts are incomplete or inconsistent: ${submission.taskId}`);
+      }
+      await this.#evidenceBuilder.verify(reviewPackage);
+      advisoryFindings.push(...decision.findings
+        .filter(({ severity }) => severity === "advisory")
+        .map(({ evidence }) => evidence));
+      knownRisks.push(...submission.submission.knownRisks);
+      tasks.push({
+        taskId: submission.taskId,
+        employeeId: task.ownerEmployeeId,
+        commits: [...submission.submission.commits],
+        submissionRevision: submission.revision,
+        reviewDecision: "approve",
+        validationOutcomes: validations.map(({ commandId }) => ({
+          commandId,
+          outcome: "passed" as const
+        }))
+      });
+    }
+    return {
+      runId: this.#runId,
+      originalBranch: run.originalBranch,
+      baseCommit: run.baseCommit,
+      integrationBranch: run.integrationRef,
+      integrationCommit: run.integrationCommit,
+      tasks,
+      advisoryFindings: [...new Set(advisoryFindings)].sort((a, b) => a.localeCompare(b, "en")),
+      knownRisks: [...new Set(knownRisks)].sort((a, b) => a.localeCompare(b, "en")),
+      mergedIntoUserBranch: false,
+      pushed: false
+    };
+  }
+
+  listApprovals(): ApprovalView[] {
+    this.#requiredOwnedRun();
+    return this.#store.listValidationCommandGrants(this.#runId)
+      .filter(({ status }) => status === "pending")
+      .map((grant): ApprovalView => {
+        const workspace = this.#store.getGitWorkspace(grant.workspaceId);
+        if (workspace === null || workspace.runId !== this.#runId
+          || workspace.taskId !== grant.taskId
+          || workspace.employeeId === null) {
+          throw new Error(`pending approval workspace facts are inconsistent: ${grant.grantId}`);
+        }
+        return {
+          approvalId: grant.grantId,
+          runId: grant.runId,
+          taskId: grant.taskId,
+          workspaceId: grant.workspaceId,
+          workspacePath: workspace.path,
+          requestingEmployeeId: workspace.employeeId,
+          reason: "suggested_validation_command",
+          executable: grant.command.executable,
+          args: [...grant.command.args],
+          cwd: grant.command.cwd,
+          timeoutSeconds: grant.command.timeoutSeconds
+        };
+      })
+      .sort((left, right) => left.approvalId.localeCompare(right.approvalId, "en"));
+  }
+
+  async decideApproval(
+    approvalId: string,
+    decision: "approved" | "rejected",
+    reason: string
+  ): Promise<{ status: "approved" | "rejected" }> {
+    if (approvalId.length === 0) throw new TypeError("approval id is required");
+    const trimmedReason = reason.trim();
+    if (trimmedReason.length === 0) throw new TypeError("approval decision reason is required");
+    const current = this.#store.getValidationCommandGrant(approvalId);
+    if (current === null || current.runId !== this.#runId) {
+      throw new Error(`validation command grant not found: ${approvalId}`);
+    }
+    this.#requiredOwnedRun();
+    if (this.#validationRunner.decideGrant === undefined) {
+      throw new Error("validation grant decisions are not configured");
+    }
+    const decided = await this.#validationRunner.decideGrant(
+      approvalId,
+      decision,
+      trimmedReason
+    );
+    if (decided.runId !== this.#runId || decided.status !== decision
+      || decided.decisionReason !== trimmedReason) {
+      throw new Error("validation grant decision did not preserve exact facts");
+    }
+    return { status: decision };
+  }
+
+  cleanupPreview(selection: CleanupSelection): Promise<CleanupPreview> {
+    if (selection.runId !== this.#runId) {
+      return Promise.reject(new Error("cleanup run id does not match this workflow"));
+    }
+    return this.#requiredCleanupService().preview(selection);
+  }
+
+  cleanupExecute(
+    input: CleanupSelection & { fingerprint: string }
+  ): Promise<CleanupExecuteResult> {
+    if (input.runId !== this.#runId) {
+      return Promise.reject(new Error("cleanup run id does not match this workflow"));
+    }
+    return this.#requiredCleanupService().execute(input);
   }
 
   async assignTask(action: ActionProposal): Promise<AssignTaskOutcome> {
@@ -547,6 +763,42 @@ export class GitWorkflowCoordinator {
     const run = this.#store.getGitRun(this.#runId);
     if (run === null) throw new Error(`Git run not found: ${this.#runId}`);
     return run;
+  }
+
+  #requiredOwnedRun() {
+    const run = this.#requiredRun();
+    if (run.companyId !== this.#companyId) {
+      throw new Error("Git workflow run company ownership mismatch");
+    }
+    return run;
+  }
+
+  #validationOutcomes(
+    taskId: string,
+    commandIds?: readonly string[]
+  ): EvidenceView["validationOutcomes"] {
+    const selectedIds = commandIds === undefined ? null : new Set(commandIds);
+    const latest = new Map<string, ValidationRunRecord>();
+    for (const record of this.#store.listValidationRuns(this.#runId, taskId)) {
+      if (selectedIds !== null && !selectedIds.has(record.command.id)) continue;
+      const previous = latest.get(record.command.id);
+      if (previous === undefined
+        || record.completedAt.localeCompare(previous.completedAt, "en") > 0
+        || (record.completedAt === previous.completedAt
+          && record.validationId.localeCompare(previous.validationId, "en") > 0)) {
+        latest.set(record.command.id, record);
+      }
+    }
+    return [...latest.values()]
+      .map(({ command, outcome }) => ({ commandId: command.id, outcome }))
+      .sort((left, right) => left.commandId.localeCompare(right.commandId, "en"));
+  }
+
+  #requiredCleanupService(): GitCleanupService {
+    if (this.#cleanupService === undefined) {
+      throw new Error("Git cleanup service is not configured");
+    }
+    return this.#cleanupService;
   }
 
   #employee(employeeId: string): EmployeeDefinition {

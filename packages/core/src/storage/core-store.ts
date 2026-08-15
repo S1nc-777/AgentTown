@@ -1130,6 +1130,64 @@ export class CoreStore {
     );
   }
 
+  commitGitCleanup(input: {
+    runId: string;
+    reviewPackages: readonly ReviewPackageRecord[];
+    validationRunIds: readonly string[];
+    event: NewEvent;
+  }): void {
+    if (input.event.type !== "git.cleanup.completed"
+      || input.event.actorId.length === 0
+      || input.event.taskId !== null
+      || input.event.causationEventId !== null
+      || input.event.payload.runId !== input.runId
+      || new Set(input.validationRunIds).size !== input.validationRunIds.length
+      || input.reviewPackages.some((record) =>
+        record.runId !== input.runId || record.status !== "deleted")) {
+      throw new Error("Git cleanup facts are invalid");
+    }
+    const inserted = this.inTransaction(() => {
+      const run = this.getGitRun(input.runId);
+      if (run === null) throw new Error(`Git cleanup run not found: ${input.runId}`);
+      for (const deleted of input.reviewPackages) {
+        const current = this.getReviewPackage(
+          deleted.runId,
+          deleted.taskId,
+          deleted.revision
+        );
+        if (current === null || current.status === "deleted"
+          || !jsonValuesEqual(current, { ...deleted, status: current.status })) {
+          throw new Error("Git cleanup review package facts changed");
+        }
+        this.#database.prepare(`
+          UPDATE review_packages
+          SET record_json = ?
+          WHERE run_id = ? AND task_id = ? AND revision = ?
+        `).run(
+          JSON.stringify(deleted),
+          deleted.runId,
+          deleted.taskId,
+          deleted.revision
+        );
+      }
+      for (const validationId of input.validationRunIds) {
+        const validation = this.getValidationRun(validationId);
+        if (validation === null || validation.runId !== input.runId) {
+          throw new Error("Git cleanup validation facts changed");
+        }
+        const result = this.#database.prepare(`
+          DELETE FROM validation_runs
+          WHERE validation_id = ? AND run_id = ?
+        `).run(validationId, input.runId);
+        if (Number(result.changes) !== 1) {
+          throw new Error("Git cleanup lost validation row ownership");
+        }
+      }
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([inserted]);
+  }
+
   putReviewDecision(input: StoredReviewDecision): void {
     this.inTransaction(() => {
       const existing = this.getReviewDecision(

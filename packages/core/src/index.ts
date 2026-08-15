@@ -28,6 +28,7 @@ export {
 } from "./ipc/lease-registry.js";
 export {
   CoreServer,
+  type CoreServerGitWorkflow,
   type CoreServerOptions
 } from "./ipc/core-server.js";
 export {
@@ -117,3 +118,7 @@ export {
   GitLifecycleHooks,
   type GitLifecycleHooksOptions
 } from "./git/git-lifecycle-hooks.js";
+export {
+  CleanupService,
+  type CleanupServiceOptions
+} from "./git/cleanup-service.js";

@@ -67,3 +67,11 @@ export function renderEmployee(employee: EmployeeStatusView): string {
       + `context=${renderUsage(employee.usage.contextTokens)}`
   ].join("\n");
 }
+
+export {
+  renderApprovals,
+  renderCleanupPreview,
+  renderDelivery,
+  renderEvidence,
+  renderGitWorkspaces
+} from "./git-render.js";

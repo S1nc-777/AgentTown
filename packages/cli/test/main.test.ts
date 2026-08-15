@@ -111,6 +111,136 @@ afterEach(async () => {
 });
 
 describe("thin CLI commands", () => {
+  it("requires exact identifiers and explicit reasons for P1B commands", async () => {
+    await expect(runCli(["cleanup"], process.cwd()))
+      .rejects.toThrow("run id");
+    await expect(runCli(["evidence"], process.cwd()))
+      .rejects.toThrow("task id");
+    await expect(runCli(["approve", "grant-1"], process.cwd()))
+      .rejects.toThrow("--reason");
+    await expect(runCli(["cleanup", "all", "--yes"], process.cwd()))
+      .rejects.toThrow("exact run id");
+  });
+
+  it("routes read-only P1B commands through Core", async () => {
+    const responses: Record<string, unknown> = {
+      "git.workspaces.list": [],
+      "git.evidence.get": {
+        runId: "run-1",
+        taskId: "task-a",
+        revision: 1,
+        manifestHash: "a".repeat(64),
+        manifestPath: "C:\\evidence\\manifest.json",
+        validationOutcomes: []
+      },
+      "git.delivery.get": {
+        runId: "run-1",
+        originalBranch: "main",
+        baseCommit: "1".repeat(40),
+        integrationBranch: "refs/heads/agenttown/run-1/integration",
+        integrationCommit: "2".repeat(40),
+        tasks: [],
+        advisoryFindings: [],
+        knownRisks: [],
+        mergedIntoUserBranch: false,
+        pushed: false
+      },
+      "approvals.list": []
+    };
+    const cases = [
+      { argv: ["workspaces"], method: "git.workspaces.list", params: {} },
+      {
+        argv: ["evidence", "task-a", "--revision", "1"],
+        method: "git.evidence.get",
+        params: { taskId: "task-a", revision: 1 }
+      },
+      { argv: ["deliver"], method: "git.delivery.get", params: {} },
+      { argv: ["approvals"], method: "approvals.list", params: {} }
+    ];
+
+    for (const testCase of cases) {
+      const fake = fakeRuntime((method) => responses[method]);
+      await expect(runCli(testCase.argv, process.cwd(), fake.runtime)).resolves.toBe(0);
+      expect(fake.calls).toEqual([{ method: testCase.method, params: testCase.params }]);
+      expect(fake.starts).toEqual([false]);
+      expect(fake.closed).toEqual([1]);
+    }
+  });
+
+  it("approves and rejects one exact pending grant with a non-empty reason", async () => {
+    for (const [command, decision] of [
+      ["approve", "approved"],
+      ["reject", "rejected"]
+    ] as const) {
+      const fake = fakeRuntime(() => ({ status: decision }));
+      await expect(runCli([
+        command,
+        "grant-1",
+        "--reason",
+        "Required project test"
+      ], process.cwd(), fake.runtime)).resolves.toBe(0);
+      expect(fake.calls).toEqual([{
+        method: "approvals.decide",
+        params: {
+          approvalId: "grant-1",
+          decision,
+          reason: "Required project test"
+        }
+      }]);
+    }
+  });
+
+  it("previews then executes cleanup with an exact fingerprint", async () => {
+    const fake = fakeRuntime((method) => method === "git.cleanup.preview"
+      ? {
+          runId: "run-1",
+          removeWorktrees: true,
+          removeBranches: false,
+          removeEvidence: false,
+          workspaces: [],
+          branchRefs: [],
+          evidenceRoots: [],
+          fingerprint: "f".repeat(64)
+        }
+      : { removedWorkspaces: 0, removedBranches: 0, removedEvidenceRoots: 0 });
+
+    await expect(runCli(["cleanup", "run-1", "--yes"], process.cwd(), fake.runtime))
+      .resolves.toBe(0);
+    expect(fake.calls).toEqual([
+      {
+        method: "git.cleanup.preview",
+        params: {
+          runId: "run-1",
+          removeWorktrees: true,
+          removeBranches: false,
+          removeEvidence: false
+        }
+      },
+      {
+        method: "git.cleanup.execute",
+        params: {
+          runId: "run-1",
+          removeWorktrees: true,
+          removeBranches: false,
+          removeEvidence: false,
+          fingerprint: "f".repeat(64)
+        }
+      }
+    ]);
+  });
+
+  it("requires --yes for noninteractive cleanup and separate destructive flags", async () => {
+    if (process.stdin.isTTY) return;
+    await expect(runCli(["cleanup", "run-1"], process.cwd()))
+      .rejects.toThrow("requires --yes");
+    await expect(runCli([
+      "cleanup",
+      "run-1",
+      "--branches",
+      "--evidence"
+    ], process.cwd())).rejects.toThrow("requires --yes");
+  });
+
   it("initializes a valid template exclusively and never overwrites it", async () => {
     const root = await mkdtemp(join(tmpdir(), "agenttown-cli-"));
     roots.push(root);

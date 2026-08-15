@@ -89,6 +89,21 @@ function createHarness(options: {
     enqueue(submission: GitSubmissionRecord): Promise<void>;
     drain(): Promise<IntegrationResult | null>;
   };
+  cleanupService?: {
+    preview(input: {
+      runId: string;
+      removeWorktrees: boolean;
+      removeBranches: boolean;
+      removeEvidence: boolean;
+    }): Promise<import("@agenttown/runtime-contract").CleanupPreview>;
+    execute(input: {
+      runId: string;
+      removeWorktrees: boolean;
+      removeBranches: boolean;
+      removeEvidence: boolean;
+      fingerprint: string;
+    }): Promise<import("@agenttown/runtime-contract").CleanupExecuteResult>;
+  };
 } = {}) {
   const company = companyDefinitionFixture();
   company.validation.commands = options.commands ?? [];
@@ -234,7 +249,12 @@ function createHarness(options: {
     tasks,
     workspaceManager: { createTaskWorkspace },
     submissionValidator: { validate },
-    validationRunner: { requestGrant, run },
+    validationRunner: {
+      requestGrant,
+      run,
+      decideGrant: async (grantId, decision, reason) =>
+        store.decideValidationCommandGrant(grantId, decision, reason)
+    },
     evidenceBuilder: { create, verify },
     reviewService: { recordDecision },
     ...(options.conflictService === undefined
@@ -243,6 +263,9 @@ function createHarness(options: {
     ...(options.integrationService === undefined
       ? {}
       : { integrationService: options.integrationService }),
+    ...(options.cleanupService === undefined
+      ? {}
+      : { cleanupService: options.cleanupService }),
     reviewerIds: new Set(["reviewer"]),
     sendMessage
   });
@@ -266,6 +289,201 @@ function createHarness(options: {
 }
 
 describe("GitWorkflowCoordinator", () => {
+  it("builds workspace, evidence, delivery and approval views from durable facts", async () => {
+    const harness = createHarness();
+    harness.store.putGitWorkspace({ ...harness.workspace, status: "completed" });
+    harness.tasks.assign("task-a", "developer");
+    harness.tasks.transition("task-a", "running", "developer");
+    const integratedSubmission: GitSubmissionRecord = {
+      runId: "run-1",
+      taskId: "task-a",
+      revision: 1,
+      submission: submission(["unit"]),
+      status: "integrated",
+      supersedes: null
+    };
+    harness.store.putGitSubmission(integratedSubmission);
+    harness.store.putReviewPackage({
+      ...harness.packageRecord,
+      status: "created"
+    });
+    harness.store.putReviewDecision({
+      runId: "run-1",
+      taskId: "task-a",
+      revision: 1,
+      decision: {
+        schemaVersion: 1,
+        decision: "approve",
+        findings: [{
+          severity: "advisory",
+          evidence: "Document the edge case",
+          requiredChange: null
+        }],
+        coverageGaps: [],
+        summary: "Approved",
+        reviewedManifestHash: harness.packageRecord.manifestHash
+      }
+    });
+    await expect(harness.coordinator.getDelivery())
+      .rejects.toThrow("incomplete");
+    const validation: ValidationRunRecord = {
+      validationId: "validation-1",
+      runId: "run-1",
+      taskId: "task-a",
+      integrationAttemptId: null,
+      command: {
+        id: "unit",
+        executable: "pnpm",
+        args: ["test"],
+        cwd: ".",
+        timeoutSeconds: 600
+      },
+      workspaceId: harness.workspace.workspaceId,
+      outcome: "passed",
+      exitCode: 0,
+      startedAt: "2026-07-30T00:00:00.000Z",
+      completedAt: "2026-07-30T00:00:01.000Z",
+      logPath: "C:\\logs\\unit.log",
+      logHash: "a".repeat(64)
+    };
+    harness.store.putValidationRun({
+      ...validation,
+      validationId: "validation-0",
+      outcome: "failed",
+      exitCode: 1,
+      completedAt: "2026-07-29T23:59:59.000Z",
+      logPath: "C:\\logs\\unit-failed.log",
+      logHash: "b".repeat(64)
+    });
+    harness.store.putValidationRun(validation);
+    harness.store.putValidationCommandGrant({
+      grantId: "grant-1",
+      runId: "run-1",
+      taskId: "task-a",
+      workspaceId: harness.workspace.workspaceId,
+      command: validation.command,
+      status: "pending",
+      decisionReason: null
+    });
+
+    expect(harness.coordinator.listWorkspaces()).toEqual([expect.objectContaining({
+      employeeId: "developer",
+      taskId: "task-a",
+      state: "completed",
+      workspacePath: harness.workspace.path
+    })]);
+    await expect(harness.coordinator.getEvidence("task-a", 1)).resolves.toEqual({
+      runId: "run-1",
+      taskId: "task-a",
+      revision: 1,
+      manifestHash: harness.packageRecord.manifestHash,
+      manifestPath: harness.packageRecord.manifestPath,
+      validationOutcomes: [{ commandId: "unit", outcome: "passed" }]
+    });
+    await expect(harness.coordinator.getDelivery()).resolves.toEqual(expect.objectContaining({
+      runId: "run-1",
+      originalBranch: "main",
+      integrationBranch: "refs/heads/agenttown/run-1/integration",
+      tasks: [expect.objectContaining({
+        taskId: "task-a",
+        employeeId: "developer",
+        reviewDecision: "approve"
+      })],
+      advisoryFindings: ["Document the edge case"],
+      mergedIntoUserBranch: false,
+      pushed: false
+    }));
+    expect(harness.coordinator.listApprovals()).toEqual([expect.objectContaining({
+      approvalId: "grant-1",
+      requestingEmployeeId: "developer",
+      executable: "pnpm",
+      args: ["test"]
+    })]);
+  });
+
+  it("decides an exact pending command grant idempotently and rejects conflicts", async () => {
+    const harness = createHarness();
+    harness.store.putGitWorkspace(harness.workspace);
+    harness.store.putValidationCommandGrant({
+      grantId: "grant-1",
+      runId: "run-1",
+      taskId: "task-a",
+      workspaceId: harness.workspace.workspaceId,
+      command: {
+        id: "unit",
+        executable: "pnpm",
+        args: ["test"],
+        cwd: ".",
+        timeoutSeconds: 600
+      },
+      status: "pending",
+      decisionReason: null
+    });
+
+    await expect(harness.coordinator.decideApproval(
+      "grant-1",
+      "approved",
+      "Required project test"
+    )).resolves.toEqual({ status: "approved" });
+    await expect(harness.coordinator.decideApproval(
+      "grant-1",
+      "approved",
+      "Required project test"
+    )).resolves.toEqual({ status: "approved" });
+    await expect(harness.coordinator.decideApproval(
+      "grant-1",
+      "rejected",
+      "Changed mind"
+    )).rejects.toThrow("already approved");
+    await expect(harness.coordinator.decideApproval(
+      "missing",
+      "approved",
+      "Required project test"
+    )).rejects.toThrow("not found");
+    await expect(harness.coordinator.decideApproval(
+      "grant-1",
+      "approved",
+      "   "
+    )).rejects.toThrow("reason");
+  });
+
+  it("delegates only this workflow's exact cleanup selection and fingerprint", async () => {
+    const preview = vi.fn(async (selection) => ({
+      ...selection,
+      workspaces: [],
+      branchRefs: [],
+      evidenceRoots: [],
+      fingerprint: "f".repeat(64)
+    }));
+    const execute = vi.fn(async () => ({
+      removedWorkspaces: 0,
+      removedBranches: 0,
+      removedEvidenceRoots: 0
+    }));
+    const harness = createHarness({ cleanupService: { preview, execute } });
+    const selection = {
+      runId: "run-1",
+      removeWorktrees: true,
+      removeBranches: false,
+      removeEvidence: false
+    };
+
+    const result = await harness.coordinator.cleanupPreview(selection);
+    await harness.coordinator.cleanupExecute({
+      ...selection,
+      fingerprint: result.fingerprint
+    });
+    expect(preview).toHaveBeenCalledWith(selection);
+    expect(execute).toHaveBeenCalledWith({
+      ...selection,
+      fingerprint: result.fingerprint
+    });
+    await expect(harness.coordinator.cleanupPreview({
+      ...selection,
+      runId: "run-other"
+    })).rejects.toThrow("does not match");
+  });
+
   it("stops accepting new Git actions after the production pause fence", async () => {
     const harness = await createHarness();
     harness.coordinator.stopNewActions();

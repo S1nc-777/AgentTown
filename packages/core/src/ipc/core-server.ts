@@ -9,6 +9,13 @@ import {
   LIVE_ONLY_AFTER_SEQUENCE,
   parseActionProposal,
   parseIpcMessage,
+  type ApprovalView,
+  type CleanupExecuteResult,
+  type CleanupPreview,
+  type CleanupSelection,
+  type DeliveryView,
+  type EvidenceView,
+  type GitWorkspaceView,
   type IpcEvent,
   type IpcRequest,
   type IpcResponse
@@ -41,12 +48,29 @@ type CoreServerLifecycle = Pick<
   "pause" | "recoverLatest" | "stop"
 >;
 
+export interface CoreServerGitWorkflow {
+  listWorkspaces(): GitWorkspaceView[];
+  getEvidence(taskId: string, revision?: number): Promise<EvidenceView>;
+  getDelivery(): Promise<DeliveryView>;
+  listApprovals(): ApprovalView[];
+  decideApproval(
+    approvalId: string,
+    decision: "approved" | "rejected",
+    reason: string
+  ): Promise<{ status: "approved" | "rejected" }>;
+  cleanupPreview(selection: CleanupSelection): Promise<CleanupPreview>;
+  cleanupExecute(
+    input: CleanupSelection & { fingerprint: string }
+  ): Promise<CleanupExecuteResult>;
+}
+
 export interface CoreServerOptions {
   pipeName: string;
   store: CoreStore;
   orchestrator: CoreServerOrchestrator;
   leases: LeaseRegistry;
   lifecycle?: CoreServerLifecycle;
+  gitWorkflow?: CoreServerGitWorkflow;
   leaseSweepIntervalMs?: number;
   requestCacheSize?: number;
   maxInboundQueuedBytes?: number;
@@ -156,7 +180,31 @@ function isMutatingMethod(method: string): boolean {
     || method === "company.pause"
     || method === "company.resume"
     || method === "company.stop"
-    || method === "action.dispatch";
+    || method === "action.dispatch"
+    || method === "approvals.decide"
+    || method === "git.cleanup.execute";
+}
+
+function assertExactKeys(
+  params: Record<string, unknown>,
+  allowed: readonly string[]
+): void {
+  const allowedSet = new Set(allowed);
+  const unexpected = Object.keys(params).filter((key) => !allowedSet.has(key));
+  if (unexpected.length > 0) {
+    throw new RequestError(
+      "invalid_params",
+      `unexpected params: ${unexpected.sort().join(", ")}`
+    );
+  }
+}
+
+function requiredBoolean(params: Record<string, unknown>, key: string): boolean {
+  const value = params[key];
+  if (typeof value !== "boolean") {
+    throw new RequestError("invalid_params", `${key} must be a boolean`);
+  }
+  return value;
 }
 
 function requiredString(
@@ -241,6 +289,7 @@ export class CoreServer {
   readonly #store: CoreStore;
   readonly #orchestrator: CoreServerOrchestrator;
   readonly #lifecycle: CoreServerLifecycle | undefined;
+  readonly #gitWorkflow: CoreServerGitWorkflow | undefined;
   readonly #leases: LeaseRegistry;
   readonly #leaseSweepIntervalMs: number;
   readonly #requestCacheSize: number;
@@ -267,6 +316,7 @@ export class CoreServer {
     this.#store = options.store;
     this.#orchestrator = options.orchestrator;
     this.#lifecycle = options.lifecycle;
+    this.#gitWorkflow = options.gitWorkflow;
     this.#leases = options.leases;
     this.#leaseSweepIntervalMs = options.leaseSweepIntervalMs
       ?? DEFAULT_LEASE_SWEEP_INTERVAL_MS;
@@ -962,6 +1012,76 @@ export class CoreServer {
             rawLimit as number | undefined
           );
         }
+      case "git.workspaces.list":
+        assertExactKeys(request.params, []);
+        return this.#requiredGitWorkflow().listWorkspaces();
+      case "git.evidence.get": {
+        assertExactKeys(request.params, ["taskId", "revision"]);
+        const taskId = requiredString(request.params, "taskId");
+        const rawRevision = request.params.revision;
+        if (rawRevision === undefined) {
+          return this.#requiredGitWorkflow().getEvidence(taskId);
+        }
+        if (!Number.isSafeInteger(rawRevision) || (rawRevision as number) < 1) {
+          throw new RequestError(
+            "invalid_params",
+            "revision must be a positive integer"
+          );
+        }
+        return this.#requiredGitWorkflow().getEvidence(
+          taskId,
+          rawRevision as number
+        );
+      }
+      case "git.delivery.get":
+        assertExactKeys(request.params, []);
+        return this.#requiredGitWorkflow().getDelivery();
+      case "approvals.list":
+        assertExactKeys(request.params, []);
+        return this.#requiredGitWorkflow().listApprovals();
+      case "approvals.decide": {
+        assertExactKeys(request.params, ["approvalId", "decision", "reason"]);
+        const decision = request.params.decision;
+        if (decision !== "approved" && decision !== "rejected") {
+          throw new RequestError(
+            "invalid_params",
+            "decision must be approved or rejected"
+          );
+        }
+        const reason = requiredString(request.params, "reason").trim();
+        if (reason.length === 0) {
+          throw new RequestError("invalid_params", "reason must not be blank");
+        }
+        return this.#requiredGitWorkflow().decideApproval(
+          requiredString(request.params, "approvalId"),
+          decision,
+          reason
+        );
+      }
+      case "git.cleanup.preview": {
+        assertExactKeys(request.params, [
+          "runId",
+          "removeWorktrees",
+          "removeBranches",
+          "removeEvidence"
+        ]);
+        return this.#requiredGitWorkflow().cleanupPreview(
+          this.#cleanupSelection(request.params)
+        );
+      }
+      case "git.cleanup.execute": {
+        assertExactKeys(request.params, [
+          "runId",
+          "removeWorktrees",
+          "removeBranches",
+          "removeEvidence",
+          "fingerprint"
+        ]);
+        return this.#requiredGitWorkflow().cleanupExecute({
+          ...this.#cleanupSelection(request.params),
+          fingerprint: requiredString(request.params, "fingerprint")
+        });
+      }
       case "action.dispatch": {
         let action;
         try {
@@ -981,6 +1101,25 @@ export class CoreServer {
           `unknown IPC method: ${request.method}`
         );
     }
+  }
+
+  #requiredGitWorkflow(): CoreServerGitWorkflow {
+    if (this.#gitWorkflow === undefined) {
+      throw new RequestError(
+        "git_workflow_unavailable",
+        "this company has no active Git workflow"
+      );
+    }
+    return this.#gitWorkflow;
+  }
+
+  #cleanupSelection(params: Record<string, unknown>): CleanupSelection {
+    return {
+      runId: requiredString(params, "runId"),
+      removeWorktrees: requiredBoolean(params, "removeWorktrees"),
+      removeBranches: requiredBoolean(params, "removeBranches"),
+      removeEvidence: requiredBoolean(params, "removeEvidence")
+    };
   }
 
   #statusSnapshot(companyId: string): Record<string, unknown> {

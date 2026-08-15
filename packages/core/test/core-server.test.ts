@@ -372,6 +372,7 @@ async function createServer(input?: {
   orchestrator?: RecordingOrchestrator;
   leases?: LeaseRegistry;
   lifecycle?: RecordingLifecycle;
+  gitWorkflow?: CoreServerOptions["gitWorkflow"];
   serverOptions?: Partial<Pick<
     CoreServerOptions,
     | "maxInboundQueuedBytes"
@@ -398,6 +399,7 @@ async function createServer(input?: {
     orchestrator,
     leases,
     ...(input?.lifecycle === undefined ? {} : { lifecycle: input.lifecycle }),
+    ...(input?.gitWorkflow === undefined ? {} : { gitWorkflow: input.gitWorkflow }),
     leaseSweepIntervalMs: 10_000,
     requestCacheSize: 16,
     ...input?.serverOptions
@@ -435,6 +437,106 @@ afterEach(async () => {
 });
 
 describe.runIf(process.platform === "win32")("CoreServer", () => {
+  it("routes the versioned P1B query, approval and cleanup methods", async () => {
+    const calls: Array<{ method: string; input: unknown }> = [];
+    const gitWorkflow: NonNullable<CoreServerOptions["gitWorkflow"]> = {
+      listWorkspaces() {
+        calls.push({ method: "listWorkspaces", input: null });
+        return [];
+      },
+      async getEvidence(taskId, revision) {
+        calls.push({ method: "getEvidence", input: { taskId, revision } });
+        return {
+          runId: "run-1",
+          taskId,
+          revision: revision ?? 2,
+          manifestHash: "a".repeat(64),
+          manifestPath: "C:\\evidence\\manifest.json",
+          validationOutcomes: []
+        };
+      },
+      async getDelivery() {
+        calls.push({ method: "getDelivery", input: null });
+        return {
+          runId: "run-1",
+          originalBranch: "main",
+          baseCommit: "1".repeat(40),
+          integrationBranch: "refs/heads/agenttown/run-1/integration",
+          integrationCommit: "2".repeat(40),
+          tasks: [],
+          advisoryFindings: [],
+          knownRisks: [],
+          mergedIntoUserBranch: false,
+          pushed: false
+        };
+      },
+      listApprovals() {
+        calls.push({ method: "listApprovals", input: null });
+        return [];
+      },
+      async decideApproval(approvalId, decision, reason) {
+        calls.push({ method: "decideApproval", input: { approvalId, decision, reason } });
+        return { status: decision };
+      },
+      async cleanupPreview(selection) {
+        calls.push({ method: "cleanupPreview", input: selection });
+        return {
+          ...selection,
+          workspaces: [],
+          branchRefs: [],
+          evidenceRoots: [],
+          fingerprint: "f".repeat(64)
+        };
+      },
+      async cleanupExecute(input) {
+        calls.push({ method: "cleanupExecute", input });
+        return {
+          removedWorkspaces: 0,
+          removedBranches: 0,
+          removedEvidenceRoots: 0
+        };
+      }
+    };
+    const { pipeName } = await createServer({ gitWorkflow });
+    const client = await connectClient(pipeName);
+    await client.handshake("p1b-client", Number.MAX_SAFE_INTEGER);
+
+    await expect(client.request("git.workspaces.list", {})).resolves.toMatchObject({ ok: true, result: [] });
+    await expect(client.request("git.evidence.get", {
+      taskId: "task-a",
+      revision: 2
+    })).resolves.toMatchObject({ ok: true, result: { taskId: "task-a", revision: 2 } });
+    await expect(client.request("git.delivery.get", {})).resolves.toMatchObject({ ok: true });
+    await expect(client.request("approvals.list", {})).resolves.toMatchObject({ ok: true, result: [] });
+    await expect(client.request("approvals.decide", {
+      approvalId: "grant-1",
+      decision: "approved",
+      reason: "Required project test"
+    })).resolves.toMatchObject({ ok: true, result: { status: "approved" } });
+    await expect(client.request("git.cleanup.preview", {
+      runId: "run-1",
+      removeWorktrees: true,
+      removeBranches: false,
+      removeEvidence: false
+    })).resolves.toMatchObject({ ok: true, result: { fingerprint: "f".repeat(64) } });
+    await expect(client.request("git.cleanup.execute", {
+      runId: "run-1",
+      removeWorktrees: true,
+      removeBranches: false,
+      removeEvidence: false,
+      fingerprint: "f".repeat(64)
+    })).resolves.toMatchObject({ ok: true });
+    expect(calls.map(({ method }) => method)).toEqual([
+      "listWorkspaces",
+      "getEvidence",
+      "getDelivery",
+      "listApprovals",
+      "decideApproval",
+      "cleanupPreview",
+      "cleanupExecute"
+    ]);
+  });
+
   it("uses live-only handshake as a captured cursor and streams future events", async () => {
     const { pipeName, store } = await createServer();
     for (let index = 0; index < 301; index += 1) {

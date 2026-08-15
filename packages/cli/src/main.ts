@@ -14,6 +14,12 @@ import { resolve } from "node:path";
 import {
   LIVE_ONLY_AFTER_SEQUENCE,
   parseCompanyYaml,
+  type ApprovalView,
+  type CleanupExecuteResult,
+  type CleanupPreview,
+  type DeliveryView,
+  type EvidenceView,
+  type GitWorkspaceView,
   type RecoveryDecision,
   type TaskRecord
 } from "@agenttown/runtime-contract";
@@ -21,6 +27,13 @@ import type { EventRecord } from "@agenttown/core";
 import type { IpcEvent } from "@agenttown/runtime-contract";
 import { AgentTownClient } from "./client.js";
 import { startCore } from "./core-process.js";
+import {
+  renderApprovals,
+  renderCleanupPreview,
+  renderDelivery,
+  renderEvidence,
+  renderGitWorkspaces
+} from "./git-render.js";
 import {
   pipeNameForProject,
   resolveAgentTownPaths,
@@ -49,13 +62,25 @@ const COMMANDS = new Set([
   "timeline",
   "pause",
   "resume",
-  "stop"
+  "stop",
+  "workspaces",
+  "evidence",
+  "deliver",
+  "approvals",
+  "approve",
+  "reject",
+  "cleanup"
 ]);
 
 interface ParsedCommand {
   command: string;
   template: TemplateName;
   yes: boolean;
+  positional: string[];
+  revision: number | undefined;
+  reason: string | undefined;
+  removeBranches: boolean;
+  removeEvidence: boolean;
 }
 
 export interface BackpressureWritable {
@@ -98,12 +123,17 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
   const command = argv[0];
   if (command === undefined || !COMMANDS.has(command)) {
     throw new Error(
-      "usage: agenttown <doctor|init|start|status|tasks|timeline|pause|resume|stop>"
+      "usage: agenttown <doctor|init|start|status|tasks|timeline|pause|resume|stop|workspaces|evidence|deliver|approvals|approve|reject|cleanup>"
     );
   }
   let template: TemplateName = "minimal";
   let templateSpecified = false;
   let yes = false;
+  const positional: string[] = [];
+  let revision: number | undefined;
+  let reason: string | undefined;
+  let removeBranches = false;
+  let removeEvidence = false;
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--yes") {
@@ -120,13 +150,75 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
       index += 1;
       continue;
     }
+    if (value === "--revision") {
+      const selected = argv[index + 1];
+      const parsed = selected === undefined ? Number.NaN : Number(selected);
+      if (!Number.isSafeInteger(parsed) || parsed < 1) {
+        throw new Error("--revision must be a positive integer");
+      }
+      revision = parsed;
+      index += 1;
+      continue;
+    }
+    if (value === "--reason") {
+      const selected = argv[index + 1];
+      if (selected === undefined || selected.trim().length === 0) {
+        throw new Error("--reason must be a non-empty user reason");
+      }
+      reason = selected.trim();
+      index += 1;
+      continue;
+    }
+    if (value === "--branches") {
+      removeBranches = true;
+      continue;
+    }
+    if (value === "--evidence") {
+      removeEvidence = true;
+      continue;
+    }
+    if (!value?.startsWith("--")) {
+      positional.push(value ?? "");
+      continue;
+    }
     throw new Error(`unknown option: ${String(value)}`);
   }
   if (command !== "init" && templateSpecified) {
     throw new Error("--template is valid only with init");
   }
-  if (command !== "stop" && yes) throw new Error("--yes is valid only with stop");
-  return { command, template, yes };
+  if (command !== "stop" && command !== "cleanup" && yes) {
+    throw new Error("--yes is valid only with stop or cleanup");
+  }
+  if (command !== "evidence" && revision !== undefined) {
+    throw new Error("--revision is valid only with evidence");
+  }
+  if (command !== "approve" && command !== "reject" && reason !== undefined) {
+    throw new Error("--reason is valid only with approve or reject");
+  }
+  if (command !== "cleanup" && (removeBranches || removeEvidence)) {
+    throw new Error("--branches and --evidence are valid only with cleanup");
+  }
+  if (command === "evidence") {
+    if (positional.length !== 1) throw new Error("evidence requires one exact task id");
+  } else if (command === "approve" || command === "reject") {
+    if (positional.length !== 1) throw new Error(`${command} requires one exact approval id`);
+    if (reason === undefined) throw new Error(`${command} requires --reason`);
+  } else if (command === "cleanup") {
+    if (positional.length !== 1) throw new Error("cleanup requires one exact run id");
+    if (positional[0] === "all") throw new Error("cleanup requires an exact run id, not all");
+  } else if (positional.length !== 0) {
+    throw new Error(`${command} does not accept positional arguments`);
+  }
+  return {
+    command,
+    template,
+    yes,
+    positional,
+    revision,
+    reason,
+    removeBranches,
+    removeEvidence
+  };
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -139,6 +231,13 @@ function record(value: unknown, label: string): Record<string, unknown> {
 function requiredString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function exactIdentifier(value: string, label: string): string {
+  if (!/^[a-z][a-z0-9_-]*$/u.test(value)) {
+    throw new Error(`${label} must be one exact lowercase identifier`);
   }
   return value;
 }
@@ -399,6 +498,94 @@ async function timeline(projectRoot: string, runtime: CliRuntime): Promise<void>
   }
 }
 
+async function requestAndRender(
+  projectRoot: string,
+  runtime: CliRuntime,
+  method: string,
+  params: Record<string, unknown>,
+  render: (value: unknown) => string
+): Promise<void> {
+  const client = await runtime.connectOrStart(projectRoot, false);
+  try {
+    await writeWithBackpressure(
+      runtime.stdout,
+      `${render(await client.request(method, params))}\n`
+    );
+  } finally {
+    await client.close();
+  }
+}
+
+async function decideApproval(
+  projectRoot: string,
+  runtime: CliRuntime,
+  approvalId: string,
+  decision: "approved" | "rejected",
+  reason: string
+): Promise<void> {
+  const client = await runtime.connectOrStart(projectRoot, false);
+  try {
+    const result = record(await client.request("approvals.decide", {
+      approvalId,
+      decision,
+      reason
+    }), "approvals.decide");
+    if (result.status !== decision) {
+      throw new Error("Core did not confirm approval decision");
+    }
+    await writeWithBackpressure(runtime.stdout, `${decision}\n`);
+  } finally {
+    await client.close();
+  }
+}
+
+async function confirmCleanup(yes: boolean): Promise<void> {
+  if (yes) return;
+  if (!process.stdin.isTTY) {
+    throw new Error("cleanup requires --yes in noninteractive mode");
+  }
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await prompt.question("Execute this exact cleanup? [y/N] ");
+    if (!/^y(?:es)?$/iu.test(answer.trim())) throw new Error("cleanup cancelled");
+  } finally {
+    prompt.close();
+  }
+}
+
+async function cleanup(
+  projectRoot: string,
+  runtime: CliRuntime,
+  parsed: ParsedCommand
+): Promise<void> {
+  await confirmCleanup(parsed.yes);
+  const runId = exactIdentifier(parsed.positional[0]!, "run id");
+  const selection = {
+    runId,
+    removeWorktrees: true,
+    removeBranches: parsed.removeBranches,
+    removeEvidence: parsed.removeEvidence
+  };
+  const client = await runtime.connectOrStart(projectRoot, false);
+  try {
+    const preview = await client.request(
+      "git.cleanup.preview",
+      selection
+    ) as CleanupPreview;
+    await writeWithBackpressure(runtime.stdout, `${renderCleanupPreview(preview)}\n`);
+    const result = await client.request("git.cleanup.execute", {
+      ...selection,
+      fingerprint: requiredString(preview.fingerprint, "cleanup fingerprint")
+    }) as CleanupExecuteResult;
+    await writeWithBackpressure(
+      runtime.stdout,
+      `removed worktrees=${result.removedWorkspaces} branches=${result.removedBranches} evidence=${result.removedEvidenceRoots}\n`
+    );
+  } finally {
+    await client.close();
+  }
+}
+
 async function pause(projectRoot: string, runtime: CliRuntime): Promise<void> {
   const client = await runtime.connectOrStart(projectRoot, false);
   try {
@@ -502,6 +689,45 @@ export async function runCli(
       return 0;
     case "stop":
       await stop(projectRoot, parsed.yes, runtime);
+      return 0;
+    case "workspaces":
+      await requestAndRender(projectRoot, runtime, "git.workspaces.list", {},
+        (value) => renderGitWorkspaces(value as GitWorkspaceView[]));
+      return 0;
+    case "evidence": {
+      const taskId = exactIdentifier(parsed.positional[0]!, "task id");
+      await requestAndRender(
+        projectRoot,
+        runtime,
+        "git.evidence.get",
+        {
+          taskId,
+          ...(parsed.revision === undefined ? {} : { revision: parsed.revision })
+        },
+        (value) => renderEvidence(value as EvidenceView)
+      );
+      return 0;
+    }
+    case "deliver":
+      await requestAndRender(projectRoot, runtime, "git.delivery.get", {},
+        (value) => renderDelivery(value as DeliveryView));
+      return 0;
+    case "approvals":
+      await requestAndRender(projectRoot, runtime, "approvals.list", {},
+        (value) => renderApprovals(value as ApprovalView[]));
+      return 0;
+    case "approve":
+    case "reject":
+      await decideApproval(
+        projectRoot,
+        runtime,
+        requiredString(parsed.positional[0], "approval id"),
+        parsed.command === "approve" ? "approved" : "rejected",
+        parsed.reason!
+      );
+      return 0;
+    case "cleanup":
+      await cleanup(projectRoot, runtime, parsed);
       return 0;
     default:
       throw new Error(`unsupported command: ${parsed.command}`);
