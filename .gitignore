@@ -10,3 +10,9 @@ artifacts/feasibility/**/events.jsonl
 .env
 .env.*
 !.env.example
+
+# 本地对话档案（含与 Codex 的完整开发对话与子代理会话，不提交公开仓库）
+conversation-archive/
+
+# pnpm ���ش洢������⣩
+.pnpm-store/
