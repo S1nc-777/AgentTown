@@ -17,7 +17,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GitWorkflowCoordinator
 } from "../src/git/git-workflow-coordinator.js";
-import type { IntegrationResult } from "../src/git/integration-service.js";
+import { GitLifecycleHooks } from "../src/git/git-lifecycle-hooks.js";
+import { GitReconciler } from "../src/git/git-reconciler.js";
+import { IntegrationService, type IntegrationResult } from "../src/git/integration-service.js";
+import { ValidationRunner } from "../src/git/validation-runner.js";
 import type { ValidatedSubmission } from "../src/git/submission-validator.js";
 import { CoreStore } from "../src/storage/core-store.js";
 import { TaskService } from "../src/tasks/task-service.js";
@@ -263,6 +266,62 @@ function createHarness(options: {
 }
 
 describe("GitWorkflowCoordinator", () => {
+  it("stops accepting new Git actions after the production pause fence", async () => {
+    const harness = await createHarness();
+    harness.coordinator.stopNewActions();
+
+    expect(harness.coordinator.handles(action({
+      type: "task.assign",
+      actor: "leader",
+      taskId: "task-a",
+      payload: { assignee: "developer" }
+    }))).toBe(false);
+  });
+
+  it("composes real workflow, validation and integration fences under one deadline", async () => {
+    const harness = createHarness();
+    const validation = new ValidationRunner({
+      store: harness.store,
+      companyId: "company-1",
+      company: harness.company
+    });
+    const integration = new IntegrationService({
+      store: harness.store,
+      companyId: "company-1",
+      company: harness.company,
+      runId: "run-1",
+      workspaceManager: {
+        createCandidateWorkspace: async () => { throw new Error("not reached"); },
+        removeVerifiedWorkspace: async () => undefined
+      },
+      validationRunner: validation
+    });
+    const reconciler = new GitReconciler({
+      store: harness.store,
+      companyId: "company-1",
+      workspaceManager: { removeVerifiedWorkspace: async () => undefined },
+      evidenceBuilder: { verify: async (record) => record }
+    });
+    const hooks = new GitLifecycleHooks({
+      runId: "run-1",
+      coordinator: harness.coordinator,
+      validationRunner: validation,
+      integrationService: integration,
+      reconciler
+    });
+    const deadlineAt = Date.now() + 5_000;
+
+    await hooks.abortValidations(new AbortController().signal, deadlineAt);
+    await hooks.settleIntegrationIntent(new AbortController().signal, deadlineAt);
+
+    expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
+    expect(harness.coordinator.handles(action({
+      type: "task.assign",
+      actor: "leader",
+      taskId: "task-a",
+      payload: { assignee: "developer" }
+    }))).toBe(false);
+  });
   it("claims an active Git owner's submission even when its workspace is missing", async () => {
     const harness = createHarness();
     harness.tasks.assign("task-a", "developer");

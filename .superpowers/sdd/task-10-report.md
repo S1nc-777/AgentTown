@@ -16,8 +16,10 @@ sleep, or historical fixture change was added.
 - Classifies exact facts, original-user-worktree warnings, missing commits,
   refs, worktrees and evidence, task/workspace/ref tampering, and prepared old,
   new, or third-SHA crash windows.
-- New-SHA recovery uses the existing strict `commitIntegratedTask` bundle and
-  authenticated final events; it does not infer or fabricate completion.
+- New-SHA recovery uses the existing strict `commitIntegratedTask` bundle for
+  ordinary submissions and the Task 9 `ConflictService.completeResolution`
+  transaction for superseding resolution submissions; it does not infer or
+  fabricate completion.
 - Old-SHA recovery only completes a verified candidate workspace, invokes
   WorkspaceManager verified removal, CAS-deletes the exact candidate ref, and
   durably aborts the attempt. It never resets, force-checks out, cleans, or
@@ -112,3 +114,112 @@ when run in the required single-worker Git-heavy mode above.
 - Runtime wiring is exposed through `CheckpointService.gitLifecycle`; current
   P1A `main.ts` intentionally does not construct P1B services and therefore
   continues to checkpoint `git: null`.
+
+## Independent review remediation (commit after `b54cf08`)
+
+An independent review found one critical and three important omissions in the
+first Task 10 commit. All four were reproduced, fixed under TDD, and covered by
+real-object or real-Git tests without adding Task 11/12 behavior.
+
+### 1. Strict supersession recovery
+
+Root cause: `GitReconciler.#completePrepared` unconditionally called the
+ordinary `commitIntegratedTask` bundle. A resolution submission with a
+non-null `supersedes` link therefore bypassed Task 9's strict resolved-conflict
+transaction.
+
+- RED:
+  `pnpm exec vitest run test/conflict-service.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1 -t "recovers a resolution"`
+  - 1 failed, 14 skipped. The original submission was expected to be
+    `superseded` but remained `queued`.
+- GREEN: the same command passed 1 test, 14 skipped, after injecting the
+  existing `ConflictService.completeResolution` recovery boundary.
+- Negative recovery coverage forged each original attempt, original
+  submission, original task, and conflict creation event chain after CAS.
+  `-t "atomically stops supersession recovery"` passed 4 tests, 15 skipped;
+  every case retained the prepared resolution attempt, emitted no fabricated
+  completion, and atomically paused with approval.
+
+### 2. Verified old-SHA cleanup
+
+Root cause: old-SHA reconciliation called cleanup before authenticating the
+candidate's durable identity/path/ref/base/head against current Git, and raw
+`WorkspaceTamperError` failures could escape without the atomic stop bundle.
+
+- RED:
+  `pnpm exec vitest run test/git-reconciler.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1 -t "old-SHA candidate"`
+  - 4 failed: missing path and candidate mismatch were incorrectly aborted;
+    missing ref and changed head leaked raw errors.
+- GREEN: first 4/4, then 6/6 after durable changed-path/ref cases were added.
+  The final table also covers status identity and asserts `removeVerifiedWorkspace`
+  is never called for a failed precondition.
+- A real-Git ref mutation immediately before verified removal passes 1/1 and
+  produces a `tampered` atomic stop while the attempt remains prepared.
+- SQLite's existing unique `git_workspaces.branch_ref` constraint rejected a
+  duplicate durable candidate before reconciliation, so duplicate identity
+  cannot be created through `CoreStore`.
+
+### 3. Production pause fences
+
+Root cause: the initial implementation exposed only an optional checkpoint
+seam. `ValidationRunner` had no active-run registry, `IntegrationService` had
+no dispatch/settlement fence, and `GitWorkflowCoordinator` had no production
+action fence.
+
+- Validation RED: `runner.abortActive is not a function`. A real child-process
+  test now passes 1/1 and proves identity-safe termination and settlement under
+  the caller's absolute deadline.
+- Integration/coordinator RED: both production methods were missing. Their
+  focused command now passes 2/2 and proves fenced dispatch.
+- A real in-flight integration test initially exposed two incorrect test
+  interception points as unchanged 20-second test timeouts. After systematic
+  tracing identified the actual `rev-parse --verify` intent boundary, the test
+  passed 1/1 (23 skipped, 5.12s): settlement remains pending until the active
+  operation is released, completes within the same deadline, and rejects all
+  later integration dispatch.
+- Production `GitLifecycleHooks` composition RED failed module import before
+  test collection. The composition plus checkpoint absolute-deadline test now
+  passes 2/2 (40 skipped) and wires real coordinator, validation runner,
+  integration service, and reconciler objects. `CheckpointService` supplies
+  the same absolute deadline to both abort and settlement phases.
+
+### 4. Deterministic approval episodes
+
+Root cause: approval identity was fixed per run and replay always inserted a
+new event. It could neither represent changed/decided episodes nor prove an
+exact pending replay.
+
+- RED for pending replay and changed discrepancies: 2/2 failed because replay
+  duplicated `git.tampering_detected` and changed facts collided with the fixed
+  approval ID.
+- GREEN: canonical sorted discrepancies plus SHA-256 episode identity made the
+  combined stop/episode gate pass 7/7.
+- Decided-episode RED was `commitApprovalDecision is not a function`; the
+  strict atomic decision bundle and suffix sequence made decided plus forged
+  episode tests pass 2/2 (31 skipped).
+- Self-review found a further same-ID hole: a foreign-company approval paired
+  with an exact-looking tamper event was accepted. RED was “expected function
+  to throw”; strict company/task/decision/created-at ownership, deterministic
+  event identity, and reuse of the original pending `createdAt` made the
+  episode replay/decision/foreign-owner gate pass 3/3 (33 skipped).
+
+### Remediation verification
+
+- Core typecheck initially found two incomplete `ActionProposal` test values
+  (`TS2739`); using the existing authenticated action fixture made
+  `pnpm --filter @agenttown/core typecheck` pass.
+- Focused/affected serial:
+  `pnpm exec vitest run test/git-reconciler.test.ts test/checkpoint-service.test.ts test/conflict-service.test.ts test/integration-service.test.ts test/validation-runner.test.ts test/git-workflow-coordinator.test.ts test/core-store.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1`
+  - 7 files, 143 tests passed, 300.47s.
+- Complete Core serial:
+  `pnpm exec vitest run --reporter=dot --no-file-parallelism --maxWorkers=1`
+  - 20 files, 407 tests passed, 500.58s.
+- Runtime contract: 3 files, 30 tests passed.
+- P1A: 2 files, 9 tests passed.
+- Root `pnpm typecheck`: all 8 participating workspace projects passed.
+- Final `git diff --check`: passed (only configured LF-to-CRLF notices).
+
+No force/reset/clean/recursive deletion, dependency, push, production timeout,
+retry, sleep, historical fixture deletion, Task 11 CLI, or Task 12 Fake E2E
+behavior was introduced. P1A remains explicit `git: null`; the production
+P1B lifecycle composition is exported for the later Task 11 runtime assembly.

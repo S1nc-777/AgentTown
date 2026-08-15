@@ -90,7 +90,7 @@ async function createHarness(options: {
   storeFactory?: (databasePath: string) => CoreStore;
   gitLifecycle?: {
     abortValidations(signal: AbortSignal, deadlineAt: number): Promise<void>;
-    settleIntegrationIntent(signal: AbortSignal): Promise<void>;
+    settleIntegrationIntent(signal: AbortSignal, deadlineAt: number): Promise<void>;
     snapshot(): Promise<GitCheckpoint | null>;
     reconcile(runId: string): Promise<ReconciliationResult>;
   };
@@ -234,7 +234,8 @@ describe("CheckpointService", () => {
           expect(deadlineAt).toBeGreaterThan(Date.now());
           calls.push("abort-validations");
         },
-        settleIntegrationIntent: async () => {
+        settleIntegrationIntent: async (_signal, deadlineAt) => {
+          expect(deadlineAt).toBeGreaterThan(Date.now());
           calls.push("settle-intent");
         },
         snapshot: async () => {

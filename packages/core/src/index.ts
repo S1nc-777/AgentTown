@@ -113,3 +113,7 @@ export {
   GitReconciler,
   type GitReconcilerOptions
 } from "./git/git-reconciler.js";
+export {
+  GitLifecycleHooks,
+  type GitLifecycleHooksOptions
+} from "./git/git-lifecycle-hooks.js";

@@ -139,6 +139,24 @@ function sameCommand(left: ValidationCommand, right: ValidationCommand): boolean
     && left.args.every((argument, index) => argument === right.args[index]);
 }
 
+async function beforeDeadline<T>(operation: Promise<T>, deadlineAt: number): Promise<T> {
+  if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= Date.now()) {
+    throw new Error("integration settlement deadline has expired");
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return await Promise.race([
+    operation,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("integration intent settlement exceeded deadline")),
+        Math.max(0, deadlineAt - Date.now())
+      );
+    })
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 function pathKey(path: string): string {
   const normalized = resolve(path).replaceAll("\\", "/");
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -154,6 +172,8 @@ export class IntegrationService {
   readonly #faultHooks: IntegrationFaultHooks;
   readonly #git: IntegrationGitRunner;
   readonly #conflictService: ResolutionConflictService | undefined;
+  readonly #active = new Set<Promise<IntegrationResult>>();
+  #accepting = true;
 
   constructor(options: IntegrationServiceOptions) {
     this.#store = options.store;
@@ -219,7 +239,24 @@ export class IntegrationService {
     return null;
   }
 
+  async settleIntegrationIntent(deadlineAt: number): Promise<void> {
+    this.#accepting = false;
+    const active = [...this.#active];
+    await beforeDeadline(Promise.allSettled(active).then(() => undefined), deadlineAt);
+  }
+
   async integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
+    if (!this.#accepting) throw new Error("integration dispatch is fenced");
+    const operation = this.#integrate(submission);
+    this.#active.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.#active.delete(operation);
+    }
+  }
+
+  async #integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
     const existing = await this.#existingAttemptResult(submission);
     if (existing !== null) return existing;
     await this.#assertResolutionSupersession(submission);

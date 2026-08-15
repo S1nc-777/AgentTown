@@ -180,6 +180,7 @@ interface RealHarnessOptions {
   validationFails?: boolean;
   validationScripts?: string[];
   faultHooks?: IntegrationFaultHooks;
+  git?: { run: GitCommandRunner["run"] };
 }
 
 async function realHarness(
@@ -328,6 +329,7 @@ async function realHarness(
     runId: "run-1",
     workspaceManager: manager,
     validationRunner,
+    ...(options.git === undefined ? {} : { git: options.git }),
     ...(options.faultHooks === undefined
       ? {}
       : { faultHooks: options.faultHooks })
@@ -434,6 +436,56 @@ async function expectReplayIsStable(
 }
 
 describe("IntegrationService", () => {
+  it("waits for an active integration to reach its intent boundary before settling", async () => {
+    const baseGit = new GitCommandRunner();
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolveBlocked) => { release = resolveBlocked; });
+    const active = new Promise<void>((resolveEntered) => { entered = resolveEntered; });
+    let held = false;
+    let shouldBlock = false;
+    const harness = await realHarness({
+      git: {
+        run: async (args, options) => {
+          if (shouldBlock && !held && args[0] === "rev-parse" && args[1] === "--verify") {
+            held = true;
+            entered();
+            await blocked;
+          }
+          return baseGit.run(args, options);
+        }
+      }
+    });
+    shouldBlock = true;
+    const integration = harness.service.integrate(harness.approved);
+    await active;
+    let settled = false;
+    const deadlineAt = Date.now() + 10_000;
+    const settlement = harness.service.settleIntegrationIntent(deadlineAt).then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await settlement;
+
+    expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
+    await expect(integration).resolves.toMatchObject({ kind: "integrated" });
+    await expect(harness.service.integrate(harness.approved)).rejects.toThrow("fenced");
+  }, 20_000);
+
+  it("fences new integrations and settles active intent within the caller deadline", async () => {
+    const harness = await queueHarness();
+    const approved = harness.approve(harness.createTask("task-a"));
+    const deadlineAt = Date.now() + 5_000;
+
+    await harness.service.settleIntegrationIntent(deadlineAt);
+
+    expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
+    await expect(harness.service.integrate(approved)).rejects.toThrow("fenced");
+    expect(harness.store.listIntegrationAttempts("run-1")).toEqual([]);
+  });
   it("orders ready submissions by DAG layer, creation sequence, then task id", () => {
     expect(orderIntegrations([
       { taskId: "task-b", layer: 0, createdSequence: 12 },

@@ -9,6 +9,7 @@ import type {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConflictService } from "../src/index.js";
 import { GitCommandRunner } from "../src/git/git-command.js";
+import { GitReconciler } from "../src/git/git-reconciler.js";
 import { IntegrationService } from "../src/git/integration-service.js";
 import { CoreStore } from "../src/storage/core-store.js";
 import { TaskService } from "../src/tasks/task-service.js";
@@ -52,7 +53,8 @@ async function reviewedResolution(
     taskId: "task-a",
     revision: 1,
     attemptId: harness.attempt.attemptId
-  }
+  },
+  faultHooks?: ConstructorParameters<typeof IntegrationService>[0]["faultHooks"]
 ): Promise<{
   approved: GitSubmissionRecord;
   conflict: TaskRecord;
@@ -154,6 +156,7 @@ async function reviewedResolution(
       }
     },
     conflictService: harness.service
+    ,...(faultHooks === undefined ? {} : { faultHooks })
   });
   return { approved, conflict, integration };
 }
@@ -534,6 +537,104 @@ describe("ConflictService", () => {
     ]));
     expect(listener).toHaveBeenCalled();
   }, 30_000);
+
+  it("recovers a resolution after CAS with the exact strict supersession bundle", async () => {
+    const harness = await conflictHarness();
+    const { approved, conflict } = await reviewedResolution(
+      harness,
+      undefined,
+      { afterRefUpdated: () => { throw new Error("crash after resolution CAS"); } }
+    );
+    const crashed = new IntegrationService({
+      store: harness.store,
+      companyId: "company-1",
+      company: harness.company,
+      runId: "run-1",
+      workspaceManager: harness.manager,
+      validationRunner: { run: async () => { throw new Error("not configured"); } },
+      conflictService: harness.service,
+      faultHooks: { afterRefUpdated: () => { throw new Error("crash after resolution CAS"); } }
+    });
+    await expect(crashed.integrate(approved)).rejects.toThrow("crash after resolution CAS");
+    const attempt = harness.store.listIntegrationAttempts("run-1", conflict.id)[0]!;
+    const reconciler = new GitReconciler({
+      store: harness.store,
+      companyId: "company-1",
+      workspaceManager: harness.manager,
+      evidenceBuilder: { verify: async (record) => record },
+      conflictService: harness.service
+    });
+
+    const result = await reconciler.reconcile("run-1");
+
+    expect(result.classification).toBe("completed_recovery");
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId)?.status).toBe("committed");
+    expect(harness.store.getGitSubmission("run-1", conflict.id, 1)?.status).toBe("integrated");
+    expect(harness.store.getGitSubmission("run-1", "task-a", 1)?.status).toBe("superseded");
+    expect(harness.store.getTask("company-1", conflict.id)?.status).toBe("completed");
+    expect(harness.store.getTask("company-1", "task-a")?.status).toBe("completed");
+    expect(harness.store.listEvents(0).filter(({ type }) => type === "task.completed")
+      .map(({ taskId }) => taskId)).toEqual(expect.arrayContaining([conflict.id, "task-a"]));
+  }, 30_000);
+
+  it.each(["original-attempt", "original-submission", "original-task", "event-chain"])(
+    "atomically stops supersession recovery for a forged %s",
+    async (scenario) => {
+      const harness = await conflictHarness();
+      const { approved, conflict } = await reviewedResolution(harness);
+      const crashed = new IntegrationService({
+        store: harness.store,
+        companyId: "company-1",
+        company: harness.company,
+        runId: "run-1",
+        workspaceManager: harness.manager,
+        validationRunner: { run: async () => { throw new Error("not configured"); } },
+        conflictService: harness.service,
+        faultHooks: { afterRefUpdated: () => { throw new Error("crash after resolution CAS"); } }
+      });
+      await expect(crashed.integrate(approved)).rejects.toThrow("crash after resolution CAS");
+      const attempt = harness.store.listIntegrationAttempts("run-1", conflict.id)[0]!;
+      if (scenario === "original-attempt") {
+        harness.store.putIntegrationAttempt({ ...harness.attempt, status: "aborted" });
+      } else if (scenario === "original-submission") {
+        harness.store.putGitSubmission({
+          ...harness.store.getGitSubmission("run-1", "task-a", 1)!,
+          status: "superseded"
+        });
+      } else if (scenario === "original-task") {
+        const forged = coreEvent("task.review_approved", "task-a");
+        harness.store.putTask("company-1", {
+          ...harness.store.getTask("company-1", "task-a")!,
+          status: "review",
+          updatedEventId: forged.id
+        }, [forged]);
+      } else {
+        const forged = coreEvent("task.audit", conflict.id);
+        harness.store.putTask("company-1", {
+          ...harness.store.getTask("company-1", conflict.id)!,
+          createdEventId: forged.id,
+          updatedEventId: forged.id
+        }, [forged]);
+      }
+      const reconciler = new GitReconciler({
+        store: harness.store,
+        companyId: "company-1",
+        workspaceManager: harness.manager,
+        evidenceBuilder: { verify: async (record) => record },
+        conflictService: harness.service
+      });
+
+      const result = await reconciler.reconcile("run-1");
+
+      expect(result.classification).toBe("tampered");
+      expect(harness.store.getIntegrationAttempt(attempt.attemptId)?.status).toBe("prepared");
+      expect(harness.store.getGitSubmission("run-1", conflict.id, 1)?.status).toBe("queued");
+      expect(harness.store.getTask("company-1", conflict.id)?.status).not.toBe("completed");
+      expect(harness.store.getCompany("company-1")?.status).toBe("paused");
+      expect(harness.store.listPendingApprovals("company-1")).toHaveLength(1);
+    },
+    30_000
+  );
 
   it("replays a completed resolution without re-executing the terminal conflict attempt", async () => {
     const harness = await conflictHarness();

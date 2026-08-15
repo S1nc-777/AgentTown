@@ -47,7 +47,7 @@ export interface CheckpointServiceOptions {
   pauseTimeoutMs?: number;
   gitLifecycle?: {
     abortValidations(signal: AbortSignal, deadlineAt: number): Promise<void>;
-    settleIntegrationIntent(signal: AbortSignal): Promise<void>;
+    settleIntegrationIntent(signal: AbortSignal, deadlineAt: number): Promise<void>;
     snapshot(): Promise<GitCheckpoint | null>;
     reconcile(runId: string): Promise<ReconciliationResult>;
   };
@@ -327,7 +327,7 @@ export class CheckpointService {
       let git: GitCheckpoint | null = null;
       if (this.#gitLifecycle !== undefined) {
         await this.#gitLifecycle.abortValidations(deadline.controller.signal, deadline.at);
-        await this.#gitLifecycle.settleIntegrationIntent(deadline.controller.signal);
+        await this.#gitLifecycle.settleIntegrationIntent(deadline.controller.signal, deadline.at);
         git = await this.#gitLifecycle.snapshot();
       }
       const checkpoint = this.#buildCheckpoint(reason, git);

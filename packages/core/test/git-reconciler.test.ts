@@ -8,6 +8,7 @@ import type {
 } from "@agenttown/runtime-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GitReconciler } from "../src/git/git-reconciler.js";
+import { GitCommandRunner } from "../src/git/git-command.js";
 import { IntegrationService } from "../src/git/integration-service.js";
 import { ValidationRunner } from "../src/git/validation-runner.js";
 import { WorkspaceManager } from "../src/git/workspace-manager.js";
@@ -47,7 +48,7 @@ function submission(headCommit: string): GitTaskSubmission {
 }
 
 async function setup(options: {
-  preparedAt?: "old" | "new";
+  preparedAt?: "old" | "before-cas" | "new";
   evidenceFailure?: Error;
 } = {}) {
   const repo = await createGitFixture();
@@ -148,6 +149,7 @@ async function setup(options: {
         reviewedManifestHash: "c".repeat(64)
       }
     });
+    const baseGit = new GitCommandRunner();
     const service = new IntegrationService({
       store,
       companyId: "company-1",
@@ -158,8 +160,22 @@ async function setup(options: {
       faultHooks: options.preparedAt === "old"
         ? { afterPrepared: () => { throw new Error("crash after prepare"); } }
         : { afterRefUpdated: () => { throw new Error("crash after CAS"); } }
+      ,...(options.preparedAt === "before-cas" ? {
+        git: {
+          run: async (args, gitOptions) =>
+            args[0] === "update-ref" && args[1] === "refs/heads/agenttown/run-1/integration"
+              ? { stdout: "", stderr: "CAS blocked", exitCode: 1 }
+              : baseGit.run(args, gitOptions)
+        }
+      } : {})
     });
-    await expect(service.integrate(approved)).rejects.toThrow(/crash after/u);
+    if (options.preparedAt === "before-cas") {
+      await expect(service.integrate(approved)).resolves.toMatchObject({
+        kind: "reconciliation_required"
+      });
+    } else {
+      await expect(service.integrate(approved)).rejects.toThrow(/crash after/u);
+    }
   }
   const reconciler = new GitReconciler({
     store,
@@ -240,6 +256,90 @@ describe("GitReconciler", () => {
     }]);
   });
 
+  it("replays the same pending reconciliation episode without duplicate approval or event", async () => {
+    const harness = await setup();
+    await harness.repo.git([
+      "update-ref", "-d", "refs/heads/agenttown/run-1/integration", harness.oldCommit
+    ]);
+
+    const first = await harness.reconciler.reconcile("run-1");
+    const beforeApprovals = harness.store.listPendingApprovals("company-1");
+    const beforeEvents = harness.store.listEvents(0).filter(
+      ({ type }) => type === "git.tampering_detected"
+    );
+    const second = await harness.reconciler.reconcile("run-1");
+
+    expect(second).toEqual(first);
+    expect(harness.store.listPendingApprovals("company-1")).toEqual(beforeApprovals);
+    expect(harness.store.listEvents(0).filter(
+      ({ type }) => type === "git.tampering_detected"
+    )).toEqual(beforeEvents);
+  });
+
+  it("creates a distinct approval episode when exact discrepancies change", async () => {
+    const harness = await setup();
+    await harness.repo.git([
+      "update-ref", "-d", "refs/heads/agenttown/run-1/integration", harness.oldCommit
+    ]);
+    await harness.reconciler.reconcile("run-1");
+    const first = harness.store.listPendingApprovals("company-1")[0]!;
+    await harness.repo.write("third.txt", "third\n");
+    await harness.repo.git(["add", "third.txt"]);
+    await harness.repo.git(["commit", "-m", "third"]);
+    await harness.repo.git([
+      "update-ref", "refs/heads/agenttown/run-1/integration", await ref(harness.repo, "HEAD")
+    ]);
+
+    await harness.reconciler.reconcile("run-1");
+
+    const approvals = harness.store.listPendingApprovals("company-1");
+    expect(approvals).toHaveLength(2);
+    expect(approvals[1]?.id).not.toBe(first.id);
+  });
+
+  it("creates a new approval episode after the previous exact episode was decided", async () => {
+    const harness = await setup();
+    await harness.repo.git([
+      "update-ref", "-d", "refs/heads/agenttown/run-1/integration", harness.oldCommit
+    ]);
+    await harness.reconciler.reconcile("run-1");
+    const first = harness.store.listPendingApprovals("company-1")[0]!;
+    const detected = harness.store.listEvents(0).find((event) =>
+      event.type === "git.tampering_detected" && event.payload.approvalId === first.id
+    )!;
+    const decidedAt = new Date().toISOString();
+    harness.store.commitApprovalDecision({
+      approval: {
+        ...first,
+        status: "rejected",
+        decision: { choice: "keep_blocked" },
+        decidedAt
+      },
+      event: {
+        id: "approval-decision-1",
+        type: "user.approval.decided",
+        actorId: "owner",
+        taskId: null,
+        causationEventId: detected.id,
+        payload: {
+          approvalId: first.id,
+          status: "rejected",
+          decision: { choice: "keep_blocked" }
+        }
+      }
+    });
+
+    await harness.reconciler.reconcile("run-1");
+
+    const pending = harness.store.listPendingApprovals("company-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.id).not.toBe(first.id);
+    expect(harness.store.getApproval(first.id)?.status).toBe("rejected");
+    expect(harness.store.listEvents(0).filter(
+      ({ type }) => type === "git.tampering_detected"
+    )).toHaveLength(2);
+  });
+
   it("classifies a missing durable commit object as missing", async () => {
     const harness = await setup();
     harness.store.putGitRun({
@@ -305,6 +405,93 @@ describe("GitReconciler", () => {
     expect(harness.store.getIntegrationAttempt(attempt.attemptId)?.status).toBe("aborted");
     expect(await ref(harness.repo, "refs/heads/agenttown/run-1/integration"))
       .toBe(harness.oldCommit);
+  });
+
+  it.each([
+    "missing-path",
+    "missing-ref",
+    "changed-head",
+    "candidate-mismatch",
+    "changed-record-path",
+    "changed-record-ref",
+    "changed-record-status"
+  ])(
+    "stops instead of aborting an old-SHA candidate with %s",
+    async (scenario) => {
+      const harness = await setup({ preparedAt: "before-cas" });
+      const attempt = harness.store.listIntegrationAttempts("run-1")[0]!;
+      const candidate = harness.store.listGitWorkspaces("run-1")
+        .find(({ kind }) => kind === "candidate")!;
+      const remove = vi.spyOn(harness.manager, "removeVerifiedWorkspace");
+      if (scenario === "missing-path") {
+        await harness.repo.git(["worktree", "remove", "--", candidate.path]);
+      } else if (scenario === "missing-ref") {
+        await harness.repo.git(["update-ref", "-d", candidate.branchRef, candidate.headCommit]);
+      } else if (scenario === "changed-head") {
+        await harness.repo.write("third.txt", "third\n");
+        await harness.repo.git(["add", "third.txt"]);
+        await harness.repo.git(["commit", "-m", "third"]);
+        await harness.repo.git(["update-ref", candidate.branchRef, await ref(harness.repo, "HEAD")]);
+      } else if (scenario === "candidate-mismatch") {
+        harness.store.putIntegrationAttempt({
+          ...attempt,
+          candidateCommit: harness.oldCommit
+        });
+      } else if (scenario === "changed-record-path") {
+        harness.store.putGitWorkspace({
+          ...candidate,
+          path: resolve(harness.repo.root, ".agenttown", "worktrees", "run-1", "forged")
+        });
+      } else if (scenario === "changed-record-ref") {
+        harness.store.putGitWorkspace({
+          ...candidate,
+          branchRef: `${candidate.branchRef}-forged`
+        });
+      } else {
+        harness.store.putGitWorkspace({ ...candidate, status: "paused" });
+      }
+
+      const result = await harness.reconciler.reconcile("run-1");
+
+      expect(result.classification).toMatch(/missing|tampered/u);
+      if (scenario.startsWith("changed-record")) {
+        expect(result.classification).toBe("tampered");
+      }
+      expect(harness.store.getIntegrationAttempt(attempt.attemptId)?.status).toBe("prepared");
+      expect(harness.store.getCompany("company-1")?.status).toBe("paused");
+      expect(remove).not.toHaveBeenCalled();
+    }
+  );
+
+  it("atomically stops when a verified candidate changes immediately before removal", async () => {
+    const harness = await setup({ preparedAt: "before-cas" });
+    const attempt = harness.store.listIntegrationAttempts("run-1")[0]!;
+    const candidate = harness.store.listGitWorkspaces("run-1")
+      .find(({ kind }) => kind === "candidate")!;
+    const racing = new GitReconciler({
+      store: harness.store,
+      companyId: "company-1",
+      evidenceBuilder: { verify: async (record) => record },
+      workspaceManager: {
+        removeVerifiedWorkspace: async (workspaceId) => {
+          await harness.repo.write("race.txt", "race\n");
+          await harness.repo.git(["add", "race.txt"]);
+          await harness.repo.git(["commit", "-m", "race"]);
+          await harness.repo.git([
+            "update-ref",
+            candidate.branchRef,
+            await ref(harness.repo, "HEAD")
+          ]);
+          await harness.manager.removeVerifiedWorkspace(workspaceId);
+        }
+      }
+    });
+
+    const result = await racing.reconcile("run-1");
+
+    expect(result.classification).toBe("tampered");
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId)?.status).toBe("prepared");
+    expect(harness.store.getCompany("company-1")?.status).toBe("paused");
   });
 
   it("warns when only the original user worktree changed", async () => {
@@ -378,6 +565,7 @@ describe("GitReconciler", () => {
         ({ type }) => type === "git.tampering_detected"
       );
       expect(detected?.payload).toEqual({
+        approvalId: approval?.id,
         runId: "run-1",
         classification: result.classification,
         discrepancies: result.discrepancies

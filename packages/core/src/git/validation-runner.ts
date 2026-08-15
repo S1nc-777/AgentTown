@@ -696,12 +696,29 @@ export class ValidationRunner {
   readonly #companyId: string;
   readonly #company: CompanyDefinition;
   readonly #actorId: string;
+  readonly #active = new Set<{
+    abort(deadlineAt: number): Promise<void>;
+    settled: Promise<void>;
+  }>();
 
   constructor(options: ValidationRunnerOptions) {
     this.#store = options.store;
     this.#companyId = options.companyId;
     this.#company = options.company;
     this.#actorId = options.actorId ?? "core";
+  }
+
+  async abortActive(deadlineAt: number): Promise<void> {
+    if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= Date.now()) {
+      throw new Error("validation abort deadline has expired");
+    }
+    const active = [...this.#active];
+    await Promise.all(active.map((entry) => entry.abort(deadlineAt)));
+    await Promise.all(active.map((entry) => beforeDeadline(
+      entry.settled,
+      "active validation settlement",
+      deadlineAt
+    )));
   }
 
   async requestGrant(command: ValidationCommand, scope: ValidationScope): Promise<ValidationCommandGrant> {
@@ -796,6 +813,29 @@ export class ValidationRunner {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: Buffer | string) => writeChunk("stdout", chunk));
     child.stderr.on("data", (chunk: Buffer | string) => writeChunk("stderr", chunk));
+
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolvePromise) => {
+      resolveSettled = resolvePromise;
+    });
+    let abortPromise: Promise<void> | null = null;
+    const active = {
+      settled,
+      abort: (deadlineAt: number): Promise<void> => {
+        if (abortPromise !== null) return abortPromise;
+        abortPromise = isLive(child)
+          ? terminateVerifiedProcessTree(
+              dependencies.processTree ?? defaultProcessTree,
+              child,
+              closed,
+              deadlineAt
+            )
+          : Promise.resolve();
+        return abortPromise;
+      }
+    };
+    this.#active.add(active);
+    try {
 
     const timeoutMs = command.timeoutSeconds * 1_000;
     const commandDeadlineAt = Date.now() + timeoutMs;
@@ -905,7 +945,11 @@ export class ValidationRunner {
       completedEvent: event,
       ...(pause === undefined ? {} : { pause })
     });
-    return record;
+      return record;
+    } finally {
+      this.#active.delete(active);
+      resolveSettled();
+    }
   }
 
   async #resolveScope(command: ValidationCommand, scope: ValidationScope): Promise<{

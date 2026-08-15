@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type {
   GitCheckpoint,
@@ -25,12 +25,24 @@ interface ReconciliationGit {
   run: GitCommandRunner["run"];
 }
 
+interface ReconciliationConflictService {
+  completeResolution(input: {
+    attempt: IntegrationAttemptRecord;
+    submission: NonNullable<ReturnType<CoreStore["getGitSubmission"]>>;
+    task: TaskRecord;
+    run: GitRunRecord;
+    integrationWorkspace: GitWorkspaceRecord;
+    events: readonly [NewEvent, NewEvent];
+  }): Promise<void>;
+}
+
 export interface GitReconcilerOptions {
   store: CoreStore;
   companyId: string;
   workspaceManager: ReconciliationWorkspaceManager;
   evidenceBuilder: ReconciliationEvidenceBuilder;
   git?: ReconciliationGit;
+  conflictService?: ReconciliationConflictService;
 }
 
 type Discrepancy = ReconciliationResult["discrepancies"][number];
@@ -75,12 +87,21 @@ function missingEvidence(error: unknown): boolean {
     && /\b(?:missing|not found|ENOENT|deleted)\b/iu.test(error.message);
 }
 
+function canonicalDiscrepancies(discrepancies: readonly Discrepancy[]): Discrepancy[] {
+  return [...discrepancies].sort((left, right) =>
+    `${left.kind}\u0000${left.expected ?? ""}\u0000${left.actual ?? ""}`.localeCompare(
+      `${right.kind}\u0000${right.expected ?? ""}\u0000${right.actual ?? ""}`,
+      "en"
+    ));
+}
+
 export class GitReconciler {
   readonly #store: CoreStore;
   readonly #companyId: string;
   readonly #workspaceManager: ReconciliationWorkspaceManager;
   readonly #evidenceBuilder: ReconciliationEvidenceBuilder;
   readonly #git: ReconciliationGit;
+  readonly #conflictService: ReconciliationConflictService | undefined;
 
   constructor(options: GitReconcilerOptions) {
     this.#store = options.store;
@@ -88,6 +109,7 @@ export class GitReconciler {
     this.#workspaceManager = options.workspaceManager;
     this.#evidenceBuilder = options.evidenceBuilder;
     this.#git = options.git ?? new GitCommandRunner();
+    this.#conflictService = options.conflictService;
   }
 
   async reconcile(runId: string): Promise<ReconciliationResult> {
@@ -133,7 +155,24 @@ export class GitReconciler {
     const attempt = prepared[0];
     if (attempt !== undefined) {
       if (actualRef === attempt.expectedOldCommit) {
-        await this.#rollbackPrepared(run, attempt);
+        const candidateProblem = await this.#verifyOldShaCandidate(run, attempt);
+        if (candidateProblem !== null) {
+          return this.#stop(
+            runId,
+            candidateProblem.classification,
+            candidateProblem.discrepancies
+          );
+        }
+        try {
+          await this.#rollbackPrepared(run, attempt);
+        } catch (error) {
+          const actual = error instanceof Error ? error.message : String(error);
+          return this.#stop(runId, missingEvidence(error) ? "missing" : "tampered", [{
+            kind: `candidate_cleanup:${attempt.attemptId}`,
+            expected: "exact verified candidate cleanup",
+            actual
+          }]);
+        }
         classification = "rolled_back_recovery";
       } else if (attempt.candidateCommit !== null
         && actualRef === attempt.candidateCommit) {
@@ -346,6 +385,69 @@ export class GitReconciler {
     return null;
   }
 
+  async #verifyOldShaCandidate(
+    run: GitRunRecord,
+    attempt: IntegrationAttemptRecord
+  ): Promise<{
+    classification: "missing" | "tampered";
+    discrepancies: Discrepancy[];
+  } | null> {
+    const expectedWorkspaceId = `${run.runId}:candidate:${attempt.attemptId}`;
+    const candidates = this.#store.listGitWorkspaces(run.runId).filter(
+      ({ kind, workspaceId, branchRef, status }) => kind === "candidate"
+        && (workspaceId === expectedWorkspaceId || branchRef === attempt.candidateRef)
+        && status !== "missing"
+    );
+    if (candidates.length === 0) {
+      return attempt.candidateCommit === null ? null : {
+        classification: "missing",
+        discrepancies: [{
+          kind: `candidate:${attempt.attemptId}`,
+          expected: attempt.candidateCommit,
+          actual: null
+        }]
+      };
+    }
+    if (candidates.length !== 1) {
+      return {
+        classification: "tampered",
+        discrepancies: [{
+          kind: `candidate_count:${attempt.attemptId}`,
+          expected: "1",
+          actual: String(candidates.length)
+        }]
+      };
+    }
+    const candidate = candidates[0]!;
+    const expectedPath = resolve(
+      run.projectRoot,
+      ".agenttown",
+      "worktrees",
+      run.runId,
+      "candidate",
+      attempt.attemptId
+    );
+    if (candidate.workspaceId !== expectedWorkspaceId
+      || candidate.branchRef !== attempt.candidateRef
+      || resolve(candidate.path) !== expectedPath
+      || candidate.taskId !== null
+      || candidate.employeeId !== null
+      || candidate.status !== "active"
+      || attempt.candidateCommit === null
+      || candidate.baseCommit !== attempt.expectedOldCommit
+      || candidate.headCommit !== attempt.candidateCommit) {
+      return {
+        classification: "tampered",
+        discrepancies: [{
+          kind: `candidate_facts:${attempt.attemptId}`,
+          expected: `${expectedWorkspaceId}:${expectedPath}:${attempt.candidateRef}:${attempt.expectedOldCommit}@${attempt.candidateCommit ?? "null"}`,
+          actual: `${candidate.workspaceId}:${resolve(candidate.path)}:${candidate.branchRef}:${candidate.baseCommit}@${candidate.headCommit}`
+        }]
+      };
+    }
+    return this.#verifyWorkspaces(run);
+  }
+
   async #userWorkspaceChanged(run: GitRunRecord): Promise<boolean> {
     const status = await this.#git.run(
       [
@@ -453,10 +555,9 @@ export class GitReconciler {
       status: "completed",
       updatedEventId: completedEvent.id
     };
-    this.#store.commitIntegratedTask({
-      companyId: this.#companyId,
-      attempt: { ...attempt, status: "committed" },
-      submission: { ...submission, status: "integrated" },
+    const completion = {
+      attempt: { ...attempt, status: "committed" as const },
+      submission: { ...submission, status: "integrated" as const },
       task: completedTask,
       run: {
         ...run,
@@ -467,8 +568,19 @@ export class GitReconciler {
         ...integration,
         headCommit: attempt.candidateCommit
       },
-      events: [committedEvent, completedEvent]
-    });
+      events: [committedEvent, completedEvent] as const
+    };
+    if (submission.supersedes === null) {
+      this.#store.commitIntegratedTask({
+        companyId: this.#companyId,
+        ...completion
+      });
+    } else {
+      if (this.#conflictService === undefined) {
+        throw new Error("strict conflict recovery service is required");
+      }
+      await this.#conflictService.completeResolution(completion);
+    }
   }
 
   #stop(
@@ -476,15 +588,32 @@ export class GitReconciler {
     classification: "missing" | "tampered",
     discrepancies: Discrepancy[]
   ): ReconciliationResult {
+    discrepancies = canonicalDiscrepancies(discrepancies);
     const result: ReconciliationResult = { runId, classification, discrepancies };
-    const approvalId = `git-reconciliation-${runId}`;
-    const createdAt = new Date().toISOString();
+    const hash = createHash("sha256")
+      .update(JSON.stringify({ runId, classification, discrepancies }))
+      .digest("hex");
+    const baseApprovalId = `git-reconciliation-${runId}-${classification}-${hash.slice(0, 24)}`;
+    let createdAt = new Date().toISOString();
     const request = {
       reason: "git_reconciliation_stop",
       runId,
       classification,
       discrepancies
     };
+    let approvalId = baseApprovalId;
+    for (let episode = 1; ; episode += 1) {
+      const existing = this.#store.getApproval(approvalId);
+      if (existing === null) break;
+      if (!exactJson(existing.request, request)) {
+        throw new Error("Git reconciliation approval episode identity is forged");
+      }
+      if (existing.status === "pending") {
+        createdAt = existing.createdAt;
+        break;
+      }
+      approvalId = `${baseApprovalId}-${episode + 1}`;
+    }
     const approval: ApprovalRecord = {
       id: approvalId,
       companyId: this.#companyId,
@@ -500,11 +629,15 @@ export class GitReconciler {
       runId,
       classification,
       approval,
-      event: this.#event("git.tampering_detected", null, {
-        runId,
-        classification,
-        discrepancies
-      })
+      event: {
+        ...this.#event("git.tampering_detected", null, {
+          approvalId,
+          runId,
+          classification,
+          discrepancies
+        }),
+        id: `git-tampering-detected-${approvalId}`
+      }
     });
     return result;
   }

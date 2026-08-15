@@ -308,6 +308,7 @@ describe("CoreStore", () => {
         taskId: null,
         causationEventId: null,
         payload: {
+          approvalId: "git-reconciliation-run-1",
           runId: run.runId,
           classification: "missing",
           discrepancies
@@ -319,6 +320,155 @@ describe("CoreStore", () => {
     expect(store.getGitRun(run.runId)?.status).toBe("active");
     expect(store.listPendingApprovals("company-1")).toEqual([]);
     expect(store.listEvents(0).map(({ id }) => id)).toEqual(["duplicate-event"]);
+    store.close();
+  });
+
+  it("atomically rejects a pre-existing forged reconciliation approval episode", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    store.createCompany({
+      id: "company-1",
+      definition: companyDefinitionFixture(),
+      event: {
+        id: "company-event", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: {}
+      }
+    });
+    const run = {
+      runId: "run-1", companyId: "company-1", projectRoot: project.root,
+      originalBranch: "main", baseCommit: "a".repeat(40),
+      integrationRef: "refs/heads/agenttown/run-1/integration",
+      integrationCommit: "a".repeat(40), status: "active" as const,
+      createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z"
+    };
+    store.putGitRun(run);
+    const discrepancies = [{ kind: "integration_ref", expected: run.integrationCommit, actual: null }];
+    const request = {
+      reason: "git_reconciliation_stop",
+      runId: run.runId,
+      classification: "missing",
+      discrepancies
+    };
+    const approval = {
+      id: "git-reconciliation-forged",
+      companyId: "company-1",
+      taskId: null,
+      status: "pending" as const,
+      request,
+      decision: null,
+      createdAt: "2026-08-13T00:00:01.000Z",
+      decidedAt: null
+    };
+    store.commitApprovalRequest({
+      approval,
+      event: {
+        id: "forged-request",
+        type: "user.approval.requested",
+        actorId: "core",
+        taskId: null,
+        causationEventId: null,
+        payload: { approvalId: approval.id, ...request }
+      }
+    });
+
+    expect(() => store.commitGitReconciliationStop({
+      companyId: "company-1",
+      runId: run.runId,
+      classification: "missing",
+      approval,
+      event: {
+        id: "tamper-event",
+        type: "git.tampering_detected",
+        actorId: "core",
+        taskId: null,
+        causationEventId: null,
+        payload: {
+          approvalId: approval.id,
+          runId: run.runId,
+          classification: "missing",
+          discrepancies
+        }
+      }
+    })).toThrow("event identity is forged");
+
+    expect(store.getCompany("company-1")?.status).toBe("active");
+    expect(store.getGitRun(run.runId)?.status).toBe("active");
+    expect(store.listEvents(0).filter(({ type }) => type === "git.tampering_detected"))
+      .toEqual([]);
+    store.close();
+  });
+
+  it("rejects an exact-looking reconciliation event bound to a foreign approval owner", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const store = new CoreStore(project.databasePath);
+    store.initialize();
+    const definition = companyDefinitionFixture();
+    store.createCompany({
+      id: "company-1",
+      definition,
+      event: {
+        id: "company-1-event", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: {}
+      }
+    });
+    store.createCompany({
+      id: "company-2",
+      definition: { ...definition, company: { ...definition.company, name: "Foreign" } },
+      event: {
+        id: "company-2-event", type: "company.created", actorId: "owner",
+        taskId: null, causationEventId: null, payload: {}
+      }
+    });
+    const run = {
+      runId: "run-1", companyId: "company-1", projectRoot: project.root,
+      originalBranch: "main", baseCommit: "a".repeat(40),
+      integrationRef: "refs/heads/agenttown/run-1/integration",
+      integrationCommit: "a".repeat(40), status: "active" as const,
+      createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z"
+    };
+    store.putGitRun(run);
+    const discrepancies = [{ kind: "integration_ref", expected: run.integrationCommit, actual: null }];
+    const request = {
+      reason: "git_reconciliation_stop", runId: run.runId,
+      classification: "missing", discrepancies
+    };
+    const approvalId = "git-reconciliation-forged-owner";
+    store.commitApprovalRequest({
+      approval: {
+        id: approvalId, companyId: "company-2", taskId: null, status: "pending",
+        request, decision: null, createdAt: "2026-08-13T00:00:01.000Z", decidedAt: null
+      },
+      event: {
+        id: "foreign-request", type: "user.approval.requested", actorId: "core",
+        taskId: null, causationEventId: null, payload: { approvalId, ...request }
+      }
+    });
+    const forgedEvent = {
+      id: "foreign-tamper-event",
+      type: "git.tampering_detected",
+      actorId: "core",
+      taskId: null,
+      causationEventId: null,
+      payload: { approvalId, runId: run.runId, classification: "missing", discrepancies }
+    };
+    store.insertEvent(forgedEvent);
+
+    expect(() => store.commitGitReconciliationStop({
+      companyId: "company-1",
+      runId: run.runId,
+      classification: "missing",
+      approval: {
+        id: approvalId, companyId: "company-1", taskId: null, status: "pending",
+        request, decision: null, createdAt: "2026-08-13T00:00:02.000Z", decidedAt: null
+      },
+      event: { ...forgedEvent, id: "target-tamper-event" }
+    })).toThrow(/identity|forged/u);
+
+    expect(store.getCompany("company-1")?.status).toBe("active");
+    expect(store.getGitRun("run-1")?.status).toBe("active");
     store.close();
   });
 

@@ -162,6 +162,7 @@ export class GitWorkflowCoordinator {
   readonly #reviewerIds: ReadonlySet<string>;
   readonly #sendMessage: GitWorkflowCoordinatorOptions["sendMessage"];
   readonly #leaderId: string;
+  #acceptingActions = true;
 
   constructor(options: GitWorkflowCoordinatorOptions) {
     this.#store = options.store;
@@ -182,6 +183,7 @@ export class GitWorkflowCoordinator {
   }
 
   handles(action: ActionProposal): boolean {
+    if (!this.#acceptingActions) return false;
     const run = this.#store.getGitRun(this.#runId);
     if (run === null || run.companyId !== this.#companyId || run.status !== "active") {
       return false;
@@ -197,6 +199,10 @@ export class GitWorkflowCoordinator {
       return false;
     }
     return this.#employee(task.ownerEmployeeId).workspace === "git_worktree";
+  }
+
+  stopNewActions(): void {
+    this.#acceptingActions = false;
   }
 
   async assignTask(action: ActionProposal): Promise<AssignTaskOutcome> {
@@ -523,6 +529,9 @@ export class GitWorkflowCoordinator {
   }
 
   #bindCompanyAndRun(): void {
+    if (!this.#acceptingActions) {
+      throw new Error("Git workflow dispatch is fenced");
+    }
     const company = this.#store.getCompany(this.#companyId);
     const run = this.#store.getGitRun(this.#runId);
     if (company === null

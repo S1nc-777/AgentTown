@@ -181,6 +181,38 @@ describe("ValidationRunner", () => {
     store.close();
   }, 10_000);
 
+  it("aborts every active validation within the caller absolute deadline", async () => {
+    const project = await createTemporaryProject();
+    cleanups.push(project.cleanup);
+    const pidPath = join(project.root, "active-validation.txt");
+    const executable = command([
+      "const { writeFileSync } = require('node:fs');",
+      `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+      "setInterval(() => {}, 1000);"
+    ].join(""));
+    const { runner, scope, store } = await createRunner([executable]);
+    const running = runner.run(executable, scope);
+    let pid: number | null = null;
+    while (pid === null) {
+      try {
+        pid = Number(await readFile(pidPath, "utf8"));
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error)
+          || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      }
+    }
+    const deadlineAt = Date.now() + 5_000;
+
+    await runner.abortActive(deadlineAt);
+    const result = await running;
+
+    expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
+    expect(isProcessGone(pid)).toBe(true);
+    expect(result.outcome).toBe("failed");
+    store.close();
+  }, 10_000);
+
   it("redacts configured secret values before persistence", async () => {
     const executable = command("process.stdout.write('secret-value')");
     const { runner, scope, store } = await createRunner([executable]);

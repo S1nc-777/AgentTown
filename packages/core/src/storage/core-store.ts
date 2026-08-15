@@ -1394,6 +1394,62 @@ export class CoreStore {
     return input.approval;
   }
 
+  commitApprovalDecision(input: {
+    approval: ApprovalRecord;
+    event: NewEvent;
+  }): ApprovalRecord {
+    if ((input.approval.status !== "approved" && input.approval.status !== "rejected")
+      || input.approval.decision === null
+      || input.approval.decidedAt === null
+      || input.event.type !== "user.approval.decided"
+      || input.event.actorId.length === 0
+      || input.event.taskId !== input.approval.taskId
+      || input.event.causationEventId === null
+      || !jsonValuesEqual(input.event.payload, {
+        approvalId: input.approval.id,
+        status: input.approval.status,
+        decision: input.approval.decision
+      })) {
+      throw new Error("approval decision bundle is invalid");
+    }
+    const inserted = this.inTransaction(() => {
+      const current = this.getApproval(input.approval.id);
+      const causation = this.listEvents(0).find(
+        ({ id }) => id === input.event.causationEventId
+      );
+      if (current === null
+        || current.companyId !== input.approval.companyId
+        || current.taskId !== input.approval.taskId
+        || current.status !== "pending"
+        || current.decision !== null
+        || current.decidedAt !== null
+        || current.createdAt !== input.approval.createdAt
+        || !jsonValuesEqual(current.request, input.approval.request)
+        || causation === undefined
+        || (causation.type !== "user.approval.requested"
+          && causation.type !== "git.tampering_detected")
+        || causation.payload.approvalId !== input.approval.id) {
+        throw new Error("approval decision facts are stale or forged");
+      }
+      const updated = this.#database.prepare(`
+        UPDATE approvals
+        SET status = ?, decision_json = ?, decided_at = ?
+        WHERE id = ? AND status = 'pending' AND decision_json IS NULL AND decided_at IS NULL
+      `).run(
+        input.approval.status,
+        JSON.stringify(input.approval.decision),
+        input.approval.decidedAt,
+        input.approval.id
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error("approval decision lost its pending ownership");
+      }
+      return this.#insertEventRow(input.event);
+    });
+    this.#publishEvents([inserted]);
+    return input.approval;
+  }
+
   commitGitReconciliationStop(input: {
     companyId: string;
     runId: string;
@@ -1410,6 +1466,7 @@ export class CoreStore {
       || input.event.actorId !== "core"
       || input.event.taskId !== null
       || input.event.causationEventId !== null
+      || input.event.payload.approvalId !== input.approval.id
       || input.event.payload.runId !== input.runId
       || input.event.payload.classification !== input.classification
       || !jsonValuesEqual(input.approval.request, {
@@ -1420,7 +1477,7 @@ export class CoreStore {
       })) {
       throw new Error("Git reconciliation stop bundle is invalid");
     }
-    const inserted = this.inTransaction(() => {
+    const inserted = this.inTransaction((): EventRecord | null => {
       const company = this.getCompany(input.companyId);
       const run = this.getGitRun(input.runId);
       if (company === null || run === null || run.companyId !== input.companyId) {
@@ -1454,13 +1511,32 @@ export class CoreStore {
           input.approval.createdAt,
           null
         );
-      } else if (!jsonValuesEqual(existing.request, input.approval.request)
-        || existing.status !== "pending") {
+      } else if (existing.companyId !== input.approval.companyId
+        || existing.taskId !== input.approval.taskId
+        || existing.status !== "pending"
+        || existing.decision !== null
+        || existing.decidedAt !== null
+        || existing.createdAt !== input.approval.createdAt
+        || !jsonValuesEqual(existing.request, input.approval.request)) {
         throw new Error("Git reconciliation approval identity is not idempotent");
+      } else {
+        const episodeEvents = this.listEvents(0).filter((event) =>
+          event.type === "git.tampering_detected"
+          && event.payload.approvalId === input.approval.id
+        );
+        if (episodeEvents.length !== 1
+          || episodeEvents[0]?.id !== input.event.id
+          || episodeEvents[0]?.actorId !== "core"
+          || episodeEvents[0].taskId !== null
+          || episodeEvents[0].causationEventId !== null
+          || !jsonValuesEqual(episodeEvents[0].payload, input.event.payload)) {
+          throw new Error("Git reconciliation approval event identity is forged");
+        }
+        return null;
       }
       return this.#insertEventRow(input.event);
     });
-    this.#publishEvents([inserted]);
+    if (inserted !== null) this.#publishEvents([inserted]);
   }
 
   getReviewDecision(
