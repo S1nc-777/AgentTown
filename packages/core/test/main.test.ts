@@ -11,8 +11,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { parseCompanyYaml } from "@agenttown/runtime-contract";
+import { CodexAgentAdapter } from "../src/agents/codex-adapter.js";
+import { FakeAgentAdapter } from "../src/agents/fake-adapter.js";
 import {
   assertCorePathWithinProject,
+  buildAdapterMap,
   createShutdownCoordinator,
   parseE2EStartupScenarios,
   parseCoreArguments,
@@ -361,6 +364,31 @@ describe("agent adapter gate", () => {
     } finally {
       await rm(project, { recursive: true, force: true });
     }
+  });
+
+  it("maps codex employees to the CodexAgentAdapter and fake to the FakeAgentAdapter", () => {
+    const { adapterFor } = buildAdapterMap(codexCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_CODEX: "0"
+    });
+    expect(adapterFor("codex")).toBeInstanceOf(CodexAgentAdapter);
+    expect(adapterFor("fake")).toBeInstanceOf(FakeAgentAdapter);
+  });
+
+  it("enables real Codex probes only on explicit opt-in", async () => {
+    const guarded = buildAdapterMap(codexCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_CODEX: "0"
+    });
+    await expect(guarded.adapterFor("codex").detect())
+      .resolves.toEqual({ available: false, version: "unknown" });
+
+    const optedIn = buildAdapterMap(codexCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "0",
+      AGENTTOWN_REAL_CODEX: "1"
+    });
+    await expect(optedIn.adapterFor("codex").detect())
+      .resolves.toEqual({ available: true, version: "unknown" });
   });
 
   it("still rejects employees of unsupported agents before store open", async () => {

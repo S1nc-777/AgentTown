@@ -47,6 +47,8 @@ import {
   type EmployeeStatusView
 } from "./render.js";
 import {
+  isTemplateName,
+  TEMPLATE_NAMES,
   templateYaml,
   type TemplateName
 } from "./templates.js";
@@ -142,8 +144,10 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
     }
     if (value === "--template") {
       const selected = argv[index + 1];
-      if (selected !== "minimal" && selected !== "parallel-software") {
-        throw new Error("--template must be minimal or parallel-software");
+      if (selected === undefined || !isTemplateName(selected)) {
+        throw new Error(
+          `--template must be one of: ${TEMPLATE_NAMES.join(", ")}`
+        );
       }
       template = selected;
       templateSpecified = true;

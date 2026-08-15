@@ -86,6 +86,53 @@ function allowRealCodexProbes(env: NodeJS.ProcessEnv): boolean {
     && env.AGENTTOWN_REAL_CODEX === "1";
 }
 
+export interface AdapterMap {
+  adapterFor: (agent: string) => AgentAdapter;
+  hasCodexEmployees: boolean;
+}
+
+/**
+ * Builds the per-company adapter factory: one shared FakeAgentAdapter for all
+ * fake employees, plus one CodexAgentAdapter when the company contains codex
+ * employees. Real Codex launches stay forbidden unless the operator opts in
+ * via `AGENTTOWN_FORBID_REAL_PROBES !== "1"` and `AGENTTOWN_REAL_CODEX === "1"`.
+ */
+export function buildAdapterMap(
+  company: CompanyDefinition,
+  env: NodeJS.ProcessEnv
+): AdapterMap {
+  const fakeRoot = fileURLToPath(new URL("../../fake-agent/", import.meta.url));
+  const fakeAdapter = new FakeAgentAdapter({
+    executable: process.execPath,
+    packageRoot: fakeRoot,
+    allowedEmployeeIds: new Set(company.employees.map(({ id }) => id))
+  });
+  const hasCodexEmployees = company.employees.some(({ agent }) =>
+    agent === "codex"
+  );
+  const codexAdapter = hasCodexEmployees
+    ? new CodexAgentAdapter({
+        ...(allowRealCodexProbes(env)
+          ? { forbidRealProbes: false }
+          : {})
+      })
+    : undefined;
+  const adapterFor = (agent: string): AgentAdapter => {
+    switch (agent) {
+      case "fake":
+        return fakeAdapter;
+      case "codex":
+        if (codexAdapter === undefined) {
+          throw new Error(`agent adapter is not configured: ${agent}`);
+        }
+        return codexAdapter;
+      default:
+        throw new Error(`unsupported agent adapter: ${agent}`);
+    }
+  };
+  return { adapterFor, hasCodexEmployees };
+}
+
 export interface CoreArguments {
   projectRoot: string;
   databasePath: string;
@@ -592,35 +639,10 @@ export async function runCore(
         }
       });
     }
-    const fakeRoot = fileURLToPath(new URL("../../fake-agent/", import.meta.url));
-    const fakeAdapter = new FakeAgentAdapter({
-      executable: process.execPath,
-      packageRoot: fakeRoot,
-      allowedEmployeeIds: new Set(company.employees.map(({ id }) => id))
-    });
-    const hasCodexEmployees = company.employees.some(({ agent }) =>
-      agent === "codex"
+    const { adapterFor, hasCodexEmployees } = buildAdapterMap(
+      company,
+      process.env
     );
-    const codexAdapter = hasCodexEmployees
-      ? new CodexAgentAdapter({
-          ...(allowRealCodexProbes(process.env)
-            ? { forbidRealProbes: false }
-            : {})
-        })
-      : undefined;
-    const adapterFor = (agent: string): AgentAdapter => {
-      switch (agent) {
-        case "fake":
-          return fakeAdapter;
-        case "codex":
-          if (codexAdapter === undefined) {
-            throw new Error(`agent adapter is not configured: ${agent}`);
-          }
-          return codexAdapter;
-        default:
-          throw new Error(`unsupported agent adapter: ${agent}`);
-      }
-    };
     const sessions = new SessionManager(
       adapterFor,
       store,

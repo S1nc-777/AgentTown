@@ -255,6 +255,18 @@ describe("thin CLI commands", () => {
       .toBe(first);
   });
 
+  it("initializes the codex-lead-software template through the CLI", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttown-cli-codex-"));
+    roots.push(root);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await expect(runCli(["init", "--template", "codex-lead-software"], root))
+      .resolves.toBe(0);
+    const company = await readFile(join(root, ".agenttown", "company.yaml"), "utf8");
+    expect(company).toContain("name: codex-lead-software");
+    expect(company).toContain("agent: codex");
+  });
+
   it("detects a state-directory swap after creation before any outside write", async () => {
     const root = await mkdtemp(join(tmpdir(), "agenttown-cli-race-"));
     const outside = await mkdtemp(join(tmpdir(), "agenttown-cli-race-outside-"));

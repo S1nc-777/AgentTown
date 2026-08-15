@@ -130,10 +130,22 @@ validation:
     - git-clean
 `;
 
-export type TemplateName =
-  | "minimal"
-  | "parallel-software"
-  | "codex-lead-software";
+/**
+ * Canonical template roster. `TemplateName` is derived from this array so a
+ * template added here is automatically accepted by the CLI `--template` gate
+ * (which validates membership instead of duplicating the name list).
+ */
+export const TEMPLATE_NAMES = [
+  "minimal",
+  "parallel-software",
+  "codex-lead-software"
+] as const;
+
+export type TemplateName = (typeof TEMPLATE_NAMES)[number];
+
+export function isTemplateName(value: string): value is TemplateName {
+  return (TEMPLATE_NAMES as readonly string[]).includes(value);
+}
 
 export function templateYaml(name: TemplateName): string {
   switch (name) {
