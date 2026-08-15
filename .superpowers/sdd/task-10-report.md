@@ -223,3 +223,39 @@ No force/reset/clean/recursive deletion, dependency, push, production timeout,
 retry, sleep, historical fixture deletion, Task 11 CLI, or Task 12 Fake E2E
 behavior was introduced. P1A remains explicit `git: null`; the production
 P1B lifecycle composition is exported for the later Task 11 runtime assembly.
+
+## Final validation-start fence remediation (after `24ba1f9`)
+
+The final independent re-review found a remaining startup race: a validation
+operation was registered only after `resolveScope`, directory setup,
+`beforeSpawn`, and process creation. A pause could therefore snapshot an empty
+active set while that operation later spawned and persisted validation facts.
+The coordinator was also fenced only in the later integration-settlement
+phase.
+
+- RED:
+  `pnpm exec vitest run test/validation-runner.test.ts test/git-workflow-coordinator.test.ts --reporter=dot --no-file-parallelism --maxWorkers=1 -t "fences a validation operation|composes real workflow"`
+  failed 2/2. The blocked operation fulfilled and the coordinator still
+  reported that it handled a new assignment after `abortValidations`.
+- GREEN: the same command passed 2/2 (39 skipped) after the runner began
+  rejecting new runs synchronously, registered the whole operation before its
+  first asynchronous boundary, and carried an abort marker through spawn,
+  evidence publication, and the synchronous durable completion boundary.
+- Already-running validation coverage now proves the identity-verified child
+  is terminated within the caller's unchanged absolute deadline and that no
+  validation row, completion event, temporary log, or published evidence log
+  survives the pause.
+- `GitLifecycleHooks.abortValidations` now closes the coordinator action gate
+  before awaiting validation settlement; the later integration-intent phase
+  retains its redundant fail-closed fence.
+
+Final focused verification:
+
+- Validation runner: 1 file, 24 tests passed, 0 failed, 21.31s.
+- Validation/checkpoint/lifecycle/coordinator group: 4 files, 90 tests passed,
+  0 failed, 83.50s, single worker.
+- Core typecheck passed.
+- `git diff --check` passed with only configured LF-to-CRLF notices.
+
+No global timeout, retry, sleep, dependency, Task 11/12 behavior, push, or
+historical fixture cleanup was added.

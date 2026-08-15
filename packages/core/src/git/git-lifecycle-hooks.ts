@@ -28,8 +28,9 @@ export class GitLifecycleHooks {
   }
 
   async abortValidations(signal: AbortSignal, deadlineAt: number): Promise<void> {
-    signal.throwIfAborted();
+    this.#coordinator.stopNewActions();
     await this.#validationRunner.abortActive(deadlineAt);
+    signal.throwIfAborted();
   }
 
   async settleIntegrationIntent(signal: AbortSignal, deadlineAt: number): Promise<void> {

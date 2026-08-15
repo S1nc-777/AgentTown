@@ -312,15 +312,15 @@ describe("GitWorkflowCoordinator", () => {
     const deadlineAt = Date.now() + 5_000;
 
     await hooks.abortValidations(new AbortController().signal, deadlineAt);
-    await hooks.settleIntegrationIntent(new AbortController().signal, deadlineAt);
-
-    expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
     expect(harness.coordinator.handles(action({
       type: "task.assign",
       actor: "leader",
       taskId: "task-a",
       payload: { assignee: "developer" }
     }))).toBe(false);
+    await hooks.settleIntegrationIntent(new AbortController().signal, deadlineAt);
+
+    expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
   });
   it("claims an active Git owner's submission even when its workspace is missing", async () => {
     const harness = createHarness();

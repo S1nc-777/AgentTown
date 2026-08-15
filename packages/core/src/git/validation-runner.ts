@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, realpath, rename, lstat, stat } from "node:fs/promises";
+import { mkdir, open, realpath, rename, lstat, stat, unlink } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import type {
   CompanyDefinition,
@@ -700,6 +700,7 @@ export class ValidationRunner {
     abort(deadlineAt: number): Promise<void>;
     settled: Promise<void>;
   }>();
+  #acceptingRuns = true;
 
   constructor(options: ValidationRunnerOptions) {
     this.#store = options.store;
@@ -709,6 +710,7 @@ export class ValidationRunner {
   }
 
   async abortActive(deadlineAt: number): Promise<void> {
+    this.#acceptingRuns = false;
     if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= Date.now()) {
       throw new Error("validation abort deadline has expired");
     }
@@ -769,51 +771,11 @@ export class ValidationRunner {
     options: { secretValues?: readonly string[] } = {}
   ): Promise<ValidationRunRecord> {
     assertCommand(command);
-    const context = await this.#resolveScope(command, scope);
-    this.#authorize(command, scope);
-    const secretValues = options.secretValues ?? [];
-    const validationId = randomUUID();
-    const logDirectory = resolve(context.projectRoot, ".agenttown", "runs", scope.runId, "validation");
-    const logDirectoryIdentity = await makeSafeDirectory(context.projectRoot, logDirectory);
-    const logPath = resolve(logDirectory, `${validationId}.log`);
-    const temporaryPath = resolve(logDirectory, `.${validationId}.tmp`);
-    const startedAt = new Date().toISOString();
-    let sequence = 0;
-    let bytesWritten = 0;
-    let overflow = false;
-    let resolveStop: (reason: "overflow") => void = () => undefined;
-    const stopRequested = new Promise<"overflow">((resolvePromise) => { resolveStop = resolvePromise; });
-    const chunks: Array<{ sequence: number; stream: "stdout" | "stderr"; value: string }> = [];
-    const writeChunk = (stream: "stdout" | "stderr", value: Buffer | string): void => {
-      if (overflow) return;
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      const available = MAX_LOG_BYTES - bytesWritten;
-      const body = available > 0 ? truncateUtf8(chunk, available) : Buffer.alloc(0);
-      bytesWritten += body.length;
-      chunks.push({ sequence: ++sequence, stream, value: body.toString("utf8") });
-      if (body.length !== chunk.length || bytesWritten >= MAX_LOG_BYTES) {
-        overflow = true;
-        resolveStop("overflow");
-      }
-    };
-
+    if (!this.#acceptingRuns) throw new Error("validation dispatch is fenced");
     const dependencies = injectedDependencies.get(this) ?? {};
-    await dependencies.beforeSpawn?.();
-    await assertSameDirectory(context.cwdIdentity, await inspectSafeDirectory(scope.workspaceRoot, context.cwd));
-    const ownsProcessGroup = process.platform !== "win32";
-    const child = spawn(command.executable, [...command.args], {
-      cwd: context.cwd, env: minimalEnvironment(), shell: false, detached: ownsProcessGroup,
-      windowsHide: true, stdio: ["ignore", "pipe", "pipe"]
-    });
-    const closed = new Promise<ProcessExit>((resolvePromise) => {
-      child.once("close", (code, signal) => resolvePromise({ code, signal }));
-    });
-    const startFailed = new Promise<Error>((_resolve, reject) => child.once("error", reject));
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: Buffer | string) => writeChunk("stdout", chunk));
-    child.stderr.on("data", (chunk: Buffer | string) => writeChunk("stderr", chunk));
-
+    let child: ChildProcess | null = null;
+    let closed: Promise<ProcessExit> | null = null;
+    let abortRequested = false;
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolvePromise) => {
       resolveSettled = resolvePromise;
@@ -822,12 +784,15 @@ export class ValidationRunner {
     const active = {
       settled,
       abort: (deadlineAt: number): Promise<void> => {
+        abortRequested = true;
         if (abortPromise !== null) return abortPromise;
-        abortPromise = isLive(child)
+        const currentChild = child;
+        const currentClosed = closed;
+        abortPromise = currentChild !== null && currentClosed !== null && isLive(currentChild)
           ? terminateVerifiedProcessTree(
               dependencies.processTree ?? defaultProcessTree,
-              child,
-              closed,
+              currentChild,
+              currentClosed,
               deadlineAt
             )
           : Promise.resolve();
@@ -835,82 +800,156 @@ export class ValidationRunner {
       }
     };
     this.#active.add(active);
+    let temporaryPath: string | null = null;
+    let logPath: string | null = null;
+    const assertNotAborted = (): void => {
+      if (abortRequested) throw new Error("validation operation was aborted by pause fence");
+    };
     try {
+      assertNotAborted();
+      const context = await this.#resolveScope(command, scope);
+      assertNotAborted();
+      this.#authorize(command, scope);
+      const secretValues = options.secretValues ?? [];
+      const validationId = randomUUID();
+      const logDirectory = resolve(context.projectRoot, ".agenttown", "runs", scope.runId, "validation");
+      const logDirectoryIdentity = await makeSafeDirectory(context.projectRoot, logDirectory);
+      assertNotAborted();
+      logPath = resolve(logDirectory, `${validationId}.log`);
+      temporaryPath = resolve(logDirectory, `.${validationId}.tmp`);
+      const startedAt = new Date().toISOString();
+      let sequence = 0;
+      let bytesWritten = 0;
+      let overflow = false;
+      let resolveStop: (reason: "overflow") => void = () => undefined;
+      const stopRequested = new Promise<"overflow">((resolvePromise) => { resolveStop = resolvePromise; });
+      const chunks: Array<{ sequence: number; stream: "stdout" | "stderr"; value: string }> = [];
+      const writeChunk = (stream: "stdout" | "stderr", value: Buffer | string): void => {
+        if (overflow) return;
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        const available = MAX_LOG_BYTES - bytesWritten;
+        const body = available > 0 ? truncateUtf8(chunk, available) : Buffer.alloc(0);
+        bytesWritten += body.length;
+        chunks.push({ sequence: ++sequence, stream, value: body.toString("utf8") });
+        if (body.length !== chunk.length || bytesWritten >= MAX_LOG_BYTES) {
+          overflow = true;
+          resolveStop("overflow");
+        }
+      };
 
-    const timeoutMs = command.timeoutSeconds * 1_000;
-    const commandDeadlineAt = Date.now() + timeoutMs;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<"timed_out">((resolvePromise) => {
-      timer = setTimeout(() => resolvePromise("timed_out"), Math.max(0, commandDeadlineAt - Date.now()));
-    });
-    let outcome: ProcessExit | "timed_out" | "overflow" | "start_failed";
-    try {
-      outcome = await Promise.race([closed, timedOut, stopRequested, startFailed.then(() => "start_failed" as const)]);
-    } catch {
-      outcome = "start_failed";
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+      await dependencies.beforeSpawn?.();
+      assertNotAborted();
+      await assertSameDirectory(
+        context.cwdIdentity,
+        await inspectSafeDirectory(scope.workspaceRoot, context.cwd)
+      );
+      assertNotAborted();
+      const ownsProcessGroup = process.platform !== "win32";
+      child = spawn(command.executable, [...command.args], {
+        cwd: context.cwd, env: minimalEnvironment(), shell: false, detached: ownsProcessGroup,
+        windowsHide: true, stdio: ["ignore", "pipe", "pipe"]
+      });
+      const runningChild = child;
+      closed = new Promise<ProcessExit>((resolvePromise) => {
+        runningChild.once("close", (code, signal) => resolvePromise({ code, signal }));
+      });
+      const runningClosed = closed;
+      const startFailed = new Promise<Error>((_resolve, reject) => runningChild.once("error", reject));
+      runningChild.stdout!.setEncoding("utf8");
+      runningChild.stderr!.setEncoding("utf8");
+      runningChild.stdout!.on("data", (chunk: Buffer | string) => writeChunk("stdout", chunk));
+      runningChild.stderr!.on("data", (chunk: Buffer | string) => writeChunk("stderr", chunk));
 
-    let cleanupFailed = false;
-    const cleanupDeadlineAt = Date.now() + 5_000;
-    if (typeof outcome === "string" && outcome !== "start_failed") {
+      const timeoutMs = command.timeoutSeconds * 1_000;
+      const commandDeadlineAt = Date.now() + timeoutMs;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<"timed_out">((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise("timed_out"), Math.max(0, commandDeadlineAt - Date.now()));
+      });
+      let outcome: ProcessExit | "timed_out" | "overflow" | "start_failed";
       try {
-        await terminateVerifiedProcessTree(
-          dependencies.processTree ?? defaultProcessTree,
-          child,
-          closed,
-          cleanupDeadlineAt
-        );
+        outcome = await Promise.race([
+          runningClosed,
+          timedOut,
+          stopRequested,
+          startFailed.then(() => "start_failed" as const)
+        ]);
       } catch {
-        cleanupFailed = true;
+        outcome = "start_failed";
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
-    }
-    if (cleanupFailed) {
-      child.stdout?.removeAllListeners("data");
-      child.stderr?.removeAllListeners("data");
-    } else {
+
+      let cleanupFailed = false;
+      const cleanupDeadlineAt = Date.now() + 5_000;
+      if (typeof outcome === "string" && outcome !== "start_failed") {
+        try {
+          await terminateVerifiedProcessTree(
+            dependencies.processTree ?? defaultProcessTree,
+            runningChild,
+            runningClosed,
+            cleanupDeadlineAt
+          );
+        } catch {
+          cleanupFailed = true;
+        }
+      }
+      if (cleanupFailed) {
+        runningChild.stdout?.removeAllListeners("data");
+        runningChild.stderr?.removeAllListeners("data");
+      } else {
+        try {
+          await waitForCloseUntil(runningClosed, "validation process", cleanupDeadlineAt);
+        } catch {
+          cleanupFailed = true;
+          runningChild.stdout?.removeAllListeners("data");
+          runningChild.stderr?.removeAllListeners("data");
+        }
+      }
+      assertNotAborted();
+      const redactedChunks = redactChunkSequence(chunks, secretValues);
+      const redactedLog = chunks.map((chunk) => {
+        const label = `[${String(chunk.sequence).padStart(6, "0")}] ${chunk.stream}: `;
+        return `${label}${redactedChunks.get(chunk.sequence) ?? ""}\n`;
+      }).join("");
+      const finalLog = truncateUtf8(Buffer.from(redactedLog), MAX_LOG_BYTES);
+      await dependencies.beforeEvidenceOpen?.();
+      assertNotAborted();
+      await assertSameDirectory(
+        logDirectoryIdentity,
+        await inspectSafeDirectory(context.projectRoot, logDirectory)
+      );
+      assertNotAborted();
+      const finalHandle = await open(temporaryPath, "wx", 0o600);
       try {
-        await waitForCloseUntil(closed, "validation process", cleanupDeadlineAt);
-      } catch {
-        cleanupFailed = true;
-        child.stdout?.removeAllListeners("data");
-        child.stderr?.removeAllListeners("data");
+        assertNotAborted();
+        await finalHandle.writeFile(finalLog);
+        assertNotAborted();
+      } finally {
+        await finalHandle.close();
       }
-    }
-    const redactedChunks = redactChunkSequence(chunks, secretValues);
-    const redactedLog = chunks.map((chunk) => {
-      const label = `[${String(chunk.sequence).padStart(6, "0")}] ${chunk.stream}: `;
-      return `${label}${redactedChunks.get(chunk.sequence) ?? ""}\n`;
-    }).join("");
-    const finalLog = truncateUtf8(Buffer.from(redactedLog), MAX_LOG_BYTES);
-    await dependencies.beforeEvidenceOpen?.();
-    await assertSameDirectory(
-      logDirectoryIdentity,
-      await inspectSafeDirectory(context.projectRoot, logDirectory)
-    );
-    const finalHandle = await open(temporaryPath, "wx", 0o600);
-    try {
-      await finalHandle.writeFile(finalLog);
-    } finally {
-      await finalHandle.close();
-    }
-    await assertSameDirectory(
-      logDirectoryIdentity,
-      await inspectSafeDirectory(context.projectRoot, logDirectory)
-    );
-    await dependencies.beforeEvidenceRename?.();
-    await assertSameDirectory(
-      logDirectoryIdentity,
-      await inspectSafeDirectory(context.projectRoot, logDirectory)
-    );
-    await rename(temporaryPath, logPath);
-    await assertSameDirectory(
-      logDirectoryIdentity,
-      await inspectSafeDirectory(context.projectRoot, logDirectory)
-    );
-    const completedAt = new Date().toISOString();
-    const record: ValidationRunRecord = {
+      assertNotAborted();
+      await assertSameDirectory(
+        logDirectoryIdentity,
+        await inspectSafeDirectory(context.projectRoot, logDirectory)
+      );
+      assertNotAborted();
+      await dependencies.beforeEvidenceRename?.();
+      assertNotAborted();
+      await assertSameDirectory(
+        logDirectoryIdentity,
+        await inspectSafeDirectory(context.projectRoot, logDirectory)
+      );
+      assertNotAborted();
+      await rename(temporaryPath, logPath);
+      assertNotAborted();
+      await assertSameDirectory(
+        logDirectoryIdentity,
+        await inspectSafeDirectory(context.projectRoot, logDirectory)
+      );
+      assertNotAborted();
+      const completedAt = new Date().toISOString();
+      const record: ValidationRunRecord = {
       validationId, runId: scope.runId, taskId: scope.taskId,
       integrationAttemptId: scope.integrationAttemptId, command: redactedCommand(command, secretValues),
       workspaceId: scope.workspaceId,
@@ -923,12 +962,12 @@ export class ValidationRunner {
       startedAt, completedAt, logPath,
       logHash: createHash("sha256").update(finalLog).digest("hex")
     };
-    const event = this.#event("validation.completed", scope.taskId, {
+      const event = this.#event("validation.completed", scope.taskId, {
       validationId, runId: scope.runId, workspaceId: scope.workspaceId,
       outcome: record.outcome, exitCode: record.exitCode, logPath, logHash: record.logHash
     });
-    const run = this.#store.getGitRun(scope.runId);
-    const pause = record.outcome === "cleanup_failed" && run?.status === "active"
+      const run = this.#store.getGitRun(scope.runId);
+      const pause = record.outcome === "cleanup_failed" && run?.status === "active"
       ? {
           run: { ...run, status: "paused" as const, updatedAt: new Date().toISOString() },
           workspaces: this.#store.listGitWorkspaces(scope.runId).map((workspace) =>
@@ -940,15 +979,28 @@ export class ValidationRunner {
           })
         }
       : undefined;
-    this.#store.commitValidationRunCompletion({
-      validation: record,
-      completedEvent: event,
-      ...(pause === undefined ? {} : { pause })
-    });
+      assertNotAborted();
+      this.#store.commitValidationRunCompletion({
+        validation: record,
+        completedEvent: event,
+        ...(pause === undefined ? {} : { pause })
+      });
       return record;
     } finally {
-      this.#active.delete(active);
-      resolveSettled();
+      try {
+        if (abortRequested) {
+          for (const path of [temporaryPath, logPath]) {
+            if (path !== null) {
+              await unlink(path).catch((error: unknown) => {
+                if (!isMissing(error)) throw error;
+              });
+            }
+          }
+        }
+      } finally {
+        this.#active.delete(active);
+        resolveSettled();
+      }
     }
   }
 

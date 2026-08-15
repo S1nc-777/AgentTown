@@ -192,6 +192,10 @@ describe("ValidationRunner", () => {
     ].join(""));
     const { runner, scope, store } = await createRunner([executable]);
     const running = runner.run(executable, scope);
+    const observed = running.then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason })
+    );
     let pid: number | null = null;
     while (pid === null) {
       try {
@@ -205,12 +209,25 @@ describe("ValidationRunner", () => {
     const deadlineAt = Date.now() + 5_000;
 
     await runner.abortActive(deadlineAt);
-    const result = await running;
+    const result = await observed;
+    const validationRuns = store.listValidationRuns(scope.runId);
+    const evidenceFiles = await readdir(join(
+      scope.workspaceRoot,
+      ".agenttown",
+      "runs",
+      scope.runId,
+      "validation"
+    ));
+    store.close();
 
     expect(Date.now()).toBeLessThanOrEqual(deadlineAt);
     expect(isProcessGone(pid)).toBe(true);
-    expect(result.outcome).toBe("failed");
-    store.close();
+    expect(result).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ message: expect.stringMatching(/aborted/u) })
+    });
+    expect(validationRuns).toEqual([]);
+    expect(evidenceFiles).toEqual([]);
   }, 10_000);
 
   it("redacts configured secret values before persistence", async () => {
@@ -516,6 +533,68 @@ describe("ValidationRunner", () => {
     await expect(runner.run(executable, scope))
       .rejects.toThrow(/symbolic link|reparse|identity|non-directory/u);
     store.close();
+  });
+
+  it("fences a validation operation blocked before spawn when pause begins", async () => {
+    const executable = command(
+      "require('node:fs').writeFileSync('validation-spawned.txt', 'spawned')"
+    );
+    let enterFirst!: () => void;
+    const firstEntered = new Promise<void>((resolvePromise) => {
+      enterFirst = resolvePromise;
+    });
+    let releaseFirst!: () => void;
+    const firstRelease = new Promise<void>((resolvePromise) => {
+      releaseFirst = resolvePromise;
+    });
+    let beforeSpawnCalls = 0;
+    const { project, runner, scope, store } = await createRunner([executable], {
+      dependencies: {
+        beforeSpawn: async () => {
+          beforeSpawnCalls += 1;
+          if (beforeSpawnCalls === 1) {
+            enterFirst();
+            await firstRelease;
+          }
+        }
+      }
+    });
+
+    const inFlight = runner.run(executable, scope);
+    await firstEntered;
+    const deadlineAt = Date.now() + 5_000;
+    const aborting = runner.abortActive(deadlineAt);
+    const late = runner.run(executable, scope);
+    releaseFirst();
+
+    const [inFlightResult, lateResult, abortResult] = await Promise.allSettled([
+      inFlight,
+      late,
+      aborting
+    ]);
+    const markerMissing = await stat(join(project.root, "validation-spawned.txt"))
+      .then(() => false, (error: unknown) => (
+        error instanceof Error && "code" in error
+          && (error as NodeJS.ErrnoException).code === "ENOENT"
+      ));
+    const validationRuns = store.listValidationRuns(scope.runId);
+    const hasCompletedEvent = store.listEvents(0)
+      .some(({ type }) => type === "validation.completed");
+    store.close();
+
+    expect(inFlightResult).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ message: expect.stringMatching(/fenced|aborted/u) })
+    });
+    expect(lateResult).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ message: expect.stringMatching(/fenced|aborted/u) })
+    });
+    expect(abortResult).toEqual({ status: "fulfilled", value: undefined });
+    expect(beforeSpawnCalls).toBe(1);
+    expect(markerMissing).toBe(true);
+    expect(validationRuns).toEqual([]);
+    expect(hasCompletedEvent).toBe(false);
   });
 
   it("keeps redacted evidence logs within the configured byte limit", async () => {
