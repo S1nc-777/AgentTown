@@ -2,14 +2,22 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import type {
   ActionProposal,
-  AgentEvent
+  AgentEvent,
+  ReviewTaskContext,
+  WritableTaskContext
 } from "@agenttown/runtime-contract";
+import {
+  GIT_FIXTURE_SCENARIOS,
+  runGitFixture,
+  type GitFixtureScenario
+} from "./git-fixture.js";
 
 type InputLine = {
   type: "message" | "interrupt" | "stop";
   messageId?: string;
   taskId?: string | null;
   text?: string;
+  taskContext?: WritableTaskContext | ReviewTaskContext | null;
 };
 
 const args = new Map<string, string>();
@@ -79,7 +87,11 @@ if (scenario === "crash") {
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let malformedEmitted = false;
 
-  input.on("line", (rawLine) => {
+  const gitScenario = GIT_FIXTURE_SCENARIOS.includes(scenario as GitFixtureScenario)
+    ? scenario as GitFixtureScenario
+    : null;
+
+  input.on("line", async (rawLine) => {
     const line = JSON.parse(rawLine) as InputLine;
     if (line.type === "stop") {
       input.close();
@@ -94,6 +106,42 @@ if (scenario === "crash") {
     if (scenario === "malformed-once" && !malformedEmitted) {
       malformedEmitted = true;
       process.stdout.write("not-json\n");
+      return;
+    }
+
+    if (gitScenario !== null) {
+      const taskContext = line.taskContext;
+      if (taskContext === undefined || taskContext === null) {
+        emit({
+          type: "adapter.error",
+          code: "missing_task_context",
+          message: `git scenario ${gitScenario} requires a task context`
+        });
+        return;
+      }
+      try {
+        const result = await runGitFixture({
+          context: taskContext,
+          scenario: gitScenario
+        });
+        emit({
+          type: "output.completed",
+          text: `completed:${taskLabel(line)}`
+        });
+        emitAction(
+          line,
+          result.action.type as "task.submit" | "task.approve" | "task.reject",
+          result.action.payload,
+          result.action.reason
+        );
+      } catch (error) {
+        emit({
+          type: "adapter.error",
+          code: "git_fixture_failed",
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+      emitUsage();
       return;
     }
 

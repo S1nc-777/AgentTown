@@ -214,7 +214,10 @@ export class FakeAgentAdapter implements AgentAdapter {
         type: "message",
         messageId: message.messageId,
         taskId: message.taskId,
-        text: message.text
+        text: message.text,
+        ...(message.taskContext === null
+          ? {}
+          : { taskContext: message.taskContext })
       });
     }
 

@@ -15,21 +15,53 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   parseCompanyYaml,
-  type CompanyDefinition
+  type AgentMessage,
+  type CompanyDefinition,
+  type GitRunRecord
 } from "@agenttown/runtime-contract";
 import { FakeAgentAdapter } from "./agents/fake-adapter.js";
 import { SessionManager } from "./agents/session-manager.js";
-import { CompanyOrchestrator } from "./company/orchestrator.js";
+import {
+  CompanyOrchestrator,
+  GitTaskWorkflow
+} from "./company/orchestrator.js";
 import { CoreServer } from "./ipc/core-server.js";
 import { LeaseRegistry } from "./ipc/lease-registry.js";
 import { CheckpointService } from "./lifecycle/checkpoint-service.js";
 import { ActionPolicy } from "./policy/action-policy.js";
 import { CoreStore } from "./storage/core-store.js";
 import { TaskService } from "./tasks/task-service.js";
+import { CleanupService } from "./git/cleanup-service.js";
+import { ConflictService } from "./git/conflict-service.js";
+import { EvidencePackageBuilder } from "./git/evidence-package.js";
+import { GitLifecycleHooks } from "./git/git-lifecycle-hooks.js";
+import { GitReconciler } from "./git/git-reconciler.js";
+import { GitWorkflowCoordinator } from "./git/git-workflow-coordinator.js";
+import { IntegrationService } from "./git/integration-service.js";
+import { RepositoryPreflight } from "./git/repository-preflight.js";
+import { ReviewService } from "./git/review-service.js";
+import { SubmissionValidator } from "./git/submission-validator.js";
+import { ValidationRunner } from "./git/validation-runner.js";
+import { WorkspaceManager } from "./git/workspace-manager.js";
 
 export const DEFAULT_COMPANY_ID = "company";
 const PIPE_PATTERN = /^agenttown-[a-f0-9]{24}$/u;
 const SHUTDOWN_TIMEOUT_MS = 15_000;
+
+/**
+ * Deterministic Git fixture scenarios supported by the Fake Agent. When any
+ * employee is started with one of these scenarios the Core enables the P1B Git
+ * collaboration workflow (preflight, active run, Git services, GitTaskWorkflow)
+ * for the company. P1B is Fake-only: no real Agent can be launched.
+ */
+const GIT_FIXTURE_SCENARIOS = new Set([
+  "git-developer-a",
+  "git-developer-b",
+  "git-review-approve",
+  "git-review-reject",
+  "git-conflict",
+  "git-conflict-resolve"
+]);
 
 export interface CoreArguments {
   projectRoot: string;
@@ -315,6 +347,191 @@ function employeeIds(company: CompanyDefinition): {
   return { leaderId: leader.id, reviewerId: reviewer.id };
 }
 
+function gitEnabledFor(
+  company: CompanyDefinition,
+  startupScenarios: Readonly<Record<string, string>>
+): boolean {
+  return company.employees.some((employee) => {
+    const scenario = startupScenarios[employee.id];
+    return scenario !== undefined && GIT_FIXTURE_SCENARIOS.has(scenario);
+  });
+}
+
+interface GitWiring {
+  workflow: GitTaskWorkflow;
+  coordinator: GitWorkflowCoordinator;
+  gitLifecycle: NonNullable<ConstructorParameters<typeof CheckpointService>[0]["gitLifecycle"]>;
+  runId: string;
+}
+
+/**
+ * Wires the P1B Git collaboration stack for one company. Order is fixed:
+ * 1. repository preflight establishes the baseline;
+ * 2. the active Git run is created or reused from durable state;
+ * 3. Git services and the GitTaskWorkflow are constructed;
+ * 4. an existing paused run is reconciled and only then reactivated, so no
+ *    session can start against a repository whose facts no longer hold.
+ */
+async function setupGitWiring(options: {
+  projectRoot: string;
+  company: CompanyDefinition;
+  companyId: string;
+  store: CoreStore;
+  tasks: TaskService;
+  leaderId: string;
+  reviewerId: string;
+  drive: (employeeId: string, message: AgentMessage) => Promise<void>;
+}): Promise<GitWiring> {
+  const preflight = new RepositoryPreflight();
+  const baseline = await preflight.inspect(options.projectRoot);
+  const workspaceManager = new WorkspaceManager({
+    store: options.store,
+    companyId: options.companyId
+  });
+  const existingRuns = options.store.listGitRuns(options.companyId);
+  let run: GitRunRecord;
+  if (existingRuns.length === 0) {
+    const runId = `run-${randomUUID().replaceAll("-", "")}`;
+    run = await workspaceManager.createRun(runId, baseline);
+  } else if (existingRuns.length === 1) {
+    run = existingRuns[0]!;
+    if (
+      resolve(run.projectRoot) !== resolve(baseline.projectRoot)
+      || run.baseCommit !== baseline.baseCommit
+    ) {
+      throw new Error(
+        "existing Git run baseline does not match the current repository"
+      );
+    }
+  } else {
+    throw new Error(
+      `multiple Git runs exist for company ${options.companyId}; cleanup is required`
+    );
+  }
+  const runId = run.runId;
+  const reviewerIds = new Set([options.reviewerId]);
+  const validationRunner = new ValidationRunner({
+    store: options.store,
+    companyId: options.companyId,
+    company: options.company
+  });
+  const submissionValidator = new SubmissionValidator({
+    store: options.store,
+    companyId: options.companyId
+  });
+  const evidenceBuilder = new EvidencePackageBuilder({
+    store: options.store,
+    companyId: options.companyId
+  });
+  const conflictService = new ConflictService({
+    store: options.store,
+    companyId: options.companyId,
+    company: options.company,
+    runId,
+    workspaceManager
+  });
+  const integrationService = new IntegrationService({
+    store: options.store,
+    companyId: options.companyId,
+    company: options.company,
+    runId,
+    workspaceManager,
+    validationRunner,
+    conflictService
+  });
+  const reviewService = new ReviewService({
+    store: options.store,
+    companyId: options.companyId,
+    company: options.company,
+    evidenceBuilder,
+    reviewerIds
+  });
+  const cleanupService = new CleanupService({
+    store: options.store,
+    companyId: options.companyId,
+    workspaceManager
+  });
+  const reconciler = new GitReconciler({
+    store: options.store,
+    companyId: options.companyId,
+    workspaceManager,
+    evidenceBuilder,
+    conflictService
+  });
+
+  const coordinator = new GitWorkflowCoordinator({
+    store: options.store,
+    companyId: options.companyId,
+    company: options.company,
+    runId,
+    tasks: options.tasks,
+    workspaceManager,
+    submissionValidator,
+    validationRunner,
+    evidenceBuilder,
+    reviewService,
+    integrationService,
+    conflictService,
+    cleanupService,
+    reviewerIds,
+    sendMessage: (employeeId, message) => {
+      void options.drive(employeeId, message);
+      return Promise.resolve();
+    },
+    leaderId: options.leaderId
+  });
+  const hooks = new GitLifecycleHooks({
+    runId,
+    coordinator,
+    validationRunner,
+    integrationService,
+    reconciler
+  });
+  const gitLifecycle = {
+    abortValidations: (signal: AbortSignal, deadlineAt: number) =>
+      hooks.abortValidations(signal, deadlineAt),
+    settleIntegrationIntent: (signal: AbortSignal, deadlineAt: number) =>
+      hooks.settleIntegrationIntent(signal, deadlineAt),
+    snapshot: async () => {
+      await workspaceManager.pauseRun(runId);
+      return hooks.snapshot();
+    },
+    reconcile: async (reconciledRunId: string) => {
+      const result = await hooks.reconcile(reconciledRunId);
+      if (
+        result.classification !== "tampered"
+        && result.classification !== "missing"
+      ) {
+        await workspaceManager.reactivateRun(reconciledRunId);
+      }
+      return result;
+    }
+  };
+
+  if (existingRuns.length === 1) {
+    const reconciliation = await hooks.reconcile(runId);
+    if (
+      reconciliation.classification === "tampered"
+      || reconciliation.classification === "missing"
+    ) {
+      throw new Error(
+        "Git run reconciliation blocked at startup: "
+        + JSON.stringify(reconciliation.discrepancies)
+      );
+    }
+    // The run and its workspaces stay paused here: the pause checkpoint stores
+    // the paused statuses, and company.resume validates that checkpoint before
+    // the reconcile wrapper reactivates the run.
+  }
+
+  const workflow = new GitTaskWorkflow(coordinator);
+  return {
+    workflow,
+    coordinator,
+    gitLifecycle,
+    runId
+  };
+}
 export async function runCore(
   argv: readonly string[],
   hooks: CoreRunHooks = {}
@@ -362,16 +579,6 @@ export async function runCore(
       args.projectRoot
     );
     const tasks = new TaskService(store, DEFAULT_COMPANY_ID, company, leaderId);
-    const orchestrator = new CompanyOrchestrator(
-      DEFAULT_COMPANY_ID,
-      company,
-      store,
-      tasks,
-      new ActionPolicy(company, leaderId, new Set([reviewerId])),
-      sessions,
-      leaderId,
-      reviewerId
-    );
     const scenarios = Object.fromEntries(company.employees.map((employee) => [
       employee.id,
       employee.role === "reviewer"
@@ -384,6 +591,33 @@ export async function runCore(
       ...scenarios,
       ...parseE2EStartupScenarios(company, process.env)
     };
+    const gitEnabled = gitEnabledFor(company, startupScenarios);
+    const policy = new ActionPolicy(company, leaderId, new Set([reviewerId]));
+    const orchestrator = new CompanyOrchestrator(
+      DEFAULT_COMPANY_ID,
+      company,
+      store,
+      tasks,
+      policy,
+      sessions,
+      leaderId,
+      reviewerId
+    );
+    let gitWiring: GitWiring | undefined;
+    if (gitEnabled) {
+      gitWiring = await setupGitWiring({
+        projectRoot: args.projectRoot,
+        company,
+        companyId: DEFAULT_COMPANY_ID,
+        store,
+        tasks,
+        leaderId,
+        reviewerId,
+        drive: (employeeId, message) =>
+          orchestrator.driveGitMessage(employeeId, message)
+      });
+      orchestrator.attachGitWorkflow(gitWiring.workflow);
+    }
     const lifecycle = new CheckpointService({
       companyId: DEFAULT_COMPANY_ID,
       company,
@@ -391,7 +625,10 @@ export async function runCore(
       orchestrator,
       sessions,
       adapterFor: () => adapter,
-      scenarios
+      scenarios: startupScenarios,
+      ...(gitWiring === undefined
+        ? {}
+        : { gitLifecycle: gitWiring.gitLifecycle })
     });
     const leases = new LeaseRegistry(store, {
       ttlMs: args.leaseTtlMs,
@@ -411,6 +648,9 @@ export async function runCore(
       },
       leases,
       lifecycle,
+      ...(gitWiring === undefined
+        ? {}
+        : { gitWorkflow: gitWiring.coordinator }),
       onBackgroundError: (error) => {
         process.stderr.write(`${error.stack ?? error.message}\n`);
       }

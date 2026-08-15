@@ -67,6 +67,17 @@ limits:
   max_task_retry: 1
   max_review_loops: 2
   max_parallel_tasks: 2
+validation:
+  commands:
+    - id: git-clean
+      executable: git
+      args:
+        - status
+        - --porcelain
+      cwd: "."
+      timeout_seconds: 30
+  integration_command_ids:
+    - git-clean
 `;
 
 export type TemplateName = "minimal" | "parallel-software";

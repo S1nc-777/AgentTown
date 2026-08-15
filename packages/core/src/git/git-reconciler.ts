@@ -432,7 +432,7 @@ export class GitReconciler {
       || resolve(candidate.path) !== expectedPath
       || candidate.taskId !== null
       || candidate.employeeId !== null
-      || candidate.status !== "active"
+      || (candidate.status !== "active" && candidate.status !== "paused")
       || attempt.candidateCommit === null
       || candidate.baseCommit !== attempt.expectedOldCommit
       || candidate.headCommit !== attempt.candidateCommit) {

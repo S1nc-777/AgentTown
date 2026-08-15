@@ -541,6 +541,45 @@ export class WorkspaceManager {
     }
   }
 
+  async reactivateRun(runId: string): Promise<void> {
+    const validatedRunId = identifier(runId, "run id");
+    const run = this.#requiredRun(validatedRunId);
+    if (run.status === "active") return;
+    if (run.status !== "paused") {
+      throw new Error(`Git run cannot be reactivated from status ${run.status}`);
+    }
+    const updatedAt = new Date().toISOString();
+    const activeRun: GitRunRecord = {
+      ...run,
+      status: "active",
+      updatedAt
+    };
+    const activeWorkspaces = this.#store.listGitWorkspaces(validatedRunId).map(
+      (workspace): GitWorkspaceRecord => workspace.status === "paused"
+        ? { ...workspace, status: "active" }
+        : workspace
+    );
+    const resumedEvent: NewEvent = {
+      id: randomUUID(),
+      type: "git.run.resumed",
+      actorId: this.#actorId,
+      taskId: null,
+      causationEventId: null,
+      payload: { runId: validatedRunId }
+    };
+    try {
+      this.#store.commitGitRunPause({
+        run: activeRun,
+        workspaces: activeWorkspaces,
+        event: resumedEvent
+      });
+    } catch (error) {
+      if (!this.#pauseIsDurable(activeRun, activeWorkspaces, resumedEvent)) {
+        throw error;
+      }
+    }
+  }
+
   async removeVerifiedWorkspace(workspaceId: string): Promise<void> {
     if (workspaceId.length === 0 || workspaceId.length > 512) {
       throw new TypeError("workspace id must be non-empty");

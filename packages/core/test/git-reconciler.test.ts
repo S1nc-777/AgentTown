@@ -407,14 +407,52 @@ describe("GitReconciler", () => {
       .toBe(harness.oldCommit);
   });
 
+  it("rolls back a prepared attempt whose paused candidate still matches", async () => {
+    // A checkpoint pause can land while an integration is prepared: pauseRun
+    // sets the run and every active workspace to paused, and restart
+    // reconciliation must recover the prepared attempt (roll back) instead of
+    // flagging the untouched paused candidate as tampered.
+    const harness = await setup({ preparedAt: "before-cas" });
+    const attempt = harness.store.listIntegrationAttempts("run-1")[0]!;
+    const candidate = harness.store.listGitWorkspaces("run-1")
+      .find(({ kind }) => kind === "candidate")!;
+    // The before-cas fault hook also detached the integration worktree; restore
+    // the formal integration workspace to its attached state so only the
+    // candidate pause (the real pause-time state) is under test.
+    const integration = harness.store.listGitWorkspaces("run-1")
+      .find(({ kind }) => kind === "integration")!;
+    await harness.repo.git([
+      "-C", integration.path,
+      "checkout", "--detach", harness.oldCommit
+    ]);
+    await harness.repo.git([
+      "-C", integration.path,
+      "symbolic-ref", "HEAD", "refs/heads/agenttown/run-1/integration"
+    ]);
+    harness.store.putGitWorkspace({
+      ...integration,
+      headCommit: harness.oldCommit,
+      branchRef: "refs/heads/agenttown/run-1/integration",
+      status: "active"
+    });
+    await harness.manager.pauseRun("run-1");
+    expect(harness.store.getGitWorkspace(candidate.workspaceId)?.status).toBe("paused");
+
+    const result = await harness.reconciler.reconcile("run-1");
+
+    expect(result.classification).toBe("rolled_back_recovery");
+    expect(harness.store.getIntegrationAttempt(attempt.attemptId)?.status).toBe("aborted");
+    expect(await ref(harness.repo, "refs/heads/agenttown/run-1/integration"))
+      .toBe(harness.oldCommit);
+  }, 20_000);
+
   it.each([
     "missing-path",
     "missing-ref",
     "changed-head",
     "candidate-mismatch",
     "changed-record-path",
-    "changed-record-ref",
-    "changed-record-status"
+    "changed-record-ref"
   ])(
     "stops instead of aborting an old-SHA candidate with %s",
     async (scenario) => {
@@ -447,8 +485,6 @@ describe("GitReconciler", () => {
           ...candidate,
           branchRef: `${candidate.branchRef}-forged`
         });
-      } else {
-        harness.store.putGitWorkspace({ ...candidate, status: "paused" });
       }
 
       const result = await harness.reconciler.reconcile("run-1");

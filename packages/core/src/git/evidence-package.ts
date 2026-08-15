@@ -111,6 +111,22 @@ function assertIdentifier(value: string, label: string): void {
   }
 }
 
+/**
+ * Workspace identities are composite keys produced by the WorkspaceManager
+ * (`<runId>:task:<employeeId>:<taskId>` or `<runId>:candidate:<attemptId>`),
+ * so they allow colon-separated safe segments. The identity is an opaque
+ * durable key and is never used as a filesystem path component.
+ */
+function assertWorkspaceIdentifier(value: string, label: string): void {
+  if (
+    value.length === 0
+    || value.length > 512
+    || !/^[a-z][a-z0-9_-]*(?::[a-z][a-z0-9_-]*)*$/u.test(value)
+  ) {
+    throw new TypeError(`${label} must be a safe workspace identifier`);
+  }
+}
+
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
@@ -325,7 +341,7 @@ export class EvidencePackageBuilder {
   async create(input: EvidencePackageInput): Promise<ReviewPackageRecord> {
     assertIdentifier(input.runId, "run id");
     assertIdentifier(input.taskId, "task id");
-    assertIdentifier(input.workspaceId, "workspace id");
+    assertWorkspaceIdentifier(input.workspaceId, "workspace id");
     assertIdentifier(input.employeeId, "employee id");
     if (!Number.isSafeInteger(input.revision) || input.revision < 1) {
       throw new TypeError("review revision must be a positive integer");
@@ -349,7 +365,10 @@ export class EvidencePackageBuilder {
       throw new Error("review package task owner or status is not authoritative");
     }
     const company = this.#store.getCompany(this.#companyId);
-    if (company === null || company.status !== "active") {
+    if (
+      company === null
+      || (company.status !== "active" && company.status !== "running")
+    ) {
       throw new Error("review package company is not active");
     }
     const definition = JSON.parse(company.definitionJson) as CompanyDefinition;

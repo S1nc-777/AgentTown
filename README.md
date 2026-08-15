@@ -46,16 +46,15 @@ flowchart LR
 - P1A：一间由四个 Fake Agent 组成的本地公司；
 - Windows Named Pipe、SQLite 事实库、事件流、任务 DAG、暂停与恢复；
 - CLI 的初始化、启动、状态、任务、时间线、暂停、恢复和停止；
-- P1B 前九项：Git 协作契约、版本化存储、仓库安全预检、独立 worktree、结构化验证与审核、确定性候选集成，以及把 Git 冲突转化为可审核的结构化任务。
+- P1B Git 协作闭环：Git 协作契约、版本化存储、仓库安全预检、独立 worktree、结构化验证与审核、确定性候选集成、Git 冲突转结构化可审核任务、暂停保存与重启对账、workspaces/evidence/deliver/approvals/cleanup CLI，以及并行重启交付与冲突解决两条端到端场景。
 
 当前尚未完成：
 
-- Claude Code、OpenCode、Hermes Agent 的真实适配器；
-- 崩溃恢复、CLI 接线和完整 Git 协作闭环；
+- Claude Code、OpenCode、Hermes Agent 的真实适配器（P1C 路线）；
 - 面向普通用户的安装包；
 - “赛博办公室”桌面 UI。
 
-因此，目前能运行的是用于开发与验证架构的 **Fake Company**，不是产品设想中的真实 Agent 公司。精确进度见 [开发状态与经验](docs/development/status.md)。
+因此，目前能运行的是用于开发与验证架构的 **Fake Company**，不是产品设想中的真实 Agent 公司。P1B 的 Git 协作同样只能由确定性 Fake 场景驱动（`git-developer-a`、`git-developer-b`、`git-review-approve`、`git-review-reject`、`git-conflict`、`git-conflict-resolve`），P1C 会把这些场景替换为真实 Agent 适配器。精确进度见 [开发状态与经验](docs/development/status.md)。
 
 ## 本地体验
 
@@ -64,7 +63,7 @@ flowchart LR
 - Windows
 - Node.js 22 或更新版本
 - pnpm 11.9.0
-- Git
+- Git 2.31 或更新版本
 
 ### 安装与检查
 
@@ -84,6 +83,9 @@ $demo = Join-Path $env:TEMP "agenttown-demo"
 New-Item -ItemType Directory -Path $demo
 Set-Location $demo
 git init
+git config user.name "Demo"
+git config user.email "demo@example.invalid"
+git commit --allow-empty -m "initial"
 
 $repo = "C:\path\to\AgentTown"
 $tsx = Join-Path $repo "node_modules\tsx\dist\loader.mjs"
@@ -102,6 +104,34 @@ node --import $tsx $cli timeline
 node --import $tsx $cli stop --yes
 ```
 
+### Git 协作的前提与边界
+
+P1B Git 协作（`workspaces`、`evidence`、`deliver`、`approvals`、`cleanup` 命令）要求：
+
+- **Git 2.31 或更新版本**，且项目根目录必须是一个**已有至少一次提交的干净仓库**（`git status` 无改动）；
+- Core 启动时会向仓库的本地 `info/exclude` 追加 `/.agenttown/`，所有运行状态、worktree 与审核证据都放在这个被本地忽略的目录里，不会进入提交；
+- 每个任务在 `.agenttown/worktrees/<run-id>/` 下拥有独立 worktree 与分支，审核员只读取不可变的审核包（`.agenttown/runs/<run-id>/reviews/`）；
+- 查看任务工作区：`node --import $tsx $cli workspaces`；
+- 查看某一任务的不可变审核证据：`node --import $tsx $cli evidence <task-id> [--revision N]`；
+- 查看已审核并通过集成校验的交付：`node --import $tsx $cli deliver`；
+- 查看并批准待执行的验证命令建议：`node --import $tsx $cli approvals`、`approve <approval-id> --reason "..."`、`reject <approval-id> --reason "..."`；
+- 清理一个运行的所有痕迹：`node --import $tsx $cli cleanup <run-id> --yes`（只能指定一个精确的 run id；`--branches` 与 `--evidence` 必须显式给出才会一并删除分支和审核证据）。
+
+AgentTown **绝不自动 merge、push、创建 PR、发布或部署**。交付只推进独立的集成分支（`refs/heads/agenttown/<run-id>/integration`），用户主分支始终保持原状。`deliver` 会打印建议的只读检查命令，例如：
+
+```powershell
+git diff main..agenttown/<run-id>/integration
+git log --oneline main..agenttown/<run-id>/integration
+```
+
+确认无误后由用户自己手动合并，例如：
+
+```powershell
+git merge agenttown/<run-id>/integration
+```
+
+AgentTown 不会替你执行这条合并命令。
+
 更完整的开发说明见 [P1A Core 开发指南](docs/development/p1a-core.md)。
 
 ## 开发与验证
@@ -115,10 +145,11 @@ $env:AGENTTOWN_REAL_CLAUDE='0'
 
 pnpm typecheck
 pnpm test
+pnpm test:p1b
 pnpm probe:fake
 ```
 
-Git 协作阶段包含真实的本地临时 Git 仓库和 worktree 测试，但不会 push、部署或修改远程仓库。
+`test:p1b` 运行 P1B 的两条确定性端到端场景（并行重启交付、冲突转解决任务），它们会在临时目录里创建真实的本地 Git 仓库与 worktree，但不会 push、部署或修改远程仓库。
 
 ## 安全边界
 
@@ -135,7 +166,7 @@ AgentTown 的目标不是让模型随意控制电脑。当前设计坚持：
 ## 路线图
 
 - [x] P1A：Fake Company 核心闭环
-- [ ] P1B：Git 协作闭环（12 项中的前 9 项已完成）
+- [x] P1B：Git 协作闭环（Fake-only 端到端验证完成）
 - [ ] P1C：Claude Code、OpenCode、Hermes Agent 适配器
 - [ ] P1D：四人真实 Agent Alpha 验收
 - [ ] 桌面端“赛博办公室”看板

@@ -156,9 +156,28 @@ function assertIdentifier(value: string, label: string): void {
   }
 }
 
+/**
+ * Workspace identities are composite keys produced by the WorkspaceManager
+ * (`<runId>:task:<employeeId>:<taskId>` or `<runId>:candidate:<attemptId>`),
+ * so they allow colon-separated safe segments. The identity is an opaque
+ * durable key and is never used as a filesystem path component.
+ */
+function assertWorkspaceIdentifier(value: string, label: string): void {
+  if (
+    value.length === 0
+    || value.length > 512
+    || !/^[a-z][a-z0-9_-]*(?::[a-z][a-z0-9_-]*)*$/u.test(value)
+  ) {
+    throw new TypeError(`${label} must be a safe workspace identifier`);
+  }
+}
+
 function companyDefinition(store: CoreStore, companyId: string): CompanyDefinition {
   const company = store.getCompany(companyId);
-  if (company === null || company.status !== "active") {
+  if (
+    company === null
+    || (company.status !== "active" && company.status !== "running")
+  ) {
     throw new Error("submission company is not active");
   }
   const value = JSON.parse(company.definitionJson) as CompanyDefinition;
@@ -381,7 +400,7 @@ export class SubmissionValidator {
     }
     assertIdentifier(run.runId, "run id");
     assertIdentifier(registered.taskId, "task id");
-    assertIdentifier(registered.workspaceId, "workspace id");
+    assertWorkspaceIdentifier(registered.workspaceId, "workspace id");
     const company = companyDefinition(this.#store, this.#companyId);
     await assertSafeDirectory(run.projectRoot, registered.path);
 

@@ -17,10 +17,12 @@ import {
   type GitWorkspaceView,
   type GitWorkspaceRecord,
   type ReviewPackageRecord,
+  type ReviewTaskContext,
   type TaskRecord,
   type ValidationCommand,
   type ValidationCommandGrant,
-  type ValidationRunRecord
+  type ValidationRunRecord,
+  type WritableTaskContext
 } from "@agenttown/runtime-contract";
 import { CoreStore, type NewEvent } from "../storage/core-store.js";
 import { TaskService } from "../tasks/task-service.js";
@@ -223,6 +225,58 @@ export class GitWorkflowCoordinator {
 
   stopNewActions(): void {
     this.#acceptingActions = false;
+  }
+
+  /**
+   * Builds the exact structured context an Agent needs to resume a Git task or
+   * review a package after a restart. A running Git task receives its durable
+   * task workspace; a task awaiting review receives its latest immutable review
+   * package (for the reviewer session, regardless of the owner workspace).
+   * Returns null for every other task shape.
+   */
+  taskContext(
+    task: TaskRecord
+  ): WritableTaskContext | ReviewTaskContext | null {
+    if (task.ownerEmployeeId === null) return null;
+    const employee = this.#employee(task.ownerEmployeeId);
+    if (task.status === "running" && employee.workspace === "git_worktree") {
+      const workspace = this.#taskWorkspace(task.id, employee.id);
+      if (workspace !== null) {
+        return {
+          kind: "git_worktree",
+          runId: this.#runId,
+          taskId: task.id,
+          employeeId: employee.id,
+          workspaceRoot: workspace.path,
+          branch: workspace.branchRef,
+          baseCommit: workspace.baseCommit,
+          approvedValidationCommandIds: this.#store
+            .listValidationCommandGrants(this.#runId, task.id)
+            .filter((grant) =>
+              grant.workspaceId === workspace.workspaceId
+              && grant.status === "approved"
+            )
+            .map(({ command }) => command.id)
+            .sort()
+        };
+      }
+    }
+    if (task.status === "review") {
+      const packages = this.#store.listReviewPackages(this.#runId, task.id)
+        .filter(({ status }) => status !== "deleted" && status !== "tampered");
+      const latest = packages.at(-1);
+      if (latest !== undefined) {
+        return {
+          kind: "review_package",
+          runId: this.#runId,
+          taskId: task.id,
+          revision: latest.revision,
+          manifestPath: latest.manifestPath,
+          manifestHash: latest.manifestHash
+        };
+      }
+    }
+    return null;
   }
 
   listWorkspaces(): GitWorkspaceView[] {
@@ -493,6 +547,10 @@ export class GitWorkflowCoordinator {
         approvedValidationCommandIds
       }
     });
+    // The transition stays after the send: a failed delivery leaves the task
+    // `ready` so assignment can be retried. The Git session drive is
+    // fire-and-forget, so a submitted action can only arrive after this
+    // synchronous transition has durably marked the task running.
     const running = this.#tasks.transition(taskId, "running", assignee.id);
     return { kind: "running", task: running, workspace };
   }
@@ -519,6 +577,21 @@ export class GitWorkflowCoordinator {
     }
     this.#assertWorkspace(workspace, taskId, employee.id);
     const parsed = parseGitTaskSubmission(action.payload.submission);
+    let advancedWorkspace = workspace;
+    if (workspace.headCommit !== parsed.headCommit) {
+      advancedWorkspace = {
+        ...workspace,
+        headCommit: parsed.headCommit
+      };
+      this.#store.commitGitWorkspace({
+        workspace: advancedWorkspace,
+        event: this.#event("git.workspace.advanced", taskId, {
+          runId: this.#runId,
+          workspaceId: workspace.workspaceId,
+          headCommit: parsed.headCommit
+        })
+      });
+    }
     const scope: ValidationScope = {
       runId: this.#runId,
       taskId,
@@ -605,9 +678,17 @@ export class GitWorkflowCoordinator {
         );
       }
     }
-    const gitFacts = await this.#submissionValidator.validate(workspace, {
-      ...parsed,
-      validationCommandIds: []
+    const gitFacts = await this.#submissionValidator.validate(
+      advancedWorkspace,
+      {
+        ...parsed,
+        validationCommandIds: []
+      }
+    ).catch(async (error: unknown) => {
+      if (advancedWorkspace !== workspace) {
+        this.#store.putGitWorkspace(workspace);
+      }
+      throw error;
     });
     for (const command of validationCommands) {
       const result = await this.#validationRunner.run(command, scope);
@@ -624,7 +705,7 @@ export class GitWorkflowCoordinator {
 
     const validated = validationCommands.length === 0
       ? gitFacts
-      : await this.#submissionValidator.validate(workspace, parsed);
+      : await this.#submissionValidator.validate(advancedWorkspace, parsed);
     const latest = this.#store.listGitSubmissions(this.#runId, taskId).at(-1);
     const revision = (latest?.revision ?? 0) + 1;
     const supersedes = task.conflictForTaskId === null

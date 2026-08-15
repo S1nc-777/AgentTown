@@ -229,6 +229,7 @@ export class IntegrationService {
       const blocker = ordered.find((other) =>
         other.layer === candidate.layer
         && this.#compareOrdered(other, candidate) < 0
+        && other.taskId !== submission.supersedes?.taskId
         && !this.#isIntegrated(other.task)
       );
       if (blocker !== undefined) {

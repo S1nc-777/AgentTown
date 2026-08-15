@@ -1,11 +1,13 @@
-import { randomUUID } from "node:crypto";
+﻿import { randomUUID } from "node:crypto";
 import type {
   ActionProposal,
   AgentEvent,
   AgentMessage,
   CompanyDefinition,
   EmployeeDefinition,
-  TaskRecord
+  ReviewTaskContext,
+  TaskRecord,
+  WritableTaskContext
 } from "@agenttown/runtime-contract";
 import {
   SessionManager,
@@ -20,6 +22,9 @@ export interface TaskWorkflow {
   assign(action: ActionProposal): Promise<void>;
   submit(action: ActionProposal): Promise<void>;
   review(action: ActionProposal): Promise<void>;
+  taskContext?(
+    task: TaskRecord
+  ): WritableTaskContext | ReviewTaskContext | null;
 }
 
 export interface TaskWorkflowHandlers {
@@ -53,6 +58,9 @@ export interface GitTaskWorkflowCoordinator {
   assignTask(action: ActionProposal): Promise<unknown>;
   submitTask(action: ActionProposal): Promise<unknown>;
   recordReview(action: ActionProposal): Promise<unknown>;
+  taskContext?(
+    task: TaskRecord
+  ): WritableTaskContext | ReviewTaskContext | null;
 }
 
 export class GitTaskWorkflow implements TaskWorkflow {
@@ -72,6 +80,12 @@ export class GitTaskWorkflow implements TaskWorkflow {
 
   async review(action: ActionProposal): Promise<void> {
     await this.coordinator.recordReview(action);
+  }
+
+  taskContext(
+    task: TaskRecord
+  ): WritableTaskContext | ReviewTaskContext | null {
+    return this.coordinator.taskContext?.(task) ?? null;
   }
 }
 
@@ -119,6 +133,7 @@ export class CompanyOrchestrator {
   #dispatchController = new AbortController();
   #reviewRecoveryTail: Promise<void> = Promise.resolve();
   readonly #fakeTaskWorkflow: FakeTaskWorkflow;
+  #gitTaskWorkflow: TaskWorkflow | undefined;
 
   constructor(
     private readonly companyId: string,
@@ -129,8 +144,9 @@ export class CompanyOrchestrator {
     private readonly sessions: SessionManager,
     private readonly leaderId: string,
     private readonly reviewerId: string,
-    private readonly gitTaskWorkflow?: TaskWorkflow
+    gitTaskWorkflow?: TaskWorkflow
   ) {
+    this.#gitTaskWorkflow = gitTaskWorkflow;
     this.#fakeTaskWorkflow = new FakeTaskWorkflow({
       assign: async (action) => {
         await this.#assignAndSend(action);
@@ -158,6 +174,19 @@ export class CompanyOrchestrator {
         throw new Error(`Fake review workflow cannot handle ${action.type}`);
       }
     });
+  }
+
+  /**
+   * Binds the Git task workflow after construction. The Git coordinator needs
+   * the orchestrator's session drive (and the orchestrator needs the workflow),
+   * so Core constructs the orchestrator first and attaches the Git workflow as
+   * soon as the Git services are wired.
+   */
+  attachGitWorkflow(workflow: TaskWorkflow): void {
+    if (this.#gitTaskWorkflow !== undefined) {
+      throw new Error("Git workflow is already attached");
+    }
+    this.#gitTaskWorkflow = workflow;
   }
 
   async start(scenarios: Readonly<Record<string, string>>): Promise<void> {
@@ -342,7 +371,8 @@ export class CompanyOrchestrator {
       taskId,
       text: `Review task ${taskId} and propose approval or rejection.`,
       actionRequest: null,
-      taskContext: null
+      taskContext: this.#gitTaskWorkflow?.taskContext?.(this.tasks.get(taskId))
+        ?? null
     }, signal)) {
       this.#assertEpoch(epoch);
       if (event.type === "action.proposed") {
@@ -515,7 +545,7 @@ export class CompanyOrchestrator {
   async #applySupportedControlAction(action: ActionProposal): Promise<void> {
     switch (action.type) {
       case "task.start": {
-        if (this.gitTaskWorkflow?.handles(action) === true) {
+        if (this.#gitTaskWorkflow?.handles(action) === true) {
           throw new Error(
             "Git task start requires coordinator assignment with WritableTaskContext"
           );
@@ -529,7 +559,7 @@ export class CompanyOrchestrator {
         return;
       }
       case "task.request_review":
-        if (this.gitTaskWorkflow?.handles(action) === true) {
+        if (this.#gitTaskWorkflow?.handles(action) === true) {
           throw new Error(
             "Git review requires a structured submission through the coordinator"
           );
@@ -662,8 +692,42 @@ export class CompanyOrchestrator {
         `Acceptance criteria: ${task.acceptanceCriteria.join("; ")}`
       ].join("\n"),
       actionRequest: null,
-      taskContext: null
+      taskContext: this.#gitTaskWorkflow?.taskContext?.(task) ?? null
     };
+  }
+
+  /**
+   * Drives one Agent message for the Git workflow (assignment or review
+   * handoff) and dispatches any structured action the Agent proposes. The
+   * caller is responsible for not awaiting this loop inside a dispatch path:
+   * Git assignments are background-driven so the task stays observable in the
+   * `running` state until the Agent finishes its work.
+   */
+  async driveGitMessage(
+    employeeId: string,
+    message: AgentMessage
+  ): Promise<void> {
+    const employee = this.#employee(employeeId);
+    const epoch = this.#dispatchEpoch;
+    const signal = this.#dispatchController.signal;
+    try {
+      for await (const event of this.sessions.send(employee, message, signal)) {
+        if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+        if (event.type === "action.proposed") {
+          await this.dispatch(event.action);
+        } else if (
+          event.type === "adapter.error"
+          || event.type === "session.exited"
+        ) {
+          return;
+        }
+      }
+    } catch (error) {
+      if (epoch !== this.#dispatchEpoch) return;
+      this.#recordEvent("task.execution_error", employee.id, message.taskId, {
+        reason: this.#errorMessage(error)
+      });
+    }
   }
 
   #recordApprovalRequest(
@@ -735,8 +799,8 @@ export class CompanyOrchestrator {
   }
 
   #taskWorkflow(action: ActionProposal): TaskWorkflow {
-    return this.gitTaskWorkflow?.handles(action) === true
-      ? this.gitTaskWorkflow
+    return this.#gitTaskWorkflow?.handles(action) === true
+      ? this.#gitTaskWorkflow
       : this.#fakeTaskWorkflow;
   }
 }

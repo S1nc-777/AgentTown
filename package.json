@@ -10,6 +10,7 @@
     "pretypecheck": "pnpm --filter @agenttown/probe-contract build",
     "test": "pnpm -r --if-present test",
     "test:p1a": "pnpm --filter @agenttown/e2e test",
+    "test:p1b": "pnpm --filter @agenttown/e2e test -- git-company.test.ts",
     "typecheck": "pnpm -r --if-present typecheck",
     "agenttown": "pnpm --filter @agenttown/cli exec tsx src/main.ts",
     "probe:fake": "pnpm --filter @agenttown/probe-runner probe:fake",
