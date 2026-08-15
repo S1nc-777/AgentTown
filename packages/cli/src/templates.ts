@@ -80,8 +80,68 @@ validation:
     - git-clean
 `;
 
-export type TemplateName = "minimal" | "parallel-software";
+const codexLeadSoftware = `schema_version: 1
+company:
+  name: codex-lead-software
+  mission: Deliver a runnable and tested small software project
+  success_criteria:
+    - All confirmed acceptance criteria pass
+    - Project verification passes
+    - Independent review passes
+  operating_rules:
+    - Each task has one owner
+    - Every conclusion includes evidence
+    - Requirement ambiguity is escalated to the user
+employees:
+  - id: leader
+    role: product_lead
+    agent: codex
+    reports_to: owner
+    workspace: read_only
+  - id: developer-a
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: developer-b
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: review_package
+limits:
+  max_task_retry: 1
+  max_review_loops: 2
+  max_parallel_tasks: 2
+validation:
+  commands:
+    - id: git-clean
+      executable: git
+      args:
+        - status
+        - --porcelain
+      cwd: "."
+      timeout_seconds: 30
+  integration_command_ids:
+    - git-clean
+`;
+
+export type TemplateName =
+  | "minimal"
+  | "parallel-software"
+  | "codex-lead-software";
 
 export function templateYaml(name: TemplateName): string {
-  return name === "minimal" ? minimal : parallelSoftware;
+  switch (name) {
+    case "minimal":
+      return minimal;
+    case "parallel-software":
+      return parallelSoftware;
+    case "codex-lead-software":
+      return codexLeadSoftware;
+  }
 }

@@ -15,10 +15,12 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   parseCompanyYaml,
+  type AgentAdapter,
   type AgentMessage,
   type CompanyDefinition,
   type GitRunRecord
 } from "@agenttown/runtime-contract";
+import { CodexAgentAdapter } from "./agents/codex-adapter.js";
 import { FakeAgentAdapter } from "./agents/fake-adapter.js";
 import { SessionManager } from "./agents/session-manager.js";
 import {
@@ -62,6 +64,27 @@ const GIT_FIXTURE_SCENARIOS = new Set([
   "git-conflict",
   "git-conflict-resolve"
 ]);
+
+/**
+ * Default startup scenario for Codex employees. `scenario` is embedded
+ * verbatim in the Codex initial prompt, so this is a full role instruction
+ * rather than a fixture id.
+ */
+const CODEX_LEADER_PROMPT = [
+  "You are the company leader agent.",
+  "Direct the developers and reviewer, propose and assign tasks, and drive the mission to completion."
+].join(" ");
+
+/**
+ * Real Codex launches require explicit opt-in: `AGENTTOWN_REAL_CODEX` must be
+ * "1" and `AGENTTOWN_FORBID_REAL_PROBES` must not be "1". This mirrors the
+ * probe-runner convention so tests and CLI-launched cores never spawn Codex
+ * unless the operator opts in for manual validation.
+ */
+function allowRealCodexProbes(env: NodeJS.ProcessEnv): boolean {
+  return env.AGENTTOWN_FORBID_REAL_PROBES !== "1"
+    && env.AGENTTOWN_REAL_CODEX === "1";
+}
 
 export interface CoreArguments {
   projectRoot: string;
@@ -542,8 +565,11 @@ export async function runCore(
   await hooks.afterInitialValidation?.();
   await validateCoreStateLayout(args);
   const company = parseCompanyYaml(await readFile(args.companyPath, "utf8"));
-  if (company.employees.some(({ agent }) => agent !== "fake")) {
-    throw new Error("P1A Core accepts only the fake adapter");
+  const unsupportedAgent = company.employees.find(({ agent }) =>
+    agent !== "fake" && agent !== "codex"
+  );
+  if (unsupportedAgent !== undefined) {
+    throw new Error(`unsupported agent adapter: ${unsupportedAgent.agent}`);
   }
   const { leaderId, reviewerId } = employeeIds(company);
   await hooks.beforeStoreOpen?.();
@@ -567,31 +593,60 @@ export async function runCore(
       });
     }
     const fakeRoot = fileURLToPath(new URL("../../fake-agent/", import.meta.url));
-    const adapter = new FakeAgentAdapter({
+    const fakeAdapter = new FakeAgentAdapter({
       executable: process.execPath,
       packageRoot: fakeRoot,
       allowedEmployeeIds: new Set(company.employees.map(({ id }) => id))
     });
+    const hasCodexEmployees = company.employees.some(({ agent }) =>
+      agent === "codex"
+    );
+    const codexAdapter = hasCodexEmployees
+      ? new CodexAgentAdapter({
+          ...(allowRealCodexProbes(process.env)
+            ? { forbidRealProbes: false }
+            : {})
+        })
+      : undefined;
+    const adapterFor = (agent: string): AgentAdapter => {
+      switch (agent) {
+        case "fake":
+          return fakeAdapter;
+        case "codex":
+          if (codexAdapter === undefined) {
+            throw new Error(`agent adapter is not configured: ${agent}`);
+          }
+          return codexAdapter;
+        default:
+          throw new Error(`unsupported agent adapter: ${agent}`);
+      }
+    };
     const sessions = new SessionManager(
-      () => adapter,
+      adapterFor,
       store,
       DEFAULT_COMPANY_ID,
       args.projectRoot
     );
     const tasks = new TaskService(store, DEFAULT_COMPANY_ID, company, leaderId);
-    const scenarios = Object.fromEntries(company.employees.map((employee) => [
-      employee.id,
-      employee.role === "reviewer"
-        ? "review-approve"
-        : employee.role === "developer"
-          ? "complete"
-          : "idle"
-    ]));
+    const scenarios = Object.fromEntries(company.employees.map((employee) => {
+      if (employee.agent === "codex") {
+        return [employee.id, CODEX_LEADER_PROMPT];
+      }
+      return [
+        employee.id,
+        employee.role === "reviewer"
+          ? "review-approve"
+          : employee.role === "developer"
+            ? "complete"
+            : "idle"
+      ];
+    }));
     const startupScenarios = {
       ...scenarios,
       ...parseE2EStartupScenarios(company, process.env)
     };
-    const gitEnabled = gitEnabledFor(company, startupScenarios);
+    const gitEnabled = hasCodexEmployees
+      || gitEnabledFor(company, startupScenarios);
     const policy = new ActionPolicy(company, leaderId, new Set([reviewerId]));
     const orchestrator = new CompanyOrchestrator(
       DEFAULT_COMPANY_ID,
@@ -624,7 +679,7 @@ export async function runCore(
       store,
       orchestrator,
       sessions,
-      adapterFor: () => adapter,
+      adapterFor,
       scenarios: startupScenarios,
       ...(gitWiring === undefined
         ? {}

@@ -43,6 +43,78 @@ limits:
   max_parallel_tasks: 1
 `;
 
+const codexLeadCompany = `schema_version: 1
+company:
+  name: codex-lead
+  mission: test
+  success_criteria: [safe]
+  operating_rules: [safe]
+employees:
+  - id: leader
+    role: product_lead
+    agent: codex
+    reports_to: owner
+    workspace: read_only
+  - id: developer-a
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: developer-b
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: review_package
+limits:
+  max_task_retry: 1
+  max_review_loops: 1
+  max_parallel_tasks: 1
+`;
+
+const claudeLeadCompany = `schema_version: 1
+company:
+  name: claude-lead
+  mission: test
+  success_criteria: [safe]
+  operating_rules: [safe]
+employees:
+  - id: leader
+    role: product_lead
+    agent: claude
+    reports_to: owner
+    workspace: read_only
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: read_only
+limits:
+  max_task_retry: 1
+  max_review_loops: 1
+  max_parallel_tasks: 1
+`;
+
+async function prepareCompanyProject(yaml: string): Promise<string> {
+  const project = await mkdtemp(join(tmpdir(), "agenttown-company-"));
+  const stateDir = join(project, ".agenttown");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, "company.yaml"), yaml);
+  return project;
+}
+
+const companyRunArgs = (project: string): readonly string[] => [
+  "--project-root", project,
+  "--database", join(project, ".agenttown", "agenttown.sqlite"),
+  "--company", join(project, ".agenttown", "company.yaml"),
+  "--pipe-name", "agenttown-0123456789abcdef01234567",
+  "--lease-ttl-ms", "15000"
+];
+
 describe("Core-owned startup scenarios", () => {
   const company = parseCompanyYaml(fakeCompany);
 
@@ -272,5 +344,45 @@ describe("Core entrypoint arguments", () => {
     shutdown.handleSignal("SIGINT");
 
     expect(exits).toEqual([130]);
+  });
+});
+
+describe("agent adapter gate", () => {
+  const codexCompany = parseCompanyYaml(codexLeadCompany);
+
+  it("accepts a company with a codex employee outside E2E mode", async () => {
+    const project = await prepareCompanyProject(codexLeadCompany);
+    try {
+      await expect(runCore(companyRunArgs(project), {
+        async beforeStoreOpen() {
+          throw new Error("codex company passed the adapter gate");
+        }
+      })).rejects.toThrow("codex company passed the adapter gate");
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it("still rejects employees of unsupported agents before store open", async () => {
+    const project = await prepareCompanyProject(claudeLeadCompany);
+    try {
+      await expect(runCore(companyRunArgs(project), {
+        async beforeStoreOpen() {
+          throw new Error("unsupported agent must not reach store open");
+        }
+      })).rejects.toThrow("unsupported agent adapter: claude");
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses codex employees through the fake-only E2E seam", () => {
+    expect(() => parseE2EStartupScenarios(codexCompany, {
+      AGENTTOWN_E2E_MODE: "1",
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_E2E_STARTUP_SCENARIOS: JSON.stringify({
+        leader: "silent"
+      })
+    })).toThrow("all-fake company");
   });
 });
