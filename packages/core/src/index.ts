@@ -120,5 +120,7 @@ export {
 } from "./git/git-lifecycle-hooks.js";
 export {
   CleanupService,
+  createInjectedCleanupService,
+  type CleanupServiceDependencies,
   type CleanupServiceOptions
 } from "./git/cleanup-service.js";

@@ -1136,7 +1136,7 @@ export class CoreStore {
     validationRunIds: readonly string[];
     event: NewEvent;
   }): void {
-    if (input.event.type !== "git.cleanup.completed"
+    if (input.event.type !== "git.cleanup.committed"
       || input.event.actorId.length === 0
       || input.event.taskId !== null
       || input.event.causationEventId !== null
