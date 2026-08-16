@@ -88,12 +88,30 @@ const REAL_AGENT_LEADER_PROMPT = [
 export function coreStartupScenarios(
   company: CompanyDefinition
 ): Readonly<Record<string, string>> {
+  const gitCollaboration = company.employees.some(({ agent }) => agent !== "fake");
+  let gitDeveloperIndex = 0;
   return Object.fromEntries(company.employees.map((employee) => {
     if (employee.agent !== "fake") {
       return [
         employee.id,
         `${REAL_AGENT_LEADER_PROMPT}\nMission: ${company.company.mission}`
       ];
+    }
+    if (gitCollaboration) {
+      // Real-agent companies drive Git collaboration: fake developers must
+      // run Git fixture scenarios (they submit through git worktrees) and the
+      // reviewer approves via the Git review path.
+      if (employee.role === "reviewer") {
+        return [employee.id, "git-review-approve"];
+      }
+      if (employee.role === "developer") {
+        const scenario = gitDeveloperIndex === 0
+          ? "git-developer-a"
+          : "git-developer-b";
+        gitDeveloperIndex += 1;
+        return [employee.id, scenario];
+      }
+      return [employee.id, "idle"];
     }
     return [
       employee.id,

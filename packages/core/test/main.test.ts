@@ -258,6 +258,14 @@ describe("core startup scenarios for real-agent leaders", () => {
       scenario.includes("Mission:")
     )).toBe(false);
   });
+
+  it("switches fake developers and reviewer to git scenarios in real-agent companies", () => {
+    const scenarios = coreStartupScenarios(codexCompany);
+    expect(scenarios.leader).toContain("Mission: test");
+    expect(scenarios["developer-a"]).toBe("git-developer-a");
+    expect(scenarios["developer-b"]).toBe("git-developer-b");
+    expect(scenarios.reviewer).toBe("git-review-approve");
+  });
 });
 
 describe("Core entrypoint arguments", () => {
