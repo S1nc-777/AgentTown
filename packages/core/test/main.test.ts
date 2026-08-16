@@ -19,6 +19,7 @@ import { OpenCodeAgentAdapter } from "../src/agents/opencode-adapter.js";
 import {
   assertCorePathWithinProject,
   buildAdapterMap,
+  coreStartupScenarios,
   createShutdownCoordinator,
   parseE2EStartupScenarios,
   parseCoreArguments,
@@ -208,6 +209,37 @@ describe("Core-owned startup scenarios", () => {
         invented: "silent"
       })
     })).toThrow("unknown employee");
+  });
+});
+
+describe("core startup scenarios for real-agent leaders", () => {
+  const codexCompany = parseCompanyYaml(codexLeadCompany);
+  const claudeCompany = parseCompanyYaml(claudeLeadCompany);
+  const opencodeCompany = parseCompanyYaml(opencodeLeadCompany);
+
+  it("injects the company mission into the codex leader scenario", () => {
+    const scenarios = coreStartupScenarios(codexCompany);
+    expect(scenarios.leader).toContain("company leader agent");
+    expect(scenarios.leader).toContain("Mission: test");
+  });
+
+  it("injects the company mission into the claude leader scenario", () => {
+    const scenarios = coreStartupScenarios(claudeCompany);
+    expect(scenarios.leader).toContain("Mission: test");
+  });
+
+  it("injects the company mission into the opencode leader scenario", () => {
+    const scenarios = coreStartupScenarios(opencodeCompany);
+    expect(scenarios.leader).toContain("Mission: test");
+  });
+
+  it("keeps fake employees on fixture scenarios without mission text", () => {
+    const scenarios = coreStartupScenarios(parseCompanyYaml(fakeCompany));
+    expect(scenarios.leader).toBe("idle");
+    expect(scenarios.reviewer).toBe("review-approve");
+    expect(Object.values(scenarios).some((scenario) =>
+      scenario.includes("Mission:")
+    )).toBe(false);
   });
 });
 

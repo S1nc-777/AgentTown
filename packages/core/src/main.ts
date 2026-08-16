@@ -78,6 +78,35 @@ const REAL_AGENT_LEADER_PROMPT = [
 ].join(" ");
 
 /**
+ * Per-employee startup scenarios owned by the Core. Real-agent employees
+ * (codex, claude, opencode) get the leader prompt with the company mission
+ * injected, because `scenario` is embedded verbatim in the adapter's initial
+ * prompt; fake employees get deterministic fixture ids. The same scenarios
+ * feed CheckpointService recovery, so the mission text is also present when a
+ * leader session is resumed or rebuilt from a checkpoint.
+ */
+export function coreStartupScenarios(
+  company: CompanyDefinition
+): Readonly<Record<string, string>> {
+  return Object.fromEntries(company.employees.map((employee) => {
+    if (employee.agent !== "fake") {
+      return [
+        employee.id,
+        `${REAL_AGENT_LEADER_PROMPT}\nMission: ${company.company.mission}`
+      ];
+    }
+    return [
+      employee.id,
+      employee.role === "reviewer"
+        ? "review-approve"
+        : employee.role === "developer"
+          ? "complete"
+          : "idle"
+    ];
+  }));
+}
+
+/**
  * Real Codex launches require explicit opt-in: `AGENTTOWN_REAL_CODEX` must be
  * "1" and `AGENTTOWN_FORBID_REAL_PROBES` must not be "1". This mirrors the
  * probe-runner convention so tests and CLI-launched cores never spawn Codex
@@ -708,19 +737,7 @@ export async function runCore(
       args.projectRoot
     );
     const tasks = new TaskService(store, DEFAULT_COMPANY_ID, company, leaderId);
-    const scenarios = Object.fromEntries(company.employees.map((employee) => {
-      if (employee.agent !== "fake") {
-        return [employee.id, REAL_AGENT_LEADER_PROMPT];
-      }
-      return [
-        employee.id,
-        employee.role === "reviewer"
-          ? "review-approve"
-          : employee.role === "developer"
-            ? "complete"
-            : "idle"
-      ];
-    }));
+    const scenarios = coreStartupScenarios(company);
     const startupScenarios = {
       ...scenarios,
       ...parseE2EStartupScenarios(company, process.env)
