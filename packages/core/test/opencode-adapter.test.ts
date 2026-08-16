@@ -25,6 +25,7 @@ interface ScriptedChild extends ChildProcessWithoutNullStreams {
   args: string[];
   cwd: string | undefined;
   killCalls: Array<string | number>;
+  stdinEndCalls: number;
   writeStdout: (chunk: string) => void;
   closeChild: (exitCode: number, signal: NodeJS.Signals | null) => void;
   exitChild: (exitCode: number) => void;
@@ -41,10 +42,20 @@ function makeScriptedChild(
   let exitCodeValue: number | null = null;
   let signalCodeValue: NodeJS.Signals | null = null;
   const killCalls: Array<string | number> = [];
+  const stdin = new PassThrough();
+  let stdinEndCalls = 0;
+  const originalEnd = stdin.end.bind(stdin);
+  Object.defineProperty(stdin, "end", {
+    configurable: true,
+    value: (...args: unknown[]) => {
+      stdinEndCalls += 1;
+      return originalEnd(...(args as []));
+    }
+  });
   const stdout = new PassThrough();
   const child = Object.assign(emitter, {
     pid: scriptedPid++,
-    stdin: new PassThrough(),
+    stdin,
     stdout,
     stderr: new PassThrough(),
     kill: (signal?: NodeJS.Signals | number) => {
@@ -68,6 +79,10 @@ function makeScriptedChild(
   });
   Object.defineProperty(child, "signalCode", {
     get: () => signalCodeValue,
+    configurable: true
+  });
+  Object.defineProperty(child, "stdinEndCalls", {
+    get: () => stdinEndCalls,
     configurable: true
   });
   Object.assign(child, {
@@ -303,6 +318,7 @@ describe("OpenCodeAgentAdapter", () => {
       ]);
       expect(children[0]!.args).not.toContain("--model");
       expect(children[0]!.args[5]).toContain("You are Developer");
+      expect(children[0]!.stdinEndCalls).toBe(1);
     } finally {
       if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
       await project.cleanup();

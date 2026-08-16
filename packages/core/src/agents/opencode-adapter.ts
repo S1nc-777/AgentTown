@@ -608,6 +608,9 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
       throw error;
     }
     child.stdin.on("error", () => undefined);
+    // `opencode run` blocks while stdin is open (it treats an open pipe as
+    // pending input). Close it immediately so the one-shot turn can start.
+    child.stdin.end();
 
     let stdoutBuffer = "";
     child.stdout.on("data", (chunk: string) => {
