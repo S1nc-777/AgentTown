@@ -70,6 +70,7 @@ const DEFAULT_SPAWN_PROCESS: NonNullable<
 function initialPrompt(input: StartSessionInput): string {
   return [
     `You are ${input.role} in the AgentTown company.`,
+    `Your employee id is ${input.employeeId}. Always use it as actorEmployeeId in ACTION blocks.`,
     `Scenario: ${input.scenario}`,
     CLAUDE_FORMAT_INSTRUCTION
   ].join("\n");
