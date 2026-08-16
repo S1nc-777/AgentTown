@@ -309,6 +309,40 @@ describe("OpenCodeAgentAdapter", () => {
     }
   });
 
+  it("spawns via process.execPath with the script entry prepended when scriptEntry is set", async () => {
+    const project = await createTemporaryProject();
+    const scriptEntry = "/path/to/cli.js";
+    const { spawnProcess, children } = createScriptedSpawn([
+      {
+        match: (args) => !args.includes("-s"),
+        lines: [stepStarted("ses_1"), stepFinished("stop", 1, 1)]
+      }
+    ]);
+    const adapter = new OpenCodeAgentAdapter({
+      forbidRealProbes: true,
+      spawnProcess,
+      scriptEntry
+    });
+    let handle: SessionHandle | undefined;
+    try {
+      handle = await bounded(
+        adapter.start(startInput("developer", project.root)),
+        "start"
+      );
+      const startChild = children[0]!;
+      expect(startChild.executable).toBe(process.execPath);
+      expect(startChild.args[0]).toBe(scriptEntry);
+      expect(startChild.args.slice(1, 4)).toEqual([
+        "run",
+        "--format",
+        "json"
+      ]);
+    } finally {
+      if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
+      await project.cleanup();
+    }
+  });
+
   it("adds --model to run args only when the model option is configured", async () => {
     const project = await createTemporaryProject();
     const { spawnProcess, children } = createScriptedSpawn([

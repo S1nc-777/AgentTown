@@ -159,6 +159,13 @@ async function nextWithTimeout<T>(
 export interface ClaudeAgentAdapterOptions {
   /** Executable used to launch Claude Code; defaults to "claude". */
   executable?: string;
+  /**
+   * When set, the CLI is launched via `process.execPath` with this script as
+   * the first argument instead of spawning `executable` directly. Needed when
+   * the CLI ships as a `#!/usr/bin/env node` script (npm shims on Windows
+   * cannot be spawned by Node directly).
+   */
+  scriptEntry?: string;
   /** Working directory for spawned processes; defaults to process.cwd(). */
   packageRoot?: string;
   /**
@@ -224,6 +231,7 @@ interface LiveClaudeSession {
  */
 export class ClaudeAgentAdapter implements AgentAdapter {
   readonly #executable: string;
+  readonly #scriptEntry: string | null;
   readonly #packageRoot: string;
   readonly #forbidRealProbes: boolean;
   readonly #permissionMode: string | null;
@@ -237,6 +245,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
   constructor(options: ClaudeAgentAdapterOptions = {}) {
     this.#executable = options.executable ?? DEFAULT_EXECUTABLE;
+    this.#scriptEntry = options.scriptEntry ?? null;
     this.#packageRoot = resolve(options.packageRoot ?? process.cwd());
     this.#forbidRealProbes = options.forbidRealProbes ?? true;
     this.#permissionMode = options.permissionMode != null
@@ -537,10 +546,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     }
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = this.#spawnProcess(this.#executable, args, {
-        cwd: this.#packageRoot,
-        stdio: ["pipe", "pipe", "pipe"]
-      });
+      child = this.#spawnProcess(
+        this.#scriptEntry === null ? this.#executable : process.execPath,
+        this.#scriptEntry === null ? args : [this.#scriptEntry, ...args],
+        {
+          cwd: this.#packageRoot,
+          stdio: ["pipe", "pipe", "pipe"]
+        }
+      );
     } catch (error) {
       throw error;
     }

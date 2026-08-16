@@ -295,6 +295,41 @@ describe("ClaudeAgentAdapter", () => {
     }
   });
 
+  it("spawns via process.execPath with the script entry prepended when scriptEntry is set", async () => {
+    const project = await createTemporaryProject();
+    const scriptEntry = "/path/to/cli.js";
+    const { spawnProcess, children } = createScriptedSpawn([
+      {
+        match: (args) => !args.includes("--resume"),
+        lines: [claudeResult({ result: "warm-up discarded" })]
+      }
+    ]);
+    const adapter = new ClaudeAgentAdapter({
+      forbidRealProbes: true,
+      spawnProcess,
+      scriptEntry
+    });
+    let handle: SessionHandle | undefined;
+    try {
+      handle = await bounded(
+        adapter.start(startInput("developer", project.root)),
+        "start"
+      );
+      const startChild = children[0]!;
+      expect(startChild.executable).toBe(process.execPath);
+      expect(startChild.args[0]).toBe(scriptEntry);
+      expect(startChild.args.slice(1, 5)).toEqual([
+        "-p",
+        expect.stringContaining("Developer"),
+        "--output-format",
+        "json"
+      ]);
+    } finally {
+      if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
+      await project.cleanup();
+    }
+  });
+
   it("refuses to launch the real executable while forbidRealProbes is enabled", async () => {
     const project = await createTemporaryProject();
     const adapter = new ClaudeAgentAdapter();

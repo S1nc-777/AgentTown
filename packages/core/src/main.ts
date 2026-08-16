@@ -149,8 +149,11 @@ export interface AdapterMap {
  * opencode) when the company contains employees of that type. Real launches
  * stay forbidden unless the operator opts in via
  * `AGENTTOWN_FORBID_REAL_PROBES !== "1"` together with the matching
- * `AGENTTOWN_REAL_<TYPE> === "1"`; OpenCode additionally honors
- * `AGENTTOWN_OPENCODE_MODEL` when set.
+ * `AGENTTOWN_REAL_<TYPE> === "1"`. Custom CLI locations are honored through
+ * `AGENTTOWN_CLAUDE_EXECUTABLE`, `AGENTTOWN_OPENCODE_EXECUTABLE` and
+ * `AGENTTOWN_OPENCODE_SCRIPT` (a `#!/usr/bin/env node` script run via
+ * `process.execPath`); OpenCode additionally honors `AGENTTOWN_OPENCODE_MODEL`
+ * when set.
  */
 export function buildAdapterMap(
   company: CompanyDefinition,
@@ -174,6 +177,7 @@ export function buildAdapterMap(
     : undefined;
   const claudeAdapter = company.employees.some(({ agent }) => agent === "claude")
     ? new ClaudeAgentAdapter({
+        executable: env.AGENTTOWN_CLAUDE_EXECUTABLE ?? "claude",
         ...(allowRealClaudeProbes(env)
           ? { forbidRealProbes: false }
           : {})
@@ -181,6 +185,7 @@ export function buildAdapterMap(
     : undefined;
   const opencodeAdapter = company.employees.some(({ agent }) => agent === "opencode")
     ? new OpenCodeAgentAdapter({
+        executable: env.AGENTTOWN_OPENCODE_EXECUTABLE ?? "opencode",
         ...(allowRealOpenCodeProbes(env)
           ? {
               forbidRealProbes: false,
@@ -188,6 +193,9 @@ export function buildAdapterMap(
                 ? { model: env.AGENTTOWN_OPENCODE_MODEL }
                 : {})
             }
+          : {}),
+        ...(env.AGENTTOWN_OPENCODE_SCRIPT
+          ? { scriptEntry: env.AGENTTOWN_OPENCODE_SCRIPT }
           : {})
       })
     : undefined;

@@ -161,6 +161,13 @@ async function nextWithTimeout<T>(
 export interface OpenCodeAgentAdapterOptions {
   /** Executable used to launch OpenCode; defaults to "opencode". */
   executable?: string;
+  /**
+   * When set, the CLI is launched via `process.execPath` with this script as
+   * the first argument instead of spawning `executable` directly. Needed when
+   * the CLI ships as a `#!/usr/bin/env node` script (npm shims on Windows
+   * cannot be spawned by Node directly).
+   */
+  scriptEntry?: string;
   /** Working directory for spawned processes; defaults to process.cwd(). */
   packageRoot?: string;
   /**
@@ -225,6 +232,7 @@ interface LiveOpenCodeSession {
  */
 export class OpenCodeAgentAdapter implements AgentAdapter {
   readonly #executable: string;
+  readonly #scriptEntry: string | null;
   readonly #packageRoot: string;
   readonly #model: string | null;
   readonly #forbidRealProbes: boolean;
@@ -238,6 +246,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
 
   constructor(options: OpenCodeAgentAdapterOptions = {}) {
     this.#executable = options.executable ?? DEFAULT_EXECUTABLE;
+    this.#scriptEntry = options.scriptEntry ?? null;
     this.#packageRoot = resolve(options.packageRoot ?? process.cwd());
     this.#model = options.model != null && options.model.length > 0
       ? options.model
@@ -535,10 +544,14 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
     }
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = this.#spawnProcess(this.#executable, args, {
-        cwd: this.#packageRoot,
-        stdio: ["pipe", "pipe", "pipe"]
-      });
+      child = this.#spawnProcess(
+        this.#scriptEntry === null ? this.#executable : process.execPath,
+        this.#scriptEntry === null ? args : [this.#scriptEntry, ...args],
+        {
+          cwd: this.#packageRoot,
+          stdio: ["pipe", "pipe", "pipe"]
+        }
+      );
     } catch (error) {
       throw error;
     }

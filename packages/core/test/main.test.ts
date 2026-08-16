@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseCompanyYaml } from "@agenttown/runtime-contract";
-import { ClaudeAgentAdapter } from "../src/agents/claude-adapter.js";
+import { ClaudeAgentAdapter, type ClaudeAgentAdapterOptions } from "../src/agents/claude-adapter.js";
 import { CodexAgentAdapter } from "../src/agents/codex-adapter.js";
 import { FakeAgentAdapter } from "../src/agents/fake-adapter.js";
 import type { OpenCodeAgentAdapterOptions } from "../src/agents/opencode-adapter.js";
@@ -42,6 +42,23 @@ vi.mock("../src/agents/opencode-adapter.js", async (importOriginal) => {
     }
   };
   return { ...actual, OpenCodeAgentAdapter: RecordingOpenCodeAdapter };
+});
+
+const claudeConstructorOptions = vi.hoisted(
+  () => [] as Array<ClaudeAgentAdapterOptions>
+);
+
+vi.mock("../src/agents/claude-adapter.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/agents/claude-adapter.js")>();
+  const RecordingClaudeAdapter = class extends actual.ClaudeAgentAdapter {
+    constructor(
+      options: ConstructorParameters<typeof actual.ClaudeAgentAdapter>[0] = {}
+    ) {
+      claudeConstructorOptions.push({ ...options });
+      super(options);
+    }
+  };
+  return { ...actual, ClaudeAgentAdapter: RecordingClaudeAdapter };
 });
 
 const fakeCompany = `schema_version: 1
@@ -455,6 +472,7 @@ describe("agent adapter gate", () => {
 
   beforeEach(() => {
     openCodeConstructorOptions.length = 0;
+    claudeConstructorOptions.length = 0;
   });
 
   it("accepts a company with a codex employee outside E2E mode", async () => {
@@ -628,6 +646,49 @@ describe("agent adapter gate", () => {
     const options = openCodeConstructorOptions.at(-1);
     expect(options?.model).toBeUndefined();
     expect(options?.forbidRealProbes).toBeUndefined();
+  });
+
+  it("passes AGENTTOWN_CLAUDE_EXECUTABLE into the Claude adapter when set", () => {
+    buildAdapterMap(claudeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "0",
+      AGENTTOWN_REAL_CLAUDE: "1",
+      AGENTTOWN_CLAUDE_EXECUTABLE: "C:/path/to/claude.exe"
+    });
+    const options = claudeConstructorOptions.at(-1);
+    expect(options?.executable).toBe("C:/path/to/claude.exe");
+    expect(options?.forbidRealProbes).toBe(false);
+  });
+
+  it("defaults the Claude executable to claude when AGENTTOWN_CLAUDE_EXECUTABLE is unset", () => {
+    buildAdapterMap(claudeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_CLAUDE: "0"
+    });
+    const options = claudeConstructorOptions.at(-1);
+    expect(options?.executable).toBe("claude");
+  });
+
+  it("passes AGENTTOWN_OPENCODE_EXECUTABLE and AGENTTOWN_OPENCODE_SCRIPT into the OpenCode adapter when set", () => {
+    buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "0",
+      AGENTTOWN_REAL_OPENCODE: "1",
+      AGENTTOWN_OPENCODE_EXECUTABLE: "C:/path/to/opencode.exe",
+      AGENTTOWN_OPENCODE_SCRIPT: "C:/path/to/opencode-cli.js"
+    });
+    const options = openCodeConstructorOptions.at(-1);
+    expect(options?.executable).toBe("C:/path/to/opencode.exe");
+    expect(options?.scriptEntry).toBe("C:/path/to/opencode-cli.js");
+    expect(options?.forbidRealProbes).toBe(false);
+  });
+
+  it("defaults the OpenCode executable to opencode when AGENTTOWN_OPENCODE_EXECUTABLE is unset", () => {
+    buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_OPENCODE: "0"
+    });
+    const options = openCodeConstructorOptions.at(-1);
+    expect(options?.executable).toBe("opencode");
+    expect(options?.scriptEntry).toBeUndefined();
   });
 
   it("still rejects employees of unsupported agents before store open", async () => {
