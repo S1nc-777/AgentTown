@@ -104,6 +104,28 @@ describe("parseClaudeResult", () => {
     ]);
   });
 
+  it("treats an empty api_error_status string as success", () => {
+    const events = parseClaudeResult(resultJson({ api_error_status: "" }));
+    expect(events).toEqual([
+      {
+        type: "session.started",
+        handle: {
+          employeeId: "",
+          adapter: "claude",
+          internalSessionId: "",
+          nativeSessionId: "session-1"
+        }
+      },
+      { type: "output.completed", text: "PONG" },
+      {
+        type: "usage.updated",
+        inputTokens: 10,
+        outputTokens: 5,
+        contextTokens: null
+      }
+    ]);
+  });
+
   it("returns an adapter.error for unparseable stdout", () => {
     expect(parseClaudeResult("total garbage")).toEqual([
       {

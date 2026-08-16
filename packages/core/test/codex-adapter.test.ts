@@ -29,6 +29,7 @@ interface ScriptedChild extends ChildProcessWithoutNullStreams {
   killCalls: Array<string | number>;
   writeStdout: (chunk: string) => void;
   closeChild: (exitCode: number, signal: NodeJS.Signals | null) => void;
+  exitChild: (exitCode: number) => void;
 }
 
 let scriptedPid = 5000;
@@ -57,8 +58,10 @@ function makeScriptedChild(
           exitCodeValue = 1;
         }
         setImmediate(() => emitter.emit("close", exitCodeValue, signalCodeValue));
+        return true;
       }
-      return true;
+      // A real ChildProcess returns false when the child has already exited.
+      return false;
     }
   }) as unknown as ScriptedChild;
   Object.defineProperty(child, "exitCode", {
@@ -78,10 +81,15 @@ function makeScriptedChild(
       stdout.write(chunk);
     },
     closeChild: (exitCode: number, signal: NodeJS.Signals | null) => {
+      exitCodeValue = exitCode;
+      signalCodeValue = signal;
+      setImmediate(() => emitter.emit("close", exitCode, signal));
+    },
+    exitChild: (exitCode: number) => {
       if (exitCodeValue === null && signalCodeValue === null) {
         exitCodeValue = exitCode;
-        signalCodeValue = signal;
-        setImmediate(() => emitter.emit("close", exitCode, signal));
+        signalCodeValue = null;
+        setImmediate(() => emitter.emit("exit", exitCode, null));
       }
     }
   });
@@ -402,6 +410,59 @@ describe("CodexAgentAdapter", () => {
       const events = await inFlight;
       expect(events.map((event) => event.type)).toContain("session.interrupted");
       expect(children[1]!.killCalls.length).toBeGreaterThan(0);
+    } finally {
+      if (inFlight !== undefined) await inFlight.catch(() => undefined);
+      if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
+      await project.cleanup();
+    }
+  });
+
+  it("does not suppress an already-exited child's output while close is pending", async () => {
+    const project = await createTemporaryProject();
+    const { spawnProcess, children } = createScriptedSpawn([
+      {
+        match: (args) => !args.includes("resume"),
+        lines: [threadStarted("thread-1"), turnCompleted(1, 1)]
+      },
+      {
+        match: (args) => args.includes("resume"),
+        lines: [agentMessage("PONG")],
+        keepOpen: true
+      }
+    ]);
+    const adapter = new CodexAgentAdapter({
+      forbidRealProbes: true,
+      spawnProcess
+    });
+    let handle: SessionHandle | undefined;
+    let inFlight: Promise<AgentEvent[]> | undefined;
+    try {
+      handle = await bounded(
+        adapter.start(startInput("developer", project.root)),
+        "start"
+      );
+      inFlight = bounded(
+        collect(adapter.send(handle, message("task-1"))),
+        "send"
+      );
+      await sleep(50);
+      const resumeChild = children[1]!;
+      // The child has exited (exitCode set, 'exit' emitted) but 'close' has
+      // not fired yet because stdio is still flushing.
+      resumeChild.exitChild(0);
+      await expect(bounded(
+        adapter.interrupt(handle),
+        "interrupt"
+      )).resolves.toEqual({ interrupted: false });
+      expect(resumeChild.killCalls).toHaveLength(0);
+      // 'close' fires now: the turn's already-queued real events must flow
+      // through instead of a session.interrupted.
+      resumeChild.closeChild(0, null);
+      const events = await inFlight;
+      expect(events.map((event) => event.type)).not.toContain(
+        "session.interrupted"
+      );
+      expect(events).toContainEqual({ type: "output.completed", text: "PONG" });
     } finally {
       if (inFlight !== undefined) await inFlight.catch(() => undefined);
       if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);

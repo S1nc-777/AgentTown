@@ -106,7 +106,7 @@ export function parseClaudeResult(text: string): AgentEvent[] {
   if (!isRecord(value) || value.type !== "result") return [];
 
   const failed = value.is_error === true
-    || (value.api_error_status !== null && value.api_error_status !== undefined)
+    || isNonEmptyString(value.api_error_status)
     || (typeof value.stop_reason === "string" && value.stop_reason !== "end_turn");
 
   // A failed result produces only the adapter.error so consumers never mistake

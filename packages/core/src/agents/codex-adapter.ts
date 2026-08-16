@@ -316,7 +316,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   async interrupt(session: SessionHandle): Promise<{ interrupted: boolean }> {
     const live = this.#getLive(session);
     const turn = live.activeTurn;
-    if (turn === null || (turn.child.exitCode !== null && turn.child.signalCode !== null)) {
+    if (turn === null || turn.child.exitCode !== null || turn.child.signalCode !== null) {
       return { interrupted: false };
     }
     turn.interruptRequested = true;
