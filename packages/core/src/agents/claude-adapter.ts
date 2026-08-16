@@ -60,7 +60,8 @@ const CLAUDE_FORMAT_INSTRUCTION = [
   'ACTION: {"schemaVersion": 1, "actionId": "<unique id>", "type": "<action type>", "actorEmployeeId": "<your employee id>", "taskId": "<task id or null>", "payload": { ... }, "reason": "<one sentence>", "causationEventId": "<event id or null>"}',
   "```",
   "The ACTION block is mandatory in every reply.",
-  "Allowed action types (use exactly one of these): task.propose, task.assign, task.start, task.submit, task.request_review, task.approve, task.reject, task.block, employee.message, user.approval.request, company.complete.request"
+  "Allowed action types (use exactly one of these): task.propose, task.assign, task.start, task.submit, task.request_review, task.approve, task.reject, task.block, employee.message, user.approval.request, company.complete.request",
+  "task.propose payload must include: title (string), objective (string), acceptanceCriteria (array of strings); dependencies (array of task ids) is optional."
 ].join("\n");
 
 const DEFAULT_SPAWN_PROCESS: NonNullable<
