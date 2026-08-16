@@ -1,6 +1,6 @@
 import { parseCompanyYaml, type CompanyDefinition } from "@agenttown/runtime-contract";
 import { describe, expect, it } from "vitest";
-import { templateYaml } from "../src/templates.js";
+import { TEMPLATE_NAMES, templateYaml } from "../src/templates.js";
 
 function assertAuthoritativeValidation(company: CompanyDefinition): void {
   expect(company.validation.commands.length).toBeGreaterThan(0);
@@ -41,6 +41,33 @@ describe("company templates", () => {
     expect(byId.get("developer-a")?.agent).toBe("fake");
     expect(byId.get("developer-b")?.agent).toBe("fake");
     expect(byId.get("reviewer")?.agent).toBe("fake");
+  });
+
+  it.each(["claude-lead-software", "opencode-lead-software"] as const)(
+    "parses %s with the matching real-agent leader and fake employees",
+    (name) => {
+      const yaml = templateYaml(name as never);
+      expect(typeof yaml).toBe("string");
+      const company = parseCompanyYaml(yaml);
+      expect(company.company.name).toBe(name);
+      expect(company.employees.length).toBe(4);
+      const byId = new Map(company.employees.map((employee) => [employee.id, employee]));
+      const leaderAgent = name === "claude-lead-software" ? "claude" : "opencode";
+      expect(byId.get("leader")?.agent).toBe(leaderAgent);
+      expect(byId.get("developer-a")?.agent).toBe("fake");
+      expect(byId.get("developer-b")?.agent).toBe("fake");
+      expect(byId.get("reviewer")?.agent).toBe("fake");
+    }
+  );
+
+  it("roster includes all five templates", () => {
+    expect([...TEMPLATE_NAMES]).toEqual([
+      "minimal",
+      "parallel-software",
+      "codex-lead-software",
+      "claude-lead-software",
+      "opencode-lead-software"
+    ]);
   });
 
   it("configures authoritative validation for the codex-lead-software template", () => {

@@ -21,7 +21,9 @@ import {
   type GitRunRecord
 } from "@agenttown/runtime-contract";
 import { CodexAgentAdapter } from "./agents/codex-adapter.js";
+import { ClaudeAgentAdapter } from "./agents/claude-adapter.js";
 import { FakeAgentAdapter } from "./agents/fake-adapter.js";
+import { OpenCodeAgentAdapter } from "./agents/opencode-adapter.js";
 import { SessionManager } from "./agents/session-manager.js";
 import {
   CompanyOrchestrator,
@@ -66,11 +68,11 @@ const GIT_FIXTURE_SCENARIOS = new Set([
 ]);
 
 /**
- * Default startup scenario for Codex employees. `scenario` is embedded
- * verbatim in the Codex initial prompt, so this is a full role instruction
- * rather than a fixture id.
+ * Default startup scenario for employees backed by a real Agent (Codex,
+ * Claude, OpenCode). `scenario` is embedded verbatim in the adapter's initial
+ * prompt, so this is a full role instruction rather than a fixture id.
  */
-const CODEX_LEADER_PROMPT = [
+const REAL_AGENT_LEADER_PROMPT = [
   "You are the company leader agent.",
   "Direct the developers and reviewer, propose and assign tasks, and drive the mission to completion."
 ].join(" ");
@@ -86,16 +88,40 @@ function allowRealCodexProbes(env: NodeJS.ProcessEnv): boolean {
     && env.AGENTTOWN_REAL_CODEX === "1";
 }
 
+/**
+ * Real Claude launches require explicit opt-in: `AGENTTOWN_REAL_CLAUDE` must
+ * be "1" and `AGENTTOWN_FORBID_REAL_PROBES` must not be "1". Same convention
+ * as Codex so tests never spawn Claude unless the operator opts in.
+ */
+function allowRealClaudeProbes(env: NodeJS.ProcessEnv): boolean {
+  return env.AGENTTOWN_FORBID_REAL_PROBES !== "1"
+    && env.AGENTTOWN_REAL_CLAUDE === "1";
+}
+
+/**
+ * Real OpenCode launches require explicit opt-in: `AGENTTOWN_REAL_OPENCODE`
+ * must be "1" and `AGENTTOWN_FORBID_REAL_PROBES` must not be "1". Same
+ * convention as Codex so tests never spawn OpenCode unless the operator opts
+ * in.
+ */
+function allowRealOpenCodeProbes(env: NodeJS.ProcessEnv): boolean {
+  return env.AGENTTOWN_FORBID_REAL_PROBES !== "1"
+    && env.AGENTTOWN_REAL_OPENCODE === "1";
+}
+
 export interface AdapterMap {
   adapterFor: (agent: string) => AgentAdapter;
-  hasCodexEmployees: boolean;
+  hasRealAgents: boolean;
 }
 
 /**
  * Builds the per-company adapter factory: one shared FakeAgentAdapter for all
- * fake employees, plus one CodexAgentAdapter when the company contains codex
- * employees. Real Codex launches stay forbidden unless the operator opts in
- * via `AGENTTOWN_FORBID_REAL_PROBES !== "1"` and `AGENTTOWN_REAL_CODEX === "1"`.
+ * fake employees, plus one adapter per real-agent type (codex, claude,
+ * opencode) when the company contains employees of that type. Real launches
+ * stay forbidden unless the operator opts in via
+ * `AGENTTOWN_FORBID_REAL_PROBES !== "1"` together with the matching
+ * `AGENTTOWN_REAL_<TYPE> === "1"`; OpenCode additionally honors
+ * `AGENTTOWN_OPENCODE_MODEL` when set.
  */
 export function buildAdapterMap(
   company: CompanyDefinition,
@@ -107,13 +133,32 @@ export function buildAdapterMap(
     packageRoot: fakeRoot,
     allowedEmployeeIds: new Set(company.employees.map(({ id }) => id))
   });
-  const hasCodexEmployees = company.employees.some(({ agent }) =>
-    agent === "codex"
+  const hasRealAgents = company.employees.some(({ agent }) =>
+    agent === "codex" || agent === "claude" || agent === "opencode"
   );
-  const codexAdapter = hasCodexEmployees
+  const codexAdapter = company.employees.some(({ agent }) => agent === "codex")
     ? new CodexAgentAdapter({
         ...(allowRealCodexProbes(env)
           ? { forbidRealProbes: false }
+          : {})
+      })
+    : undefined;
+  const claudeAdapter = company.employees.some(({ agent }) => agent === "claude")
+    ? new ClaudeAgentAdapter({
+        ...(allowRealClaudeProbes(env)
+          ? { forbidRealProbes: false }
+          : {})
+      })
+    : undefined;
+  const opencodeAdapter = company.employees.some(({ agent }) => agent === "opencode")
+    ? new OpenCodeAgentAdapter({
+        ...(allowRealOpenCodeProbes(env)
+          ? {
+              forbidRealProbes: false,
+              ...(env.AGENTTOWN_OPENCODE_MODEL
+                ? { model: env.AGENTTOWN_OPENCODE_MODEL }
+                : {})
+            }
           : {})
       })
     : undefined;
@@ -126,11 +171,21 @@ export function buildAdapterMap(
           throw new Error(`agent adapter is not configured: ${agent}`);
         }
         return codexAdapter;
+      case "claude":
+        if (claudeAdapter === undefined) {
+          throw new Error(`agent adapter is not configured: ${agent}`);
+        }
+        return claudeAdapter;
+      case "opencode":
+        if (opencodeAdapter === undefined) {
+          throw new Error(`agent adapter is not configured: ${agent}`);
+        }
+        return opencodeAdapter;
       default:
         throw new Error(`unsupported agent adapter: ${agent}`);
     }
   };
-  return { adapterFor, hasCodexEmployees };
+  return { adapterFor, hasRealAgents };
 }
 
 export interface CoreArguments {
@@ -613,7 +668,10 @@ export async function runCore(
   await validateCoreStateLayout(args);
   const company = parseCompanyYaml(await readFile(args.companyPath, "utf8"));
   const unsupportedAgent = company.employees.find(({ agent }) =>
-    agent !== "fake" && agent !== "codex"
+    agent !== "fake"
+    && agent !== "codex"
+    && agent !== "claude"
+    && agent !== "opencode"
   );
   if (unsupportedAgent !== undefined) {
     throw new Error(`unsupported agent adapter: ${unsupportedAgent.agent}`);
@@ -639,7 +697,7 @@ export async function runCore(
         }
       });
     }
-    const { adapterFor, hasCodexEmployees } = buildAdapterMap(
+    const { adapterFor, hasRealAgents } = buildAdapterMap(
       company,
       process.env
     );
@@ -651,8 +709,8 @@ export async function runCore(
     );
     const tasks = new TaskService(store, DEFAULT_COMPANY_ID, company, leaderId);
     const scenarios = Object.fromEntries(company.employees.map((employee) => {
-      if (employee.agent === "codex") {
-        return [employee.id, CODEX_LEADER_PROMPT];
+      if (employee.agent !== "fake") {
+        return [employee.id, REAL_AGENT_LEADER_PROMPT];
       }
       return [
         employee.id,
@@ -667,7 +725,7 @@ export async function runCore(
       ...scenarios,
       ...parseE2EStartupScenarios(company, process.env)
     };
-    const gitEnabled = hasCodexEmployees
+    const gitEnabled = hasRealAgents
       || gitEnabledFor(company, startupScenarios);
     const policy = new ActionPolicy(company, leaderId, new Set([reviewerId]));
     const orchestrator = new CompanyOrchestrator(

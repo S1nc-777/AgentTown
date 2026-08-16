@@ -9,10 +9,13 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseCompanyYaml } from "@agenttown/runtime-contract";
+import { ClaudeAgentAdapter } from "../src/agents/claude-adapter.js";
 import { CodexAgentAdapter } from "../src/agents/codex-adapter.js";
 import { FakeAgentAdapter } from "../src/agents/fake-adapter.js";
+import type { OpenCodeAgentAdapterOptions } from "../src/agents/opencode-adapter.js";
+import { OpenCodeAgentAdapter } from "../src/agents/opencode-adapter.js";
 import {
   assertCorePathWithinProject,
   buildAdapterMap,
@@ -22,6 +25,23 @@ import {
   runCore,
   validateCoreStateLayout
 } from "../src/main.js";
+
+const openCodeConstructorOptions = vi.hoisted(
+  () => [] as Array<OpenCodeAgentAdapterOptions>
+);
+
+vi.mock("../src/agents/opencode-adapter.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/agents/opencode-adapter.js")>();
+  const RecordingOpenCodeAdapter = class extends actual.OpenCodeAgentAdapter {
+    constructor(
+      options: ConstructorParameters<typeof actual.OpenCodeAgentAdapter>[0] = {}
+    ) {
+      openCodeConstructorOptions.push({ ...options });
+      super(options);
+    }
+  };
+  return { ...actual, OpenCodeAgentAdapter: RecordingOpenCodeAdapter };
+});
 
 const fakeCompany = `schema_version: 1
 company:
@@ -89,6 +109,52 @@ employees:
   - id: leader
     role: product_lead
     agent: claude
+    reports_to: owner
+    workspace: read_only
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: read_only
+limits:
+  max_task_retry: 1
+  max_review_loops: 1
+  max_parallel_tasks: 1
+`;
+
+const opencodeLeadCompany = `schema_version: 1
+company:
+  name: opencode-lead
+  mission: test
+  success_criteria: [safe]
+  operating_rules: [safe]
+employees:
+  - id: leader
+    role: product_lead
+    agent: opencode
+    reports_to: owner
+    workspace: read_only
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: read_only
+limits:
+  max_task_retry: 1
+  max_review_loops: 1
+  max_parallel_tasks: 1
+`;
+
+const geminiLeadCompany = `schema_version: 1
+company:
+  name: gemini-lead
+  mission: test
+  success_criteria: [safe]
+  operating_rules: [safe]
+employees:
+  - id: leader
+    role: product_lead
+    agent: gemini
     reports_to: owner
     workspace: read_only
   - id: reviewer
@@ -352,6 +418,12 @@ describe("Core entrypoint arguments", () => {
 
 describe("agent adapter gate", () => {
   const codexCompany = parseCompanyYaml(codexLeadCompany);
+  const claudeCompany = parseCompanyYaml(claudeLeadCompany);
+  const opencodeCompany = parseCompanyYaml(opencodeLeadCompany);
+
+  beforeEach(() => {
+    openCodeConstructorOptions.length = 0;
+  });
 
   it("accepts a company with a codex employee outside E2E mode", async () => {
     const project = await prepareCompanyProject(codexLeadCompany);
@@ -366,6 +438,32 @@ describe("agent adapter gate", () => {
     }
   });
 
+  it("accepts a company with a claude employee outside E2E mode", async () => {
+    const project = await prepareCompanyProject(claudeLeadCompany);
+    try {
+      await expect(runCore(companyRunArgs(project), {
+        async beforeStoreOpen() {
+          throw new Error("claude company passed the adapter gate");
+        }
+      })).rejects.toThrow("claude company passed the adapter gate");
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a company with an opencode employee outside E2E mode", async () => {
+    const project = await prepareCompanyProject(opencodeLeadCompany);
+    try {
+      await expect(runCore(companyRunArgs(project), {
+        async beforeStoreOpen() {
+          throw new Error("opencode company passed the adapter gate");
+        }
+      })).rejects.toThrow("opencode company passed the adapter gate");
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
   it("maps codex employees to the CodexAgentAdapter and fake to the FakeAgentAdapter", () => {
     const { adapterFor } = buildAdapterMap(codexCompany, {
       AGENTTOWN_FORBID_REAL_PROBES: "1",
@@ -373,6 +471,44 @@ describe("agent adapter gate", () => {
     });
     expect(adapterFor("codex")).toBeInstanceOf(CodexAgentAdapter);
     expect(adapterFor("fake")).toBeInstanceOf(FakeAgentAdapter);
+  });
+
+  it("maps claude employees to the ClaudeAgentAdapter and reports hasRealAgents", () => {
+    const { adapterFor, hasRealAgents } = buildAdapterMap(claudeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_CLAUDE: "0"
+    });
+    expect(adapterFor("claude")).toBeInstanceOf(ClaudeAgentAdapter);
+    expect(adapterFor("fake")).toBeInstanceOf(FakeAgentAdapter);
+    expect(hasRealAgents).toBe(true);
+  });
+
+  it("maps opencode employees to the OpenCodeAgentAdapter and reports hasRealAgents", () => {
+    const { adapterFor, hasRealAgents } = buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_OPENCODE: "0"
+    });
+    expect(adapterFor("opencode")).toBeInstanceOf(OpenCodeAgentAdapter);
+    expect(adapterFor("fake")).toBeInstanceOf(FakeAgentAdapter);
+    expect(hasRealAgents).toBe(true);
+  });
+
+  it("reports hasRealAgents false for a fake-only company", () => {
+    const { hasRealAgents } = buildAdapterMap(
+      parseCompanyYaml(fakeCompany),
+      { AGENTTOWN_FORBID_REAL_PROBES: "1" }
+    );
+    expect(hasRealAgents).toBe(false);
+  });
+
+  it("refuses to resolve a real-agent adapter that is not configured", () => {
+    const { adapterFor } = buildAdapterMap(
+      parseCompanyYaml(fakeCompany),
+      { AGENTTOWN_FORBID_REAL_PROBES: "1" }
+    );
+    expect(() => adapterFor("claude")).toThrow("agent adapter is not configured");
+    expect(() => adapterFor("opencode")).toThrow("agent adapter is not configured");
+    expect(() => adapterFor("codex")).toThrow("agent adapter is not configured");
   });
 
   it("enables real Codex probes only on explicit opt-in", async () => {
@@ -391,26 +527,99 @@ describe("agent adapter gate", () => {
       .resolves.toEqual({ available: true, version: "unknown" });
   });
 
+  it("keeps Claude probes forbidden when forbid wins over the opt-in flag", async () => {
+    const guarded = buildAdapterMap(claudeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_CLAUDE: "1"
+    });
+    await expect(guarded.adapterFor("claude").detect())
+      .resolves.toEqual({ available: false, version: "unknown" });
+  });
+
+  it("enables real Claude probes only on explicit opt-in", async () => {
+    const guarded = buildAdapterMap(claudeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_CLAUDE: "0"
+    });
+    await expect(guarded.adapterFor("claude").detect())
+      .resolves.toEqual({ available: false, version: "unknown" });
+
+    const optedIn = buildAdapterMap(claudeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "0",
+      AGENTTOWN_REAL_CLAUDE: "1"
+    });
+    await expect(optedIn.adapterFor("claude").detect())
+      .resolves.toEqual({ available: true, version: "unknown" });
+  });
+
+  it("keeps OpenCode probes forbidden when forbid wins over the opt-in flag", async () => {
+    const guarded = buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_OPENCODE: "1"
+    });
+    await expect(guarded.adapterFor("opencode").detect())
+      .resolves.toEqual({ available: false, version: "unknown" });
+  });
+
+  it("enables real OpenCode probes only on explicit opt-in", async () => {
+    const guarded = buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_OPENCODE: "0"
+    });
+    await expect(guarded.adapterFor("opencode").detect())
+      .resolves.toEqual({ available: false, version: "unknown" });
+
+    const optedIn = buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "0",
+      AGENTTOWN_REAL_OPENCODE: "1"
+    });
+    await expect(optedIn.adapterFor("opencode").detect())
+      .resolves.toEqual({ available: true, version: "unknown" });
+  });
+
+  it("passes AGENTTOWN_OPENCODE_MODEL into the OpenCode adapter when set", () => {
+    buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "0",
+      AGENTTOWN_REAL_OPENCODE: "1",
+      AGENTTOWN_OPENCODE_MODEL: "alibaba-cn/deepseek-v4-flash"
+    });
+    const options = openCodeConstructorOptions.at(-1);
+    expect(options?.forbidRealProbes).toBe(false);
+    expect(options?.model).toBe("alibaba-cn/deepseek-v4-flash");
+  });
+
+  it("omits the model option when AGENTTOWN_OPENCODE_MODEL is unset", () => {
+    buildAdapterMap(opencodeCompany, {
+      AGENTTOWN_FORBID_REAL_PROBES: "1",
+      AGENTTOWN_REAL_OPENCODE: "1"
+    });
+    const options = openCodeConstructorOptions.at(-1);
+    expect(options?.model).toBeUndefined();
+    expect(options?.forbidRealProbes).toBeUndefined();
+  });
+
   it("still rejects employees of unsupported agents before store open", async () => {
-    const project = await prepareCompanyProject(claudeLeadCompany);
+    const project = await prepareCompanyProject(geminiLeadCompany);
     try {
       await expect(runCore(companyRunArgs(project), {
         async beforeStoreOpen() {
           throw new Error("unsupported agent must not reach store open");
         }
-      })).rejects.toThrow("unsupported agent adapter: claude");
+      })).rejects.toThrow("unsupported agent adapter: gemini");
     } finally {
       await rm(project, { recursive: true, force: true });
     }
   });
 
-  it("refuses codex employees through the fake-only E2E seam", () => {
-    expect(() => parseE2EStartupScenarios(codexCompany, {
-      AGENTTOWN_E2E_MODE: "1",
-      AGENTTOWN_FORBID_REAL_PROBES: "1",
-      AGENTTOWN_E2E_STARTUP_SCENARIOS: JSON.stringify({
-        leader: "silent"
-      })
-    })).toThrow("all-fake company");
+  it("refuses real-agent employees through the fake-only E2E seam", () => {
+    for (const company of [codexCompany, claudeCompany, opencodeCompany]) {
+      expect(() => parseE2EStartupScenarios(company, {
+        AGENTTOWN_E2E_MODE: "1",
+        AGENTTOWN_FORBID_REAL_PROBES: "1",
+        AGENTTOWN_E2E_STARTUP_SCENARIOS: JSON.stringify({
+          leader: "silent"
+        })
+      })).toThrow("all-fake company");
+    }
   });
 });

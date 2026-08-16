@@ -130,6 +130,106 @@ validation:
     - git-clean
 `;
 
+const claudeLeadSoftware = `schema_version: 1
+company:
+  name: claude-lead-software
+  mission: Deliver a runnable and tested small software project
+  success_criteria:
+    - All confirmed acceptance criteria pass
+    - Project verification passes
+    - Independent review passes
+  operating_rules:
+    - Each task has one owner
+    - Every conclusion includes evidence
+    - Requirement ambiguity is escalated to the user
+employees:
+  - id: leader
+    role: product_lead
+    agent: claude
+    reports_to: owner
+    workspace: read_only
+  - id: developer-a
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: developer-b
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: review_package
+limits:
+  max_task_retry: 1
+  max_review_loops: 2
+  max_parallel_tasks: 2
+validation:
+  commands:
+    - id: git-clean
+      executable: git
+      args:
+        - status
+        - --porcelain
+      cwd: "."
+      timeout_seconds: 30
+  integration_command_ids:
+    - git-clean
+`;
+
+const opencodeLeadSoftware = `schema_version: 1
+company:
+  name: opencode-lead-software
+  mission: Deliver a runnable and tested small software project
+  success_criteria:
+    - All confirmed acceptance criteria pass
+    - Project verification passes
+    - Independent review passes
+  operating_rules:
+    - Each task has one owner
+    - Every conclusion includes evidence
+    - Requirement ambiguity is escalated to the user
+employees:
+  - id: leader
+    role: product_lead
+    agent: opencode
+    reports_to: owner
+    workspace: read_only
+  - id: developer-a
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: developer-b
+    role: developer
+    agent: fake
+    reports_to: leader
+    workspace: git_worktree
+  - id: reviewer
+    role: reviewer
+    agent: fake
+    reports_to: leader
+    workspace: review_package
+limits:
+  max_task_retry: 1
+  max_review_loops: 2
+  max_parallel_tasks: 2
+validation:
+  commands:
+    - id: git-clean
+      executable: git
+      args:
+        - status
+        - --porcelain
+      cwd: "."
+      timeout_seconds: 30
+  integration_command_ids:
+    - git-clean
+`;
+
 /**
  * Canonical template roster. `TemplateName` is derived from this array so a
  * template added here is automatically accepted by the CLI `--template` gate
@@ -138,7 +238,9 @@ validation:
 export const TEMPLATE_NAMES = [
   "minimal",
   "parallel-software",
-  "codex-lead-software"
+  "codex-lead-software",
+  "claude-lead-software",
+  "opencode-lead-software"
 ] as const;
 
 export type TemplateName = (typeof TEMPLATE_NAMES)[number];
@@ -155,5 +257,9 @@ export function templateYaml(name: TemplateName): string {
       return parallelSoftware;
     case "codex-lead-software":
       return codexLeadSoftware;
+    case "claude-lead-software":
+      return claudeLeadSoftware;
+    case "opencode-lead-software":
+      return opencodeLeadSoftware;
   }
 }
