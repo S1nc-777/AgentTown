@@ -279,15 +279,15 @@ describe("ClaudeAgentAdapter", () => {
         nativeSessionId: "session-1"
       });
       const startChild = children[0]!;
-      expect(startChild.args.slice(0, 5)).toEqual([
+      expect(startChild.args.slice(0, 4)).toEqual([
         "-p",
         expect.stringContaining("Developer"),
         "--output-format",
-        "json",
-        "--cd"
+        "json"
       ]);
-      expect(startChild.args[5]).toBe(project.root);
+      expect(startChild.args).not.toContain("--cd");
       expect(startChild.args).not.toContain("--resume");
+      expect(startChild.cwd).toBe(project.root);
       expect(startChild.stdinEndCalls).toBe(1);
     } finally {
       if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
@@ -386,15 +386,14 @@ describe("ClaudeAgentAdapter", () => {
         }
       ]);
       const resumeChild = children[1]!;
-      expect(resumeChild.args.slice(0, 5)).toEqual([
+      expect(resumeChild.args.slice(0, 4)).toEqual([
         "-p",
         expect.stringContaining("implement feature X"),
         "--output-format",
-        "json",
-        "--cd"
+        "json"
       ]);
-      expect(resumeChild.args[5]).toBe(project.root);
-      expect(resumeChild.args.slice(6)).toEqual(["--resume", "session-1"]);
+      expect(resumeChild.args.slice(4)).toEqual(["--resume", "session-1"]);
+      expect(resumeChild.cwd).toBe(project.root);
       expect(resumeChild.stdinEndCalls).toBe(1);
     } finally {
       if (handle !== undefined) await adapter.stop(handle).catch(() => undefined);
@@ -812,15 +811,14 @@ describe("ClaudeAgentAdapter", () => {
       expect(resumed.nativeSessionId).toBe("session-1");
       expect(resumed.internalSessionId).not.toBe(first.internalSessionId);
       const resumeChild = children[1]!;
-      expect(resumeChild.args.slice(0, 5)).toEqual([
+      expect(resumeChild.args.slice(0, 4)).toEqual([
         "-p",
         expect.stringContaining("continue from checkpoint"),
         "--output-format",
-        "json",
-        "--cd"
+        "json"
       ]);
-      expect(resumeChild.args[5]).toBe(project.root);
-      expect(resumeChild.args.slice(6)).toEqual(["--resume", "session-1"]);
+      expect(resumeChild.args.slice(4)).toEqual(["--resume", "session-1"]);
+      expect(resumeChild.cwd).toBe(project.root);
     } finally {
       await Promise.all(handles.map(async (handle) => {
         await adapter.stop(handle).catch(() => undefined);

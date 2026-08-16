@@ -308,8 +308,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       `${message.text}\n${CLAUDE_FORMAT_INSTRUCTION}`,
       "--output-format",
       "json",
-      "--cd",
-      live.projectRoot,
       "--resume",
       session.nativeSessionId,
       ...this.#permissionArgs()
@@ -468,8 +466,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           initialPrompt(input),
           "--output-format",
           "json",
-          "--cd",
-          projectRoot,
           ...this.#permissionArgs()
         ]
       : [
@@ -477,8 +473,6 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           handoffPrompt(resume.handoff),
           "--output-format",
           "json",
-          "--cd",
-          projectRoot,
           "--resume",
           resume.resumeId,
           ...this.#permissionArgs()
@@ -550,7 +544,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         this.#scriptEntry === null ? this.#executable : process.execPath,
         this.#scriptEntry === null ? args : [this.#scriptEntry, ...args],
         {
-          cwd: this.#packageRoot,
+          cwd: live.projectRoot,
           stdio: ["pipe", "pipe", "pipe"]
         }
       );
