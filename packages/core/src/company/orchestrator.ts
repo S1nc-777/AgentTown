@@ -33,6 +33,18 @@ export interface TaskWorkflowHandlers {
   review(action: ActionProposal): Promise<void>;
 }
 
+export interface LeaderDriveOptions {
+  /**
+   * Enables the autonomous leader drive loop started by `start()`. When
+   * omitted the loop is enabled automatically when the company contains any
+   * real-agent employee (codex, claude, opencode); fake-only companies keep
+   * the legacy externally-injected dispatch behavior.
+   */
+  driveLeader?: boolean;
+  /** Maximum drive turns before the loop records and stops. Defaults to 10. */
+  leaderTurnCap?: number;
+}
+
 export class FakeTaskWorkflow implements TaskWorkflow {
   constructor(private readonly handlers: TaskWorkflowHandlers) {}
 
@@ -134,6 +146,9 @@ export class CompanyOrchestrator {
   #reviewRecoveryTail: Promise<void> = Promise.resolve();
   readonly #fakeTaskWorkflow: FakeTaskWorkflow;
   #gitTaskWorkflow: TaskWorkflow | undefined;
+  readonly #driveLeaderEnabled: boolean;
+  readonly #leaderTurnCap: number;
+  #leaderDrive: Promise<void> | undefined;
 
   constructor(
     private readonly companyId: string,
@@ -144,9 +159,13 @@ export class CompanyOrchestrator {
     private readonly sessions: SessionManager,
     private readonly leaderId: string,
     private readonly reviewerId: string,
-    gitTaskWorkflow?: TaskWorkflow
+    gitTaskWorkflow?: TaskWorkflow,
+    options: LeaderDriveOptions = {}
   ) {
     this.#gitTaskWorkflow = gitTaskWorkflow;
+    this.#driveLeaderEnabled = options.driveLeader
+      ?? this.company.employees.some(({ agent }) => agent !== "fake");
+    this.#leaderTurnCap = options.leaderTurnCap ?? 10;
     this.#fakeTaskWorkflow = new FakeTaskWorkflow({
       assign: async (action) => {
         await this.#assignAndSend(action);
@@ -204,6 +223,9 @@ export class CompanyOrchestrator {
         this.#dispatchController = new AbortController();
       }
       this.#acceptingActions = true;
+      if (this.#driveLeaderEnabled) {
+        this.#startLeaderDrive();
+      }
     } catch (error) {
       await this.sessions.stopAll().catch(() => undefined);
       throw error;
@@ -355,6 +377,196 @@ export class CompanyOrchestrator {
       }
       this.tasks.transition(taskId, "running", employee.id);
     }
+  }
+
+  /**
+   * Starts the autonomous leader drive loop fire-and-forget from `start()`.
+   * The loop is epoch/abort guarded like every other dispatch loop, so
+   * `stopDispatching()` (pause/stop) aborts it at the next checkpoint and the
+   * turn cap prevents an unresponsive leader from spinning forever.
+   */
+  #startLeaderDrive(): void {
+    const epoch = this.#dispatchEpoch;
+    const signal = this.#dispatchController.signal;
+    let tracked: Promise<void>;
+    tracked = this.#driveLeader(epoch, signal)
+      .catch((error: unknown) => {
+        if (epoch !== this.#dispatchEpoch) return;
+        this.#recordEvent("task.execution_error", this.leaderId, null, {
+          reason: this.#errorMessage(error)
+        });
+      })
+      .finally(() => {
+        if (this.#leaderDrive === tracked) this.#leaderDrive = undefined;
+      });
+    this.#leaderDrive = tracked;
+  }
+
+  /**
+   * Drives the leader through the mission: turn 0 asks for the first
+   * `task.propose`, the next turn asks to assign the created task, and later
+   * turns are state driven (nudge an unassigned task, summarize when every
+   * task is terminal, otherwise request the next task or completion). Every
+   * leader action flows through the normal `dispatch()` routes so the
+   * externally injected path (E2E boss) stays untouched. The loop stops on a
+   * leader session failure, an epoch change (pause/stop), an unexpected
+   * non-propose action that policy rejects, `company.complete.request`, or the
+   * turn cap.
+   */
+  async #driveLeader(epoch: number, signal: AbortSignal): Promise<void> {
+    const leader = this.#employee(this.leaderId);
+    let createdTaskId: string | null = null;
+    let turn = 0;
+    let rejectedProposals = 0;
+    while (turn < this.#leaderTurnCap) {
+      if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+      const message = this.#leaderDriveMessage(createdTaskId);
+      let sawAction = false;
+      let stop = false;
+      let resend = false;
+      try {
+        for await (const event of this.sessions.send(leader, message, signal)) {
+          if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+          if (event.type === "action.proposed") {
+            sawAction = true;
+            const outcome = await this.#applyLeaderAction(
+              event.action,
+              createdTaskId
+            );
+            if (outcome.kind === "stop") {
+              stop = true;
+              break;
+            }
+            if (outcome.kind === "resend") {
+              resend = true;
+              break;
+            }
+            if (outcome.taskId !== null) createdTaskId = outcome.taskId;
+          } else if (
+            event.type === "adapter.error"
+            || event.type === "session.exited"
+          ) {
+            this.#recordEvent("task.execution_error", leader.id, createdTaskId, {
+              reason: `leader session ${event.type} while being driven`
+            });
+            return;
+          }
+        }
+      } catch (error) {
+        if (epoch !== this.#dispatchEpoch) return;
+        this.#recordEvent("task.execution_error", leader.id, createdTaskId, {
+          reason: this.#errorMessage(error)
+        });
+        return;
+      }
+      if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+      if (stop) return;
+      if (resend) {
+        rejectedProposals += 1;
+        if (rejectedProposals >= 3) {
+          this.#recordEvent("task.execution_error", leader.id, createdTaskId, {
+            reason: "leader repeated a rejected task.propose"
+          });
+          return;
+        }
+        continue;
+      }
+      rejectedProposals = 0;
+      if (!sawAction) return;
+      turn += 1;
+    }
+    this.#recordEvent("task.execution_error", leader.id, createdTaskId, {
+      reason: `leader drive loop reached the ${this.#leaderTurnCap} turn cap`
+    });
+  }
+
+  /**
+   * Dispatches one leader-proposed action and reports the loop outcome.
+   * `task.propose` is expected on the first turn (its task id becomes the
+   * tracked created task), `task.assign` routes to the normal assignment path
+   * (which drives the assignee), `company.complete.request` ends the loop, and
+   * every other supported action falls back to the existing dispatch routes.
+   * A policy-rejected `task.propose` returns "resend" so the loop retries the
+   * same prompt a bounded number of times; any other rejected action stops the
+   * loop after recording.
+   */
+  async #applyLeaderAction(
+    action: ActionProposal,
+    createdTaskId: string | null
+  ): Promise<
+    | { kind: "dispatched"; taskId: string | null }
+    | { kind: "stop"; taskId: null }
+    | { kind: "resend"; taskId: null }
+  > {
+    try {
+      await this.dispatch(action);
+    } catch (error) {
+      this.#recordEvent("action.rejected", "core", action.taskId, {
+        actionId: action.actionId,
+        reason: this.#errorMessage(error)
+      });
+      return action.type === "task.propose"
+        ? { kind: "resend", taskId: null }
+        : { kind: "stop", taskId: null };
+    }
+    if (action.type === "company.complete.request") {
+      return { kind: "stop", taskId: null };
+    }
+    if (action.type === "task.propose") {
+      return { kind: "dispatched", taskId: action.taskId };
+    }
+    return { kind: "dispatched", taskId: createdTaskId };
+  }
+
+  /**
+   * Builds the next leader drive message from the current task state: an
+   * unassigned (draft) task takes priority for assignment, a fully terminal
+   * task set asks for completion or the next task, otherwise the mission
+   * prompt asks for the first task or the next one while work is in progress.
+   */
+  #leaderDriveMessage(createdTaskId: string | null): AgentMessage {
+    const leader = this.#employee(this.leaderId);
+    const tasks = this.tasks.list();
+    const unassigned = tasks.find(({ status }) => status === "draft");
+    const allTerminal = tasks.length > 0
+      && tasks.every(({ status }) =>
+        status === "completed" || status === "blocked"
+      );
+    let taskId: string | null;
+    let text: string;
+    if (unassigned !== undefined) {
+      taskId = unassigned.id;
+      text = [
+        `Task ${unassigned.id} has been created.`,
+        `Assign it to a developer by emitting a task.assign action with assignee "developer-a" or "developer-b".`
+      ].join("\n");
+    } else if (allTerminal) {
+      taskId = createdTaskId;
+      text = [
+        "All tasks are completed or blocked.",
+        "Emit a company.complete.request to finish the mission, or propose the next task."
+      ].join("\n");
+    } else if (createdTaskId === null) {
+      taskId = null;
+      text = [
+        `Mission: ${this.company.company.mission}`,
+        "Propose the first task by emitting a task.propose action with a title, objective and acceptance criteria."
+      ].join("\n");
+    } else {
+      taskId = createdTaskId;
+      text = [
+        `Task ${createdTaskId} is in progress.`,
+        "Propose the next task, or emit a company.complete.request when the mission is complete."
+      ].join("\n");
+    }
+    return {
+      messageId: randomUUID(),
+      employeeId: leader.id,
+      taskId,
+      text,
+      actionRequest: null,
+      taskContext: null
+    };
   }
 
   async requestReview(

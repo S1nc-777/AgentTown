@@ -123,7 +123,7 @@ function startCompany(
 function sendMessage(
   company: RunningCompany,
   messageId: string,
-  taskId = "task-1"
+  taskId: string | null = "task-1"
 ): void {
   company.child.stdin.write(`${JSON.stringify({
     type: "message",
@@ -177,6 +177,61 @@ describe("company Fake Agent process", () => {
       "output.completed",
       "usage.updated"
     ]);
+    expect(await company.stop()).toBe(0);
+  });
+
+  it("proposes a task on the first leader drive message and assigns on the second", async () => {
+    const company = startCompany("git-lead-propose-assign", { employeeId: "leader" });
+    await company.waitForLineCount(1);
+
+    sendMessage(company, "m1", null);
+    await company.waitForLineCount(4);
+    const first = parsedJsonLines(company.lines);
+    expect(first.map((event) => event.type)).toEqual([
+      "session.started",
+      "output.completed",
+      "action.proposed",
+      "usage.updated"
+    ]);
+    expect(first[2]).toMatchObject({
+      type: "action.proposed",
+      action: {
+        type: "task.propose",
+        actorEmployeeId: "leader",
+        taskId: "task-a",
+        payload: {
+          title: "Task A",
+          objective: "Complete task-a",
+          dependencies: [],
+          acceptanceCriteria: ["task-a evidence passes"]
+        }
+      }
+    });
+
+    sendMessage(company, "m2", "task-a");
+    await company.waitForLineCount(7);
+    const second = parsedJsonLines(company.lines);
+    expect(second[5]).toMatchObject({
+      type: "action.proposed",
+      action: {
+        type: "task.assign",
+        actorEmployeeId: "leader",
+        taskId: "task-a",
+        payload: { assignee: "developer-a" }
+      }
+    });
+
+    sendMessage(company, "m3", "task-a");
+    await company.waitForLineCount(10);
+    const third = parsedJsonLines(company.lines);
+    expect(third[8]).toMatchObject({
+      type: "action.proposed",
+      action: {
+        type: "company.complete.request",
+        actorEmployeeId: "leader",
+        taskId: "task-a"
+      }
+    });
     expect(await company.stop()).toBe(0);
   });
 

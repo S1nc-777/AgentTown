@@ -180,6 +180,14 @@ class ScriptedAdapter implements AgentAdapter {
     return taskId;
   }
 
+  nextMessage(employeeId: string): AgentMessage {
+    const pending = this.#pending.get(employeeId)?.[0];
+    if (pending === undefined) {
+      throw new Error(`no pending message for ${employeeId}`);
+    }
+    return pending.message;
+  }
+
   async #take(employeeId: string): Promise<PendingSend> {
     await this.waitForPending(employeeId);
     const pending = this.#pending.get(employeeId)?.shift();
@@ -379,7 +387,10 @@ afterEach(async () => {
   }
 });
 
-function createHarness(store: CoreStore = new CoreStore(":memory:")): Harness {
+function createHarness(
+  store: CoreStore = new CoreStore(":memory:"),
+  options?: ConstructorParameters<typeof CompanyOrchestrator>[9]
+): Harness {
   const company = companyFixture();
   store.initialize();
   store.createCompany({
@@ -411,7 +422,9 @@ function createHarness(store: CoreStore = new CoreStore(":memory:")): Harness {
     policy,
     sessions,
     "leader",
-    "reviewer"
+    "reviewer",
+    undefined,
+    options
   );
   const harness = { company, store, adapter, sessions, tasks, orchestrator };
   harnesses.push(harness);
@@ -481,6 +494,63 @@ describe("CompanyOrchestrator", () => {
       artifacts: ["artifact:task-review"],
       evidence: ["evidence:task-review"]
     });
+  });
+
+  it("drives the leader to propose and assign the first task on company start", async () => {
+    const { adapter, orchestrator, store, tasks } = createHarness(
+      undefined,
+      { driveLeader: true }
+    );
+    await orchestrator.start({});
+
+    await adapter.waitForPending("leader");
+    expect(adapter.nextMessage("leader").taskId).toBeNull();
+    expect(adapter.nextMessage("leader").text).toContain("Mission:");
+    await adapter.complete("leader", action({
+      type: "task.propose",
+      actorEmployeeId: "leader",
+      taskId: "task-a",
+      payload: {
+        title: "Task A",
+        objective: "Complete task-a",
+        dependencies: [],
+        acceptanceCriteria: ["task-a evidence passes"]
+      }
+    }));
+
+    await adapter.waitForPending("leader");
+    expect(adapter.nextMessage("leader").taskId).toBe("task-a");
+    await adapter.complete("leader", leaderAssigns("task-a", "developer-a"));
+
+    await adapter.waitForPending("developer-a");
+    await adapter.complete("developer-a", submitAction("task-a", "developer-a"));
+    await adapter.waitForPending("reviewer");
+    await adapter.complete("reviewer", approveAction("task-a"));
+
+    await adapter.waitForPending("leader");
+    await adapter.complete("leader", action({
+      type: "company.complete.request",
+      actorEmployeeId: "leader",
+      taskId: "task-a",
+      reason: "deterministic fake leader completion request"
+    }));
+
+    await waitUntil(
+      () => tasks.get("task-a").status === "completed",
+      "leader-driven task did not complete"
+    );
+    const types = store.listEvents(0).map(({ type }) => type);
+    expect(types).toEqual(expect.arrayContaining([
+      "session.started",
+      "company.started",
+      "task.created",
+      "task.assigned",
+      "task.started",
+      "task.submitted",
+      "task.review_requested",
+      "task.completed",
+      "company.completion_requested"
+    ]));
   });
 
   it("runs two developers concurrently and serializes the reviewer", async () => {

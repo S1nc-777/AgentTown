@@ -48,16 +48,17 @@ const emitUsage = (): void => {
 };
 const emitAction = (
   line: InputLine,
-  type: "task.submit" | "task.approve" | "task.reject",
+  type: "task.submit" | "task.approve" | "task.reject" | "task.propose" | "task.assign" | "company.complete.request",
   payload: Record<string, unknown>,
-  reason: string
+  reason: string,
+  taskIdOverride?: string
 ): void => {
   const action: ActionProposal = {
     schemaVersion: 1,
     actionId: randomUUID(),
     type,
     actorEmployeeId: employeeId,
-    taskId: line.taskId ?? null,
+    taskId: taskIdOverride ?? line.taskId ?? null,
     payload,
     reason,
     causationEventId: null
@@ -86,6 +87,7 @@ if (scenario === "crash") {
 
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let malformedEmitted = false;
+  let leaderMessageCount = 0;
 
   const gitScenario = GIT_FIXTURE_SCENARIOS.includes(scenario as GitFixtureScenario)
     ? scenario as GitFixtureScenario
@@ -140,6 +142,43 @@ if (scenario === "crash") {
           code: "git_fixture_failed",
           message: error instanceof Error ? error.message : String(error)
         });
+      }
+      emitUsage();
+      return;
+    }
+
+    if (scenario === "git-lead-propose-assign") {
+      leaderMessageCount += 1;
+      emit({ type: "output.completed", text: `leader:${taskLabel(line)}:${leaderMessageCount}` });
+      if (leaderMessageCount === 1) {
+        emitAction(
+          line,
+          "task.propose",
+          {
+            title: "Task A",
+            objective: "Complete task-a",
+            dependencies: [],
+            acceptanceCriteria: ["task-a evidence passes"]
+          },
+          "deterministic fake leader proposal",
+          "task-a"
+        );
+      } else if (leaderMessageCount === 2) {
+        emitAction(
+          line,
+          "task.assign",
+          { assignee: "developer-a" },
+          "deterministic fake leader assignment",
+          "task-a"
+        );
+      } else {
+        emitAction(
+          line,
+          "company.complete.request",
+          {},
+          "deterministic fake leader completion request",
+          "task-a"
+        );
       }
       emitUsage();
       return;
