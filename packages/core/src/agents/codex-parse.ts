@@ -103,7 +103,15 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function extractJsonPayload(text: string): string | null {
   const fence = /```json\s*([\s\S]*?)```/u.exec(text);
-  if (fence !== null && fence[1] !== undefined) return fence[1].trim();
+  if (fence !== null && fence[1] !== undefined) {
+    // FORMAT_INSTRUCTION embeds the payload as `ACTION: { ... }` on the
+    // fence's first line; strip that prefix (case-insensitively, after any
+    // leading whitespace) so the remainder is pure JSON. Pure-JSON fences
+    // are returned unchanged.
+    return fence[1].trim().replace(/^action:\s*/iu, "");
+  }
+  // The capture group already excludes the `ACTION:` prefix; no stripping
+  // needed on this path.
   const actionLine = /^ACTION:\s*(\{.*)$/mu.exec(text);
   if (actionLine !== null && actionLine[1] !== undefined) {
     return actionLine[1].trim();

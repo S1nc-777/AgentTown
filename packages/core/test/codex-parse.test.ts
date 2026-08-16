@@ -156,6 +156,41 @@ describe("extractStructuredAction", () => {
     expect(extractStructuredAction(text)).toEqual(proposal);
   });
 
+  it("extracts from a fenced block whose first line is the FORMAT_INSTRUCTION ACTION: prefix", () => {
+    const proposal = validProposal();
+    const text = [
+      "Understood. Here is my next action.",
+      "```json",
+      `ACTION: ${JSON.stringify(proposal)}`,
+      "```"
+    ].join("\n");
+    expect(extractStructuredAction(text)).toEqual(proposal);
+  });
+
+  it("extracts from a fenced block with a lowercase action: prefix", () => {
+    const proposal = validProposal();
+    const text = ["```json", `action: ${JSON.stringify(proposal)}`, "```"].join(
+      "\n"
+    );
+    expect(extractStructuredAction(text)).toEqual(proposal);
+  });
+
+  it("extracts from a fenced block with leading whitespace before the ACTION: prefix", () => {
+    const proposal = validProposal();
+    const text = `\`\`\`json\n   ACTION: ${JSON.stringify(proposal)}\n\`\`\``;
+    expect(extractStructuredAction(text)).toEqual(proposal);
+  });
+
+  it("returns null when a fenced block has ACTION: followed by invalid JSON", () => {
+    const text = "```json\nACTION: { not json }\n```";
+    expect(extractStructuredAction(text)).toBeNull();
+  });
+
+  it("returns null when a fenced block has ACTION: followed by nothing", () => {
+    const text = "```json\nACTION:\n```";
+    expect(extractStructuredAction(text)).toBeNull();
+  });
+
   it("returns null when the fenced block contains malformed JSON", () => {
     const text = "```json\n{ not json }\n```";
     expect(extractStructuredAction(text)).toBeNull();
