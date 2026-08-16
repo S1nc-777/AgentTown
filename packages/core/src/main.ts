@@ -179,7 +179,12 @@ export function buildAdapterMap(
     ? new ClaudeAgentAdapter({
         executable: env.AGENTTOWN_CLAUDE_EXECUTABLE ?? "claude",
         ...(allowRealClaudeProbes(env)
-          ? { forbidRealProbes: false }
+          ? {
+              forbidRealProbes: false,
+              // "plan" is read-only (no Bash/write tools), matching the
+              // leader's read_only workspace; override via env if needed.
+              permissionMode: env.AGENTTOWN_CLAUDE_PERMISSION_MODE ?? "plan"
+            }
           : {})
       })
     : undefined;

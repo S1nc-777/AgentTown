@@ -39,7 +39,12 @@ const STOP_TIMEOUT_MS = 2_000;
  * same session when the first `send` spawns its own resume process. Real
  * model inference legitimately takes 10-60s, so this must be generous.
  */
-const INITIAL_EXEC_TIMEOUT_MS = 180_000;
+/**
+ * Real `claude -p` first turns can take minutes (model exploration and
+ * reasoning); the start wait covers natural process exit, so use a generous
+ * bound. Observed worst case on a local DeepSeek-backed endpoint: ~150s.
+ */
+const INITIAL_EXEC_TIMEOUT_MS = 300_000;
 const EMPLOYEE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/u;
 const DEFAULT_EXECUTABLE = "claude";
 
