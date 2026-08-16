@@ -56,7 +56,8 @@ const OPENCODE_FORMAT_INSTRUCTION = [
   "```json",
   'ACTION: {"schemaVersion": 1, "actionId": "<unique id>", "type": "<action type>", "actorEmployeeId": "<your employee id>", "taskId": "<task id or null>", "payload": { ... }, "reason": "<one sentence>", "causationEventId": "<event id or null>"}',
   "```",
-  "The ACTION block is mandatory in every reply."
+  "The ACTION block is mandatory in every reply.",
+  "Allowed action types (use exactly one of these): task.propose, task.assign, task.start, task.submit, task.request_review, task.approve, task.reject, task.block, employee.message, user.approval.request, company.complete.request"
 ].join("\n");
 
 const DEFAULT_SPAWN_PROCESS: NonNullable<
