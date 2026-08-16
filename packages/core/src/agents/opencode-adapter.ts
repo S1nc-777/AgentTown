@@ -58,8 +58,9 @@ const OPENCODE_FORMAT_INSTRUCTION = [
   "```",
   "The ACTION block is mandatory in every reply.",
   "Allowed action types (use exactly one of these): task.propose, task.assign, task.start, task.submit, task.request_review, task.approve, task.reject, task.block, employee.message, user.approval.request, company.complete.request",
-  "task.propose: taskId must be a non-empty unique string you generate (never null); payload must include title (string), objective (string), acceptanceCriteria (array of strings); dependencies (array of task ids) is optional.",
-  "task.assign: taskId must reference an existing proposed task; payload must include assignee (string, exactly one of the developer employee ids, e.g. developer-a)."
+  "task.propose: taskId must be a non-empty unique string you generate (never null); payload must include title (string), objective (string), acceptanceCriteria (array of strings); dependencies MUST be an array of task id strings (use [] when there are none, never a string or object).",
+  "task.assign: taskId must reference an existing proposed task; payload must include assignee (string, exactly one of the developer employee ids, e.g. developer-a).",
+  "Do NOT use employee.message to ask questions or seek confirmation — you are the leader; act directly with task.propose, task.assign or company.complete.request."
 ].join("\n");
 
 const DEFAULT_SPAWN_PROCESS: NonNullable<
