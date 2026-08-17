@@ -1,4 +1,4 @@
-﻿import { randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type {
   ActionProposal,
   AgentEvent,
@@ -895,16 +895,20 @@ export class CompanyOrchestrator {
   }
 
   #taskMessage(task: TaskRecord, employee: EmployeeDefinition): AgentMessage {
+    const taskContext = this.#gitTaskWorkflow?.taskContext?.(task) ?? null;
     return {
       messageId: randomUUID(),
       employeeId: employee.id,
       taskId: task.id,
       text: [
         task.objective,
-        `Acceptance criteria: ${task.acceptanceCriteria.join("; ")}`
+        `Acceptance criteria: ${task.acceptanceCriteria.join("; ")}`,
+        ...(taskContext === null
+          ? []
+          : [`Task context: ${JSON.stringify(taskContext)}`])
       ].join("\n"),
       actionRequest: null,
-      taskContext: this.#gitTaskWorkflow?.taskContext?.(task) ?? null
+      taskContext
     };
   }
 

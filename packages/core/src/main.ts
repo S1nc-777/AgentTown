@@ -78,6 +78,21 @@ const REAL_AGENT_LEADER_PROMPT = [
 ].join(" ");
 
 /**
+ * Startup scenario for real-agent developer employees. `scenario` is embedded
+ * verbatim in the adapter's initial prompt. The per-task message (which
+ * includes the git worktree task context JSON) tells the developer where to
+ * work; this prompt teaches the submission protocol.
+ */
+const REAL_AGENT_DEVELOPER_PROMPT = [
+  "You are a developer employee in the AgentTown company.",
+  "You implement tasks inside a dedicated git worktree; the task message includes its workspace root path.",
+  "Implement the task in that workspace root: write the required files, then git add and git commit your changes there.",
+  "When your work is committed, emit a task.submit action whose payload.submission is a git submission object:",
+  '{ "schemaVersion": 1, "headCommit": "<latest commit sha of your worktree branch, from `git rev-parse HEAD`>", "commits": ["<your commit shas, oldest first, from `git log --format=%H`>"], "changeSummary": "<short description>", "validationCommandIds": ["git-clean"], "suggestedValidationCommands": [], "reportedResults": [], "knownRisks": [] }',
+  "Only emit task.submit after your changes are committed in the worktree."
+].join("\n");
+
+/**
  * Per-employee startup scenarios owned by the Core. Real-agent employees
  * (codex, claude, opencode) get the leader prompt with the company mission
  * injected, because `scenario` is embedded verbatim in the adapter's initial
@@ -92,9 +107,14 @@ export function coreStartupScenarios(
   let gitDeveloperIndex = 0;
   return Object.fromEntries(company.employees.map((employee) => {
     if (employee.agent !== "fake") {
+      const rolePrompt = employee.role === "developer"
+        ? REAL_AGENT_DEVELOPER_PROMPT
+        : employee.role === "reviewer"
+          ? "You are the reviewer employee in the AgentTown company. Review the review package for the task and emit task.approve or task.reject with findings."
+          : REAL_AGENT_LEADER_PROMPT;
       return [
         employee.id,
-        `${REAL_AGENT_LEADER_PROMPT}\nMission: ${company.company.mission}`
+        `${rolePrompt}\nMission: ${company.company.mission}`
       ];
     }
     if (gitCollaboration) {
