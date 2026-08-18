@@ -1028,6 +1028,7 @@ describe("OpenCodeAgentAdapter", () => {
     ]);
     const adapter = new OpenCodeAgentAdapter({
       forbidRealProbes: true,
+      startTimeoutMs: 200,
       spawnProcess
     });
     try {

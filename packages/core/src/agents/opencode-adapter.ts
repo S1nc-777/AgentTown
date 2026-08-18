@@ -32,7 +32,12 @@ import { parseOpenCodeJsonl } from "./opencode-parse.js";
 const lstatAsync = promisify(lstat);
 const mkdirAsync = promisify(mkdir);
 const realpathAsync = promisify(realpath);
-const START_TIMEOUT_MS = 5_000;
+/**
+ * The real `opencode` CLI can take tens of seconds to become productive on
+ * first launch (models.dev metadata fetch, session/title warm-up), so the
+ * start first-event wait is generous; tests inject a small value.
+ */
+const START_TIMEOUT_MS = 60_000;
 const STOP_TIMEOUT_MS = 2_000;
 /**
  * The initial `opencode run` (fresh session) or `opencode run -s` (recovered
@@ -187,6 +192,12 @@ export interface OpenCodeAgentAdapterOptions {
    * launch a real OpenCode CLI.
    */
   forbidRealProbes?: boolean;
+  /**
+   * How long `start` waits for the first event before failing. Defaults to
+   * 60s; real launches may spend tens of seconds on models.dev metadata and
+   * warm-up before the first step_start. Tests inject a small value.
+   */
+  startTimeoutMs?: number;
   spawnProcess?: (
     executable: string,
     args: string[],
@@ -241,6 +252,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
   readonly #packageRoot: string;
   readonly #model: string | null;
   readonly #forbidRealProbes: boolean;
+  readonly #startTimeoutMs: number;
   readonly #spawnProcess: NonNullable<
     OpenCodeAgentAdapterOptions["spawnProcess"]
   >;
@@ -257,6 +269,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
       ? options.model
       : null;
     this.#forbidRealProbes = options.forbidRealProbes ?? true;
+    this.#startTimeoutMs = options.startTimeoutMs ?? START_TIMEOUT_MS;
     this.#spawnProcess = options.spawnProcess ?? DEFAULT_SPAWN_PROCESS;
     this.#writeDiagnosticLine = options.writeDiagnostic
       ?? ((fileDescriptor, line) =>
@@ -501,7 +514,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
     try {
       const first = await nextWithTimeout(
         turn.lines,
-        START_TIMEOUT_MS,
+        this.#startTimeoutMs,
         `OpenCode Agent ${input.employeeId} did not start within ${START_TIMEOUT_MS}ms`
       );
       if (first.done || first.value.type === "session.exited") {
