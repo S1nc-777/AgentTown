@@ -899,6 +899,7 @@ export class CompanyOrchestrator {
     const executionInstruction = employee.agent !== "fake" && employee.role === "developer"
       ? [
           "You are ASSIGNED this task. You are the implementer, not the leader: do NOT propose new tasks.",
+          "Use EXACTLY this task's id as the taskId in your task.submit action; do NOT invent a new task id.",
           "Implement the task inside the git worktree given in the task context (workspaceRoot): write the required files there, run git add and git commit inside that worktree, then emit ONE task.submit action with payload.submission = { schemaVersion: 1, headCommit, commits, changeSummary, validationCommandIds: [\"git-clean\"], suggestedValidationCommands: [], reportedResults: [], knownRisks: [] } (headCommit = `git rev-parse HEAD` in the worktree; commits = your commit shas from `git log --format=%H`, oldest first)."
         ]
       : [];
