@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   ActionProposal,
+  ActionType,
   AgentEvent,
   AgentMessage,
   CompanyDefinition,
@@ -296,7 +297,9 @@ export class CompanyOrchestrator {
           this.#assertEpoch(epoch);
           if (event.type === "action.proposed") {
             try {
-              this.#assertProposalTask(event.action, taskId);
+              if (event.action.type !== "task.submit") {
+                this.#assertProposalTask(event.action, taskId);
+              }
               await this.dispatch(event.action);
             } catch (error) {
               if (epoch !== this.#dispatchEpoch) return;
@@ -431,6 +434,8 @@ export class CompanyOrchestrator {
     let createdTaskId: string | null = null;
     let turn = 0;
     let rejectedProposals = 0;
+    let rejectedOther = 0;
+    let lastRejectedType: ActionType | null = null;
     while (turn < this.#leaderTurnCap) {
       if (epoch !== this.#dispatchEpoch || signal.aborted) return;
       const message = this.#leaderDriveMessage(createdTaskId);
@@ -452,6 +457,7 @@ export class CompanyOrchestrator {
             }
             if (outcome.kind === "resend") {
               resend = true;
+              lastRejectedType = outcome.rejectedType;
               break;
             }
             if (outcome.taskId !== null) createdTaskId = outcome.taskId;
@@ -475,16 +481,32 @@ export class CompanyOrchestrator {
       if (epoch !== this.#dispatchEpoch || signal.aborted) return;
       if (stop) return;
       if (resend) {
-        rejectedProposals += 1;
+        // Only rejected task.propose actions consume the proposal retry
+        // budget; other rejected actions (a malformed employee.message, a
+        // task.block on an illegal transition) are retried too but bounded
+        // separately so a leader emitting stray non-propose actions does not
+        // exhaust the proposal quota.
+        if (lastRejectedType === "task.propose") {
+          rejectedProposals += 1;
+        } else {
+          rejectedOther += 1;
+        }
         if (rejectedProposals >= 3) {
           this.#recordEvent("task.execution_error", leader.id, createdTaskId, {
             reason: "leader repeated a rejected task.propose"
           });
           return;
         }
+        if (rejectedOther >= 8) {
+          this.#recordEvent("task.execution_error", leader.id, createdTaskId, {
+            reason: "leader repeated too many rejected non-propose actions"
+          });
+          return;
+        }
         continue;
       }
       rejectedProposals = 0;
+      rejectedOther = 0;
       if (!sawAction) return;
       turn += 1;
     }
@@ -509,7 +531,7 @@ export class CompanyOrchestrator {
   ): Promise<
     | { kind: "dispatched"; taskId: string | null }
     | { kind: "stop"; taskId: null }
-    | { kind: "resend"; taskId: null }
+    | { kind: "resend"; taskId: null; rejectedType: ActionType }
   > {
     try {
       await this.dispatch(action);
@@ -522,7 +544,7 @@ export class CompanyOrchestrator {
       // malformed assign) is retried a bounded number of times instead of
       // killing the drive loop: policy already guards against abuse, and the
       // loop's rejection cap stops a persistently misbehaving leader.
-      return { kind: "resend", taskId: null };
+      return { kind: "resend", taskId: null, rejectedType: action.type };
     }
     if (action.type === "company.complete.request") {
       return { kind: "stop", taskId: null };
@@ -1001,7 +1023,14 @@ export class CompanyOrchestrator {
           if (event.type === "action.proposed") {
             sawAction = true;
             try {
-              if (message.taskId !== null) {
+              if (
+                message.taskId !== null
+                // task.submit may legitimately carry a null taskId: the
+                // dispatch path resolves it to the actor's running task
+                // (#resolveSubmitTaskId). Asserting here would reject the
+                // submission before that tolerance can apply.
+                && event.action.type !== "task.submit"
+              ) {
                 this.#assertProposalTask(event.action, message.taskId);
               }
               await this.dispatch(event.action);
