@@ -916,11 +916,18 @@ export class CompanyOrchestrator {
 
   #taskMessage(task: TaskRecord, employee: EmployeeDefinition): AgentMessage {
     const taskContext = this.#gitTaskWorkflow?.taskContext?.(task) ?? null;
+    const worktreeState =
+      taskContext !== null && taskContext.kind === "git_worktree"
+        ? taskContext.headCommit === taskContext.baseCommit
+          ? `Current worktree state: HEAD is ${taskContext.headCommit} (no task commits yet). If the acceptance criteria are already satisfied by files present in the worktree (e.g. a re-run over previously integrated work), do NOT re-implement: verify, then emit ONE task.submit with the current HEAD commit. Otherwise implement, commit, then submit.`
+          : `Current worktree state: HEAD is ${taskContext.headCommit} (ahead of base ${taskContext.baseCommit} — the implementation is already committed). Do NOT re-implement it: verify the existing files against the acceptance criteria, then emit ONE task.submit immediately with payload.submission.headCommit = ${taskContext.headCommit} and the existing commit shas.`
+        : null;
     const executionInstruction = employee.agent !== "fake" && employee.role === "developer"
       ? [
           "You are ASSIGNED this task. You are the implementer, not the leader: do NOT propose new tasks.",
           "Use EXACTLY this task's id as the taskId in your task.submit action; do NOT invent a new task id.",
-          "Implement the task inside the git worktree given in the task context (workspaceRoot): write the required files there, run git add and git commit inside that worktree, then emit ONE task.submit action with payload.submission = { schemaVersion: 1, headCommit, commits, changeSummary, validationCommandIds: [\"git-clean\"], suggestedValidationCommands: [], reportedResults: [], knownRisks: [] } (headCommit = `git rev-parse HEAD` in the worktree; commits = your commit shas from `git log --format=%H`, oldest first)."
+          "Implement the task inside the git worktree given in the task context (workspaceRoot): write the required files there, run git add and git commit inside that worktree, then emit ONE task.submit action with payload.submission = { schemaVersion: 1, headCommit, commits, changeSummary, validationCommandIds: [\"git-clean\"], suggestedValidationCommands: [], reportedResults: [], knownRisks: [] } (headCommit = `git rev-parse HEAD` in the worktree; commits = your commit shas from `git log --format=%H`, oldest first).",
+          ...(worktreeState === null ? [] : [worktreeState])
         ]
       : [];
     return {

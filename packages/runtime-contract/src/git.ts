@@ -160,6 +160,7 @@ export interface WritableTaskContext {
   workspaceRoot: string;
   branch: string;
   baseCommit: string;
+  headCommit: string;
   approvedValidationCommandIds: string[];
 }
 

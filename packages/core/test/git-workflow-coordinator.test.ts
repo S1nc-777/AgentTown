@@ -605,6 +605,7 @@ describe("GitWorkflowCoordinator", () => {
           workspaceRoot: harness.workspace.path,
           branch: harness.workspace.branchRef,
           baseCommit: harness.workspace.baseCommit,
+          headCommit: harness.workspace.headCommit,
           approvedValidationCommandIds: []
         });
       }

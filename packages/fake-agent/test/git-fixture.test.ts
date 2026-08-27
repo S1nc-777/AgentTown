@@ -118,6 +118,7 @@ async function createHarness(): Promise<{
     workspaceRoot,
     branch: "refs/heads/agenttown/run-1/developer-a/task-a",
     baseCommit,
+    headCommit: baseCommit,
     approvedValidationCommandIds: []
   };
   return { userRoot, workspaceRoot, writableContext, outside };

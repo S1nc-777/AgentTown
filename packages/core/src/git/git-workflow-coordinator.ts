@@ -250,6 +250,7 @@ export class GitWorkflowCoordinator {
           workspaceRoot: workspace.path,
           branch: workspace.branchRef,
           baseCommit: workspace.baseCommit,
+          headCommit: workspace.headCommit,
           approvedValidationCommandIds: this.#store
             .listValidationCommandGrants(this.#runId, task.id)
             .filter((grant) =>
@@ -544,6 +545,7 @@ export class GitWorkflowCoordinator {
         workspaceRoot: workspace.path,
         branch: workspace.branchRef,
         baseCommit: workspace.baseCommit,
+        headCommit: workspace.headCommit,
         approvedValidationCommandIds
       }
     });
