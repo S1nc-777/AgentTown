@@ -112,9 +112,12 @@ export function coreStartupScenarios(
         : employee.role === "reviewer"
           ? "You are the reviewer employee in the AgentTown company. Review the review package for the task and emit task.approve or task.reject with findings."
           : REAL_AGENT_LEADER_PROMPT;
+      const missionLine = employee.role === "product_lead"
+        ? `\nMission: ${company.company.mission}`
+        : "";
       return [
         employee.id,
-        `${rolePrompt}\nMission: ${company.company.mission}`
+        `${rolePrompt}${missionLine}`
       ];
     }
     if (gitCollaboration) {
