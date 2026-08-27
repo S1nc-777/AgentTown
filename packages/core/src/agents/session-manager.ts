@@ -68,15 +68,27 @@ export class SessionManager {
     scenarios: Readonly<Record<string, string>>
   ): Promise<void> {
     if (this.#sessions.size > 0) throw new Error("sessions already started");
-    const starts = company.employees.map(async (employee) =>
-      this.adapterFor(employee.agent).start({
-        employeeId: employee.id,
-        role: employee.role,
-        projectRoot: this.projectRoot,
-        scenario: scenarios[employee.id] ?? "idle"
-      })
-    );
-    const results = await Promise.allSettled(starts);
+    // Start employees strictly sequentially: real CLI adapters (codex,
+    // claude, opencode) all declare `parallelSessions: "unsupported"` and
+    // share per-user state (storage locks, warm-up processes), so concurrent
+    // starts race and one of them reliably fails to boot. Sequential starts
+    // are only a few seconds slower and eliminate the race entirely.
+    const results: Array<PromiseSettledResult<SessionHandle>> = [];
+    for (const employee of company.employees) {
+      let result: PromiseSettledResult<SessionHandle>;
+      try {
+        const handle = await this.adapterFor(employee.agent).start({
+          employeeId: employee.id,
+          role: employee.role,
+          projectRoot: this.projectRoot,
+          scenario: scenarios[employee.id] ?? "idle"
+        });
+        result = { status: "fulfilled", value: handle };
+      } catch (error) {
+        result = { status: "rejected", reason: error };
+      }
+      results.push(result);
+    }
     for (const result of results) {
       if (result.status === "fulfilled") this.#registerHandle(result.value);
     }
