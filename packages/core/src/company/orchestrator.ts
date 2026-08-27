@@ -984,13 +984,15 @@ export class CompanyOrchestrator {
       if (epoch !== this.#dispatchEpoch || signal.aborted) return;
       if (message.taskId !== null) {
         const task = this.tasks.get(message.taskId);
-        if (
-          task === undefined
-          || task.status !== "running"
-          || task.ownerEmployeeId !== employeeId
-        ) {
-          return;
-        }
+        if (task === undefined) return;
+        // The Git coordinator sends the task message before the running
+        // transition (a failed delivery leaves the task `ready` for retry),
+        // so the first drive happens while the task is still `ready` with
+        // the employee already assigned. Allow ready+running; anything else
+        // (draft without owner, terminal states, ownership change) stops
+        // the drive.
+        if (task.ownerEmployeeId !== employeeId) return;
+        if (task.status !== "ready" && task.status !== "running") return;
       }
       let sawAction = false;
       try {
