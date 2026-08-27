@@ -112,11 +112,14 @@ export async function startCore(input: {
     windowsHide: true,
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
+    // Safe defaults for tests, but an operator who explicitly opts into real
+    // agents (AGENTTOWN_FORBID_REAL_PROBES=0 + AGENTTOWN_REAL_*="1") must not
+    // have their settings overridden — inherit them verbatim.
     env: {
       ...process.env,
-      AGENTTOWN_FORBID_REAL_PROBES: "1",
-      AGENTTOWN_REAL_CODEX: "0",
-      AGENTTOWN_REAL_CLAUDE: "0"
+      AGENTTOWN_FORBID_REAL_PROBES: process.env.AGENTTOWN_FORBID_REAL_PROBES ?? "1",
+      AGENTTOWN_REAL_CODEX: process.env.AGENTTOWN_REAL_CODEX ?? "0",
+      AGENTTOWN_REAL_CLAUDE: process.env.AGENTTOWN_REAL_CLAUDE ?? "0"
     }
   });
 
