@@ -244,7 +244,9 @@ export class CompanyOrchestrator {
         await this.#taskWorkflow(action).assign(action);
         return;
       case "task.submit":
-        await this.#taskWorkflow(action).submit(action);
+        await this.#taskWorkflow(action).submit(
+          this.#resolveSubmitTaskId(action)
+        );
         return;
       case "task.approve":
         await this.#taskWorkflow(action).review(action);
@@ -710,6 +712,24 @@ export class CompanyOrchestrator {
       evidence: [],
       conflictForTaskId: null
     });
+  }
+
+  /**
+   * Real-agent developers occasionally omit the task id on task.submit.
+   * If it is missing, resolve it to the actor's unique running task so the
+   * submission is not lost to a strict-id rejection.
+   */
+  #resolveSubmitTaskId(action: ActionProposal): ActionProposal {
+    if (action.taskId !== null) return action;
+    const running = this.tasks.list().filter((task) =>
+      task.ownerEmployeeId === action.actorEmployeeId && task.status === "running"
+    );
+    if (running.length !== 1) {
+      throw new Error(
+        `task.submit requires taskId: ${action.actorEmployeeId} has ${running.length} running tasks`
+      );
+    }
+    return { ...action, taskId: running[0]!.id };
   }
 
   async #assignAndSend(action: ActionProposal): Promise<void> {
