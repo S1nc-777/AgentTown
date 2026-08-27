@@ -45,6 +45,15 @@ export interface LeaderDriveOptions {
   leaderTurnCap?: number;
 }
 
+/**
+ * Maximum rejected actions a driven Git employee may propose before the
+ * drive gives up and records a task execution error. Real agents sometimes
+ * mis-propose (e.g. a developer emitting task.propose), so the first
+ * rejection re-drives the same message; the cap bounds a persistently
+ * misbehaving agent.
+ */
+const MAX_DRIVE_REJECTED_ACTIONS = 3;
+
 export class FakeTaskWorkflow implements TaskWorkflow {
   constructor(private readonly handlers: TaskWorkflowHandlers) {}
 
@@ -291,12 +300,14 @@ export class CompanyOrchestrator {
               await this.dispatch(event.action);
             } catch (error) {
               if (epoch !== this.#dispatchEpoch) return;
-              failed = true;
+              // A rejected action (e.g. a real developer mis-proposing a new
+              // task) is not fatal: keep consuming the same turn so the Agent
+              // can correct itself with a valid terminal action. The turn
+              // always ends (session.exited), which bounds this loop.
               this.#recordEvent("action.rejected", "core", taskId, {
                 actionId: event.action.actionId,
                 reason: this.#errorMessage(error)
               });
-              break;
             }
           } else if (event.type === "adapter.error" || event.type === "session.exited") {
             failed = true;
@@ -507,9 +518,11 @@ export class CompanyOrchestrator {
         actionId: action.actionId,
         reason: this.#errorMessage(error)
       });
-      return action.type === "task.propose"
-        ? { kind: "resend", taskId: null }
-        : { kind: "stop", taskId: null };
+      // Any rejected leader action (including a stray task.start or a
+      // malformed assign) is retried a bounded number of times instead of
+      // killing the drive loop: policy already guards against abuse, and the
+      // loop's rejection cap stops a persistently misbehaving leader.
+      return { kind: "resend", taskId: null };
     }
     if (action.type === "company.complete.request") {
       return { kind: "stop", taskId: null };
@@ -953,6 +966,11 @@ export class CompanyOrchestrator {
    * caller is responsible for not awaiting this loop inside a dispatch path:
    * Git assignments are background-driven so the task stays observable in the
    * `running` state until the Agent finishes its work.
+   *
+   * Rejected actions (policy violations, task-id mismatches, malformed
+   * payloads) do not kill the drive: the same message is re-sent so the Agent
+   * gets a chance to correct itself. Only repeated rejections (bounded),
+   * session failure, or a task that left the running state end the drive.
    */
   async driveGitMessage(
     employeeId: string,
@@ -961,23 +979,63 @@ export class CompanyOrchestrator {
     const employee = this.#employee(employeeId);
     const epoch = this.#dispatchEpoch;
     const signal = this.#dispatchController.signal;
-    try {
-      for await (const event of this.sessions.send(employee, message, signal)) {
-        if (epoch !== this.#dispatchEpoch || signal.aborted) return;
-        if (event.type === "action.proposed") {
-          await this.dispatch(event.action);
-        } else if (
-          event.type === "adapter.error"
-          || event.type === "session.exited"
+    let rejectedActions = 0;
+    while (true) {
+      if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+      if (message.taskId !== null) {
+        const task = this.tasks.get(message.taskId);
+        if (
+          task === undefined
+          || task.status !== "running"
+          || task.ownerEmployeeId !== employeeId
         ) {
           return;
         }
       }
-    } catch (error) {
-      if (epoch !== this.#dispatchEpoch) return;
-      this.#recordEvent("task.execution_error", employee.id, message.taskId, {
-        reason: this.#errorMessage(error)
-      });
+      let sawAction = false;
+      try {
+        for await (const event of this.sessions.send(employee, message, signal)) {
+          if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+          if (event.type === "action.proposed") {
+            sawAction = true;
+            try {
+              if (message.taskId !== null) {
+                this.#assertProposalTask(event.action, message.taskId);
+              }
+              await this.dispatch(event.action);
+            } catch (error) {
+              if (epoch !== this.#dispatchEpoch) return;
+              rejectedActions += 1;
+              this.#recordEvent("action.rejected", "core", message.taskId, {
+                actionId: event.action.actionId,
+                reason: this.#errorMessage(error)
+              });
+              if (rejectedActions >= MAX_DRIVE_REJECTED_ACTIONS) {
+                this.#recordEvent(
+                  "task.execution_error",
+                  employee.id,
+                  message.taskId,
+                  { reason: `agent repeated rejected actions (${rejectedActions})` }
+                );
+                return;
+              }
+              break;
+            }
+          } else if (
+            event.type === "adapter.error"
+            || event.type === "session.exited"
+          ) {
+            return;
+          }
+        }
+      } catch (error) {
+        if (epoch !== this.#dispatchEpoch) return;
+        this.#recordEvent("task.execution_error", employee.id, message.taskId, {
+          reason: this.#errorMessage(error)
+        });
+        return;
+      }
+      if (!sawAction || rejectedActions === 0) return;
     }
   }
 
