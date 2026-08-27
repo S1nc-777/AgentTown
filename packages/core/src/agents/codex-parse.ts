@@ -152,6 +152,7 @@ export function extractStructuredAction(text: string): ActionProposal | null {
   if (
     typeof value.causationEventId !== "string"
     && value.causationEventId !== null
+    && value.causationEventId !== undefined
   ) {
     return null;
   }
@@ -164,6 +165,8 @@ export function extractStructuredAction(text: string): ActionProposal | null {
     taskId: value.taskId,
     payload: value.payload,
     reason: value.reason,
-    causationEventId: value.causationEventId
+    causationEventId: typeof value.causationEventId === "string"
+      ? value.causationEventId
+      : null
   };
 }
