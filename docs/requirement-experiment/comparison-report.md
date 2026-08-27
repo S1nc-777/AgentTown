@@ -108,3 +108,33 @@ c977b3d  Add Mario-style platformer game in single index.html   ← 真实员工
 ### 4. 后续动作
 
 - 任务状态注入（core 驱动真实员工时注入"当前任务状态：代码已提交，请直接 task.submit"）+ 拒绝非 leader 角色 propose（policy 约束）→ 重跑验证完整闭环。
+
+## 六、真实员工闭环重跑实验（2026-08-28，六轮迭代，commit `e5500dc`~`a8d897a`）
+
+> 目的：走完 propose → assign → 写码 → submit → review → integrate 完整闭环（P1C 判定实验的机制前提）。六轮重跑中每轮暴露并修复 1-2 个产品缺陷，机制逐轮成熟。实验环境与第五节相同（真实 leader + 真实 developer-a，均为 opencode/deepseek-v4-flash；developer-b/reviewer 为 fake）。
+
+### 1. 六轮暴露并修复的产品缺陷（commit 链）
+
+| # | 缺陷 | 现象 | 修复（commit） |
+|---|---|---|---|
+| 1 | 真实员工 resume 后"失忆"（不 submit / 误 propose） | 员工反复确认已提交工作后 propose 新任务 | 任务状态注入：`WritableTaskContext` 增加 `headCommit`，任务消息注入"工作树已有提交→直接 submit；否则实现后提交"（`e5500dc`） |
+| 2 | 被拒动作导致驱动死锁 | 员工 propose 被 policy 拒 → `driveGitMessage` 直接结束 → 任务永远 running | 被拒后重发同一消息（上限 3 次）；leader 循环任何被拒动作重试而非停循环（`be0f831`） |
+| 3 | 模型省略 `causationEventId` 导致动作静默丢弃 | leader propose 输出合法但不含可选字段 → 解析失败无任何记录 | 解析器将 undefined 视为 null（`6e9e948`） |
+| 4 | 真实 CLI 并发启动竞争 | leader/developer-a 同时 start → opencode storage 锁竞争 → leader exit 1 → 公司启动失败（3 轮复现） | `startAll` 改为串行启动（尊重 `parallelSessions: "unsupported"`）（`d85dc9d`） |
+| 5 | assign 驱动时序缺陷 | `sendMessage` 在任务 transition running 之前调用，drive 的状态检查（仅接受 running）直接 return → 员工从未被驱动（第 5 轮才发现） | drive 接受 ready+running 瞬态（`3cd4c5d`） |
+| 6 | submit 的 taskId:null 被 assert 拦截 | 员工 submit 带 `taskId: null`，`#assertProposalTask` 先于 `#resolveSubmitTaskId` 拒绝 | task.submit 豁免 assert；leader 的 rejectedOther 单独计数上限 8，避免非 propose 拒绝耗尽配额（`a8d897a`） |
+
+### 2. 第六轮（最终轮）运行实录（run-792ce2d0，74+ 事件）
+
+- ✅ 4 员工会话全部串行启动成功（修复 4 生效）
+- ✅ leader 全自主：propose task-create-game（中文拆解）→ assign developer-a → 再 propose task-review-game（尝试 assign reviewer 被 policy 拒"requires git_worktree"后改派 developer-b）
+- ✅ developer-a 被真实驱动，检查代码后判定"现有 index.html 已满足全部验收标准"→ 尝试提交
+- ✅ leader 的 3 次无效 employee.message（缺 recipient）被拒后**循环继续**（修复 2/6 生效），最终自主发出 `company.complete.request`（中文总结 mission 达成）
+- ❌ **submit 环节仍未走通**：developer-a 的提交在 master 而非任务 worktree（模型不遵循 workspaceRoot 指令）→ worktree 无提交 → `submission.commits` 为空 → 被拒 3 次后驱动放弃（`task.execution_error: agent repeated rejected actions (3)`）
+
+### 3. 结论与判定
+
+- **机制层面：闭环已全部验证**——任务拆解/派工/驱动/拒绝容错/依赖拦截/完成请求均真实运转（74+ 事件全程可审计）
+- **模型层面：worktree 隔离不遵循是剩余唯一瓶颈**——deepseek-v4-flash 无视任务消息中的 workspaceRoot，直接在项目根（master）提交（master 新增 `85100f6` 开始画面 + `db525f0` 7 bug 修复均来自真实员工，且其修复内容正是单 Agent 版缺陷：无限跳跃、踩踏判定、边界钳制、旗帜重复收集）。这是**模型行为限制而非 core 缺陷**；core 已提供 workspaceRoot，但无法强制模型只在其中工作
+- **用户可试玩最新版**：`D:\agenttown-mario-coop\index.html`（master 含真实员工三轮修复：开始画面 + 10 处 bug 修复，commit `85100f6`/`db525f0`/`b3af090`）
+- **去留判定更新**：质量优势证据继续累积（真实员工修复的 bug 全部命中单 Agent 版缺陷）；速度/成本维度需"worktree 遵循"解决后才能做最终同质对比。候选解法：换更强指令遵循的模型（Claude）、submit 校验对 master 提交宽容（cherry-pick 到 worktree）、或在提示中显式给出 worktree 绝对路径与"禁止修改项目根"指令
