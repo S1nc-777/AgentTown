@@ -204,10 +204,82 @@ describe("WorkspaceManager", () => {
     expect(store.listEvents(0).at(-1)?.type).toBe("git.workspace.created");
   }, GIT_TEST_TIMEOUT_MS);
 
+  it("adopts project-root commits when the task worktree has none", async () => {
+    await setupRepository(true);
+    const run = await manager.createRun("run-1", baseline);
+    const task = await manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "developer-a",
+      taskId: "task-a",
+      baseCommit: run.integrationCommit
+    });
+    expect(task.headCommit).toBe(run.integrationCommit);
+
+    // Employee commits directly in the project root instead of the worktree.
+    await writeFile(join(repo.root, "feature.txt"), "feature\n", "utf8");
+    await repo.git(["add", "feature.txt"]);
+    await repo.git(["commit", "-m", "feat: employee committed in project root"]);
+    const adoptedHead = await head();
+
+    const advanced = await manager.adoptProjectRootCommits(task, adoptedHead);
+    expect(advanced.headCommit).toBe(adoptedHead);
+    expect(await head(task.path)).toBe(adoptedHead);
+    expect((await repo.git(["show-ref", "--verify", task.branchRef]))
+      .stdout.trim().split(" ")[0]).toBe(adoptedHead);
+    expect(store.getGitWorkspace(task.workspaceId)?.headCommit).toBe(adoptedHead);
+    expect(store.listEvents(0).at(-1)?.type).toBe("git.workspace.advanced");
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("never overwrites a task worktree that already has its own commits", async () => {
+    await setupRepository(true);
+    const run = await manager.createRun("run-1", baseline);
+    const task = await manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "developer-a",
+      taskId: "task-a",
+      baseCommit: run.integrationCommit
+    });
+    await writeFile(join(task.path, "a.txt"), "a\n", "utf8");
+    await repo.git(["-C", task.path, "add", "a.txt"]);
+    await repo.git(["-C", task.path, "commit", "-m", "task work"]);
+    const taskHead = await head(task.path);
+
+    await writeFile(join(repo.root, "root.txt"), "r\n", "utf8");
+    await repo.git(["add", "root.txt"]);
+    await repo.git(["commit", "-m", "root work"]);
+    const rootHead = await head();
+
+    const advanced = await manager.adoptProjectRootCommits(task, rootHead);
+    expect(advanced.headCommit).toBe(task.headCommit);
+    expect(await head(task.path)).toBe(taskHead);
+    expect(store.getGitWorkspace(task.workspaceId)?.headCommit).toBe(task.headCommit);
+  }, GIT_TEST_TIMEOUT_MS);
+
+  it("resolves the canonical task commit range base..head", async () => {
+    await setupRepository(true);
+    const run = await manager.createRun("run-1", baseline);
+    const task = await manager.createTaskWorkspace({
+      runId: run.runId,
+      employeeId: "developer-a",
+      taskId: "task-a",
+      baseCommit: run.integrationCommit
+    });
+    await writeFile(join(repo.root, "one.txt"), "1\n", "utf8");
+    await repo.git(["add", "one.txt"]);
+    await repo.git(["commit", "-m", "feat: one"]);
+    const head1 = await head();
+    await writeFile(join(repo.root, "two.txt"), "2\n", "utf8");
+    await repo.git(["add", "two.txt"]);
+    await repo.git(["commit", "-m", "feat: two"]);
+    const head2 = await head();
+
+    expect(await manager.resolveTaskCommitRange(task, head2))
+      .toEqual([head1, head2]);
+  }, GIT_TEST_TIMEOUT_MS);
+
   it("creates a candidate worktree from a validated attempt id", async () => {
     await setupRepository();
     const run = await manager.createRun("run-1", baseline);
-
     const candidate = await manager.createCandidateWorkspace({
       runId: run.runId,
       attemptId: "attempt-a",

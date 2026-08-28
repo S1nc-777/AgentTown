@@ -197,7 +197,10 @@ export const validationCommandSchema = z.object({
 const gitTaskSubmissionSchema = z.object({
   schemaVersion: z.literal(1),
   headCommit: gitObjectId,
-  commits: z.array(gitObjectId).min(1),
+  // Real agents sometimes omit the commit list (or report an empty one when
+  // they committed in the project root instead of the task worktree). The
+  // core resolves the canonical range base..head when commits is empty.
+  commits: z.array(gitObjectId),
   changeSummary: nonEmpty,
   validationCommandIds: z.array(safeIdentifier),
   suggestedValidationCommands: z.array(validationCommandSchema),
@@ -208,6 +211,7 @@ const gitTaskSubmissionSchema = z.object({
   })),
   knownRisks: z.array(nonEmpty)
 }).superRefine((submission, context) => {
+  if (submission.commits.length === 0) return;
   if (new Set(submission.commits).size !== submission.commits.length) {
     context.addIssue({ code: "custom", path: ["commits"], message: "commits must be unique" });
   }

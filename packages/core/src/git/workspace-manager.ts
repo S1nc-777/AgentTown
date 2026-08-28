@@ -485,6 +485,72 @@ export class WorkspaceManager {
     });
   }
 
+  /**
+   * Adopts commits the employee made directly in the project root instead of
+   * the task worktree (real agents do not always honor workspaceRoot). When
+   * the task worktree has no commits yet (headCommit === baseCommit) and the
+   * submitted head exists in the repository, the task branch ref and the task
+   * worktree HEAD are moved to that commit so the standard validation path
+   * sees a consistent, non-empty commit range. A worktree that already has
+   * its own commits is never touched. Returns the (possibly advanced)
+   * workspace record.
+   */
+  async adoptProjectRootCommits(
+    workspace: GitWorkspaceRecord,
+    headCommit: string
+  ): Promise<GitWorkspaceRecord> {
+    const run = this.#requiredRun(workspace.runId);
+    if (workspace.kind !== "task" || workspace.status !== "active") {
+      return workspace;
+    }
+    objectId(headCommit, run.baseCommit.length, "adopted head commit");
+    if (headCommit === workspace.baseCommit) return workspace;
+    // The registered headCommit is not advanced when the employee commits
+    // inside the worktree, so detect the worktree's actual HEAD: if it
+    // already has its own commits, never overwrite them.
+    const actualHead = (await this.#git.run([
+      "rev-parse",
+      "--verify",
+      "HEAD^{commit}"
+    ], { cwd: workspace.path })).stdout.trim();
+    if (actualHead !== workspace.baseCommit) return workspace;
+    await this.#assertCommit(run.projectRoot, headCommit);
+    await this.#git.run(["update-ref", workspace.branchRef, headCommit], {
+      cwd: run.projectRoot
+    });
+    await this.#git.run(["reset", "--hard", headCommit], { cwd: workspace.path });
+    const advanced: GitWorkspaceRecord = {
+      ...workspace,
+      headCommit
+    };
+    await this.#verifyWorkspace(run.projectRoot, advanced);
+    this.#commitWorkspaceDurably(
+      advanced,
+      workspaceEvent("git.workspace.advanced", this.#actorId, advanced)
+    );
+    return advanced;
+  }
+
+  /**
+   * Resolves the canonical commit range `baseCommit..headCommit` in the
+   * project repository (topological order, oldest first). Used to fill in
+   * submission commit lists that real agents omitted.
+   */
+  async resolveTaskCommitRange(
+    workspace: GitWorkspaceRecord,
+    headCommit: string
+  ): Promise<string[]> {
+    const run = this.#requiredRun(workspace.runId);
+    objectId(headCommit, run.baseCommit.length, "task head commit");
+    const result = await this.#git.run([
+      "rev-list",
+      "--reverse",
+      "--topo-order",
+      `${workspace.baseCommit}..${headCommit}`
+    ], { cwd: run.projectRoot });
+    return result.stdout.split(/\r?\n/u).filter(Boolean);
+  }
+
   async createCandidateWorkspace(
     input: CreateCandidateWorkspaceInput
   ): Promise<GitWorkspaceRecord> {

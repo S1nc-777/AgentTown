@@ -1436,7 +1436,9 @@ describe("IntegrationService", () => {
       workspaceManager: {
         createTaskWorkspace: async () => {
           throw new Error("not reached");
-        }
+        },
+        adoptProjectRootCommits: async (workspace) => workspace,
+        resolveTaskCommitRange: async () => []
       },
       submissionValidator: {
         validate: async () => {

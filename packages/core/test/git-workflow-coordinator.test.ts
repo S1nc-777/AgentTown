@@ -247,7 +247,11 @@ function createHarness(options: {
     company,
     runId: "run-1",
     tasks,
-    workspaceManager: { createTaskWorkspace },
+    workspaceManager: {
+      createTaskWorkspace,
+      adoptProjectRootCommits: async (workspace) => workspace,
+      resolveTaskCommitRange: async () => []
+    },
     submissionValidator: { validate },
     validationRunner: {
       requestGrant,

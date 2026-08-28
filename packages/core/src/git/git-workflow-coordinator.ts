@@ -38,6 +38,14 @@ import type { CreateTaskWorkspaceInput } from "./workspace-manager.js";
 
 interface TaskWorkspaceManager {
   createTaskWorkspace(input: CreateTaskWorkspaceInput): Promise<GitWorkspaceRecord>;
+  adoptProjectRootCommits(
+    workspace: GitWorkspaceRecord,
+    headCommit: string
+  ): Promise<GitWorkspaceRecord>;
+  resolveTaskCommitRange(
+    workspace: GitWorkspaceRecord,
+    headCommit: string
+  ): Promise<string[]>;
 }
 
 interface TaskSubmissionValidator {
@@ -579,10 +587,18 @@ export class GitWorkflowCoordinator {
     }
     this.#assertWorkspace(workspace, taskId, employee.id);
     const parsed = parseGitTaskSubmission(action.payload.submission);
-    let advancedWorkspace = workspace;
-    if (workspace.headCommit !== parsed.headCommit) {
+    // Real agents sometimes ignore workspaceRoot and commit directly in the
+    // project root (master worktree). When the task worktree itself has no
+    // commits, adopt the submitted head: point the task branch ref and the
+    // worktree HEAD at it so the standard validation path sees a consistent,
+    // non-empty commit range (base..head from the project history).
+    let advancedWorkspace = await this.#workspaceManager.adoptProjectRootCommits(
+      workspace,
+      parsed.headCommit
+    );
+    if (advancedWorkspace.headCommit !== parsed.headCommit) {
       advancedWorkspace = {
-        ...workspace,
+        ...advancedWorkspace,
         headCommit: parsed.headCommit
       };
       this.#store.commitGitWorkspace({
@@ -593,6 +609,14 @@ export class GitWorkflowCoordinator {
           headCommit: parsed.headCommit
         })
       });
+    }
+    // Agents also frequently omit (or empty) the declared commit list; the
+    // canonical range base..head is authoritative and resolves it.
+    if (parsed.commits.length === 0) {
+      parsed.commits = await this.#workspaceManager.resolveTaskCommitRange(
+        advancedWorkspace,
+        parsed.headCommit
+      );
     }
     const scope: ValidationScope = {
       runId: this.#runId,
