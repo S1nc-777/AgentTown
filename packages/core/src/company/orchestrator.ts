@@ -50,10 +50,10 @@ export interface LeaderDriveOptions {
  * Maximum rejected actions a driven Git employee may propose before the
  * drive gives up and records a task execution error. Real agents sometimes
  * mis-propose (e.g. a developer emitting task.propose), so the first
- * rejection re-drives the same message; the cap bounds a persistently
- * misbehaving agent.
+ * rejection re-drives the same message with explicit feedback; the cap
+ * bounds a persistently misbehaving agent.
  */
-const MAX_DRIVE_REJECTED_ACTIONS = 3;
+const MAX_DRIVE_REJECTED_ACTIONS = 5;
 
 export class FakeTaskWorkflow implements TaskWorkflow {
   constructor(private readonly handlers: TaskWorkflowHandlers) {}
@@ -436,9 +436,10 @@ export class CompanyOrchestrator {
     let rejectedProposals = 0;
     let rejectedOther = 0;
     let lastRejectedType: ActionType | null = null;
+    let lastRejectedReason: string | null = null;
     while (turn < this.#leaderTurnCap) {
       if (epoch !== this.#dispatchEpoch || signal.aborted) return;
-      const message = this.#leaderDriveMessage(createdTaskId);
+      const message = this.#leaderDriveMessage(createdTaskId, lastRejectedReason);
       let sawAction = false;
       let stop = false;
       let resend = false;
@@ -458,6 +459,7 @@ export class CompanyOrchestrator {
             if (outcome.kind === "resend") {
               resend = true;
               lastRejectedType = outcome.rejectedType;
+              lastRejectedReason = outcome.reason;
               break;
             }
             if (outcome.taskId !== null) createdTaskId = outcome.taskId;
@@ -507,6 +509,8 @@ export class CompanyOrchestrator {
       }
       rejectedProposals = 0;
       rejectedOther = 0;
+      lastRejectedReason = null;
+      lastRejectedType = null;
       if (!sawAction) return;
       turn += 1;
     }
@@ -531,20 +535,21 @@ export class CompanyOrchestrator {
   ): Promise<
     | { kind: "dispatched"; taskId: string | null }
     | { kind: "stop"; taskId: null }
-    | { kind: "resend"; taskId: null; rejectedType: ActionType }
+    | { kind: "resend"; taskId: null; rejectedType: ActionType; reason: string }
   > {
     try {
       await this.dispatch(action);
     } catch (error) {
+      const reason = this.#errorMessage(error);
       this.#recordEvent("action.rejected", "core", action.taskId, {
         actionId: action.actionId,
-        reason: this.#errorMessage(error)
+        reason
       });
       // Any rejected leader action (including a stray task.start or a
       // malformed assign) is retried a bounded number of times instead of
       // killing the drive loop: policy already guards against abuse, and the
       // loop's rejection cap stops a persistently misbehaving leader.
-      return { kind: "resend", taskId: null, rejectedType: action.type };
+      return { kind: "resend", taskId: null, rejectedType: action.type, reason };
     }
     if (action.type === "company.complete.request") {
       return { kind: "stop", taskId: null };
@@ -561,7 +566,10 @@ export class CompanyOrchestrator {
    * task set asks for completion or the next task, otherwise the mission
    * prompt asks for the first task or the next one while work is in progress.
    */
-  #leaderDriveMessage(createdTaskId: string | null): AgentMessage {
+  #leaderDriveMessage(
+    createdTaskId: string | null,
+    feedback: string | null = null
+  ): AgentMessage {
     const leader = this.#employee(this.leaderId);
     const tasks = this.tasks.list();
     const unassigned = tasks.find(({ status }) => status === "draft");
@@ -595,6 +603,9 @@ export class CompanyOrchestrator {
         `Task ${createdTaskId} is in progress.`,
         "Propose the next task, or emit a company.complete.request when the mission is complete."
       ].join("\n");
+    }
+    if (feedback !== null) {
+      text = `${text}\n\nYour previous ACTION was rejected: ${feedback}. Emit a corrected action now.`;
     }
     return {
       messageId: randomUUID(),
@@ -1037,9 +1048,10 @@ export class CompanyOrchestrator {
             } catch (error) {
               if (epoch !== this.#dispatchEpoch) return;
               rejectedActions += 1;
+              const reason = this.#errorMessage(error);
               this.#recordEvent("action.rejected", "core", message.taskId, {
                 actionId: event.action.actionId,
-                reason: this.#errorMessage(error)
+                reason
               });
               if (rejectedActions >= MAX_DRIVE_REJECTED_ACTIONS) {
                 this.#recordEvent(
@@ -1050,6 +1062,18 @@ export class CompanyOrchestrator {
                 );
                 return;
               }
+              // Re-drive with explicit rejection feedback so the agent can
+              // correct its next action instead of repeating the mistake.
+              message = {
+                ...message,
+                text: `${message.text}\n\nYour previous ACTION "${
+                  event.action.actionId
+                }" was rejected: ${reason}. Emit a corrected action now.${
+                  message.taskId === null
+                    ? ""
+                    : ` A developer must emit task.submit with EXACTLY the task id "${message.taskId}" once the work is committed (or complete the implementation first, then submit).`
+                }`
+              };
               break;
             }
           } else if (
