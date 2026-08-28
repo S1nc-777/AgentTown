@@ -604,6 +604,13 @@ export class CompanyOrchestrator {
         "Propose the next task, or emit a company.complete.request when the mission is complete."
       ].join("\n");
     }
+    // Always show the leader the current task landscape so it does not
+    // re-propose or re-assign tasks that already exist in this run (a common
+    // failure across repeated real-agent runs).
+    const stateSummary = this.#taskStateSummary();
+    if (stateSummary.length > 0) {
+      text = `${text}\n\n${stateSummary}`;
+    }
     if (feedback !== null) {
       text = `${text}\n\nYour previous ACTION was rejected: ${feedback}. Emit a corrected action now.`;
     }
@@ -615,6 +622,19 @@ export class CompanyOrchestrator {
       actionRequest: null,
       taskContext: null
     };
+  }
+
+  /**
+   * Builds a compact snapshot of the current task landscape for the leader
+   * drive message (most recent tasks first, capped to keep prompts bounded).
+   */
+  #taskStateSummary(): string {
+    const tasks = this.tasks.list().slice(-10).reverse();
+    if (tasks.length === 0) return "";
+    const lines = tasks.map((task) =>
+      `- ${task.id} [${task.status}] owner=${task.ownerEmployeeId ?? "unassigned"}`
+    );
+    return `Current task state:\n${lines.join("\n")}`;
   }
 
   async requestReview(
@@ -1087,6 +1107,14 @@ export class CompanyOrchestrator {
             event.type === "adapter.error"
             || event.type === "session.exited"
           ) {
+            if (!sawAction) {
+              this.#recordEvent(
+                "task.execution_error",
+                employee.id,
+                message.taskId,
+                { reason: `agent session ended (${event.type}) without producing an action` }
+              );
+            }
             return;
           }
         }
@@ -1097,7 +1125,16 @@ export class CompanyOrchestrator {
         });
         return;
       }
-      if (!sawAction || rejectedActions === 0) return;
+      if (!sawAction) {
+        this.#recordEvent(
+          "task.execution_error",
+          employee.id,
+          message.taskId,
+          { reason: "agent session ended without a terminal action" }
+        );
+        return;
+      }
+      if (rejectedActions === 0) return;
     }
   }
 
