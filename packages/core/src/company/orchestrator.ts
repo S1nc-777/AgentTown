@@ -710,6 +710,12 @@ export class CompanyOrchestrator {
   }
 
   recoverWork(): void {
+    // Restart the leader drive loop after a pause/stop cycle: the abort that
+    // paused dispatching also stopped the loop, and nothing else would ever
+    // re-drive the leader (a gap that left companies stalled after resume).
+    if (this.#driveLeaderEnabled && this.#leaderDrive === undefined) {
+      this.#startLeaderDrive();
+    }
     const tasks = this.tasks.list();
     for (const task of tasks
       .filter(({ status }) => status === "running")
