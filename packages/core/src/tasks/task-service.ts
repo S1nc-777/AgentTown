@@ -97,6 +97,15 @@ export class TaskService {
     return this.store.listTasks(this.companyId);
   }
 
+  /**
+   * Validates that every dependency of the task is completed, without any
+   * state mutation. The Git coordinator calls this before creating any
+   * workspace so a rejected assignment never leaves side effects behind.
+   */
+  assertDependenciesComplete(taskId: string): void {
+    this.#assertDependenciesComplete(this.get(taskId));
+  }
+
   assign(taskId: string, employeeId: string): TaskRecord {
     const record = this.get(taskId);
     this.#assertTransition(record.status, "ready");
@@ -107,8 +116,12 @@ export class TaskService {
       throw new Error(`employee requires git_worktree workspace: ${employeeId}`);
     }
     for (const dependencyId of record.dependencies) {
-      if (this.store.getTask(this.companyId, dependencyId) === null) {
+      const dependency = this.store.getTask(this.companyId, dependencyId);
+      if (dependency === null) {
         throw new Error(`dependency not found: ${dependencyId}`);
+      }
+      if (dependency.status !== "completed") {
+        throw new Error(`dependencies incomplete: ${record.id}`);
       }
     }
 

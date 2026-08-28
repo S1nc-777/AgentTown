@@ -85,12 +85,28 @@ describe("TaskService", () => {
     expect(() => service.create(task("b", ["a"]))).toThrow("dependency cycle");
   });
 
-  it("does not start before dependencies complete", () => {
+  it("does not assign before dependencies complete", () => {
     service.create(task("build", []));
     service.create(task("test", ["build"]));
-    service.assign("test", "developer");
-    expect(() => service.transition("test", "running", "leader"))
+    // Assignment itself is rejected while a dependency is incomplete, so a
+    // rejected assign never leaves an assigned-but-not-runnable task.
+    expect(() => service.assign("test", "developer"))
       .toThrow("dependencies incomplete");
+    expect(service.get("test").ownerEmployeeId).toBeNull();
+    // Once the dependency completes, assignment succeeds.
+    store.putTask("company-1", {
+      ...service.get("build"),
+      status: "completed"
+    }, [{
+      id: "build-completed",
+      type: "task.completed",
+      actorId: "reviewer",
+      taskId: "build",
+      causationEventId: null,
+      payload: {}
+    }]);
+    service.assign("test", "developer");
+    expect(service.get("test").ownerEmployeeId).toBe("developer");
   });
 
   it("allows one execution retry and blocks the second failure", () => {

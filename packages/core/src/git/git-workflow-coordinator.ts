@@ -504,6 +504,10 @@ export class GitWorkflowCoordinator {
       && !(before.status === "ready" && before.ownerEmployeeId === assigneeId)) {
       throw new Error("Git task assignment is stale or belongs to another employee");
     }
+    // Dependency validation must fail before any side effect (workspace
+    // creation, assignment events, employee drive), so a rejected assign
+    // never leaves an orphan workspace or an assigned-but-not-running task.
+    this.#tasks.assertDependenciesComplete(taskId);
 
     let workspace: GitWorkspaceRecord;
     if (before.conflictForTaskId !== null) {
@@ -610,13 +614,29 @@ export class GitWorkflowCoordinator {
         })
       });
     }
-    // Agents also frequently omit (or empty) the declared commit list; the
-    // canonical range base..head is authoritative and resolves it.
-    if (parsed.commits.length === 0) {
-      parsed.commits = await this.#workspaceManager.resolveTaskCommitRange(
-        advancedWorkspace,
-        parsed.headCommit
-      );
+    // Agents also frequently omit (or mis-declare) the commit list; the
+    // canonical range base..head is authoritative and resolves it. A
+    // mismatch is recorded as evidence, not silently discarded. When the
+    // resolver cannot produce a range (e.g. a stub in tests) the declared
+    // list is kept and the strict validator decides.
+    const actualCommits = await this.#workspaceManager.resolveTaskCommitRange(
+      advancedWorkspace,
+      parsed.headCommit
+    );
+    const declaredMismatch = parsed.commits.length !== actualCommits.length
+      || parsed.commits.some((commit, index) => commit !== actualCommits[index]);
+    if (declaredMismatch && actualCommits.length > 0) {
+      this.#store.insertEvent(this.#event(
+        "git.submission.commits_resolved",
+        taskId,
+        {
+          runId: this.#runId,
+          workspaceId: workspace.workspaceId,
+          declaredCommits: parsed.commits,
+          resolvedCommits: actualCommits
+        }
+      ));
+      parsed.commits = actualCommits;
     }
     const scope: ValidationScope = {
       runId: this.#runId,
