@@ -138,3 +138,38 @@ c977b3d  Add Mario-style platformer game in single index.html   ← 真实员工
 - **模型层面：worktree 隔离不遵循是剩余唯一瓶颈**——deepseek-v4-flash 无视任务消息中的 workspaceRoot，直接在项目根（master）提交（master 新增 `85100f6` 开始画面 + `db525f0` 7 bug 修复均来自真实员工，且其修复内容正是单 Agent 版缺陷：无限跳跃、踩踏判定、边界钳制、旗帜重复收集）。这是**模型行为限制而非 core 缺陷**；core 已提供 workspaceRoot，但无法强制模型只在其中工作
 - **用户可试玩最新版**：`D:\agenttown-mario-coop\index.html`（master 含真实员工三轮修复：开始画面 + 10 处 bug 修复，commit `85100f6`/`db525f0`/`b3af090`）
 - **去留判定更新**：质量优势证据继续累积（真实员工修复的 bug 全部命中单 Agent 版缺陷）；速度/成本维度需"worktree 遵循"解决后才能做最终同质对比。候选解法：换更强指令遵循的模型（Claude）、submit 校验对 master 提交宽容（cherry-pick 到 worktree）、或在提示中显式给出 worktree 绝对路径与"禁止修改项目根"指令
+
+## 七、完整闭环走通（2026-08-28 第十轮，commit `9ff4b63`~`c04227b`）
+
+> 在第六节基础上继续修复 4 个缺陷后，第十轮实验**完整闭环首次全通**：真实员工（opencode/deepseek-v4-flash）产出的游戏代码经过 propose → assign → 写码/提交 → submit → 审核 → 批准 → 集成 → 完成 全流程交付。
+
+### 1. 本轮新增修复（commit 链）
+
+| # | 缺陷 | 修复（commit） |
+|---|---|---|
+| 7 | 员工在项目根提交导致 submit 校验失败（worktree 隔离不遵循） | `adoptProjectRootCommits`：worktree 无提交时把任务分支引用/HEAD 同步到员工声明提交；commits 声明缺失/错误时解析为权威范围 base..head（`9ff4b63`） |
+| 8 | 被拒后重发同一消息，模型重复犯错 | 重发消息注入拒绝原因反馈（"your ACTION X was rejected: <reason>; emit task.submit with EXACTLY task id Y"）；重试配额 3→5（`5037061`） |
+| 9 | 依赖未完成时 assign 仍创建 workspace + 写 assigned 事件（孤儿状态） | 依赖校验前置到 assignTask 入口（`assertDependenciesComplete`），assign 本身也拒绝不完整依赖（`935ecf4`） |
+| 10 | reviewer 从未被驱动（review 状态任务被 owner 检查误杀） | drive 检查区分 reviewer（review 状态）与 developer（ready/running+owner）（`c04227b`） |
+
+### 2. 第十轮完整闭环事件链（run-c6718bde，真实员工任务 create-mario-game）
+
+```
+leader propose create-mario-game → assign developer-a → task.started
+developer-a 检查已有代码 → 重写游戏（master 提交 3afbd9d "Build Mario-style horizontal scrolling platformer game"）
+developer-a task.submit（taskId 正确，adopt 生效 git.workspace.advanced）
+git.submission.validated → review.package.created → task.submitted → task.review_requested
+reviewer（fake）review.approved → task.review_approved → integration.queued
+git.integration.prepared → candidate 创建 → cherry-pick → validation.completed
+git.integration.committed（76cb871 → d93549f）→ task.completed ✅
+```
+
+- **全程 176+ 事件可审计**；leader 同时自主拆出 review/verify/submit 等任务（部分被依赖机制正确拦截）
+- **交付物**：集成分支 `agenttown/run-c6718bde.../integration` @ `d93549f`（含真实员工重写版游戏）
+- 真实员工本轮的"重写游戏"（3afbd9d）与其此前"修复 10 处 bug"（85100f6/db525f0）均为自主行为——**模型行为波动大**（同一模型有时精修、有时重写），但流程层全部接住
+
+### 3. 结论
+
+- **机制层：完整闭环已验证**——从任务拆解到集成交付全部真实运转，且能接住模型的大量随机行为（误 propose、错误 taskId、空 commits、项目根提交、错误角色动作）
+- **模型层：稳定性仍是最大成本**——每轮实验仍需主控修复 core 兜底；真实使用需要更强的模型（Claude 类）或更强的指令遵循
+- **剩余架构项**（下一步）：leader 跨轮记忆（重跑时重复 propose）、无输出诊断记录、leader pause/resume 再驱动
