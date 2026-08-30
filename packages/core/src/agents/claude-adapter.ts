@@ -199,6 +199,19 @@ export interface ClaudeAgentAdapterOptions {
    * scenario.
    */
   permissionMode?: string;
+  /**
+   * Optional `--model <alias>` appended to every `claude -p` invocation,
+   * overriding the model resolved from the user's settings (sonnet/opus/
+   * haiku aliases or a full model id). Omitted when unset or empty.
+   */
+  model?: string;
+  /**
+   * Optional `--effort <level>` appended to every `claude -p` invocation,
+   * overriding the session effort from the user's settings (e.g. "low" for
+   * fast, cheap turns; "max" is the default on this machine and can push
+   * real turns past 150s). Omitted when unset or empty.
+   */
+  effort?: string;
 }
 
 /**
@@ -245,6 +258,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
   readonly #packageRoot: string;
   readonly #forbidRealProbes: boolean;
   readonly #permissionMode: string | null;
+  readonly #model: string | null;
+  readonly #effort: string | null;
   readonly #spawnProcess: NonNullable<
     ClaudeAgentAdapterOptions["spawnProcess"]
   >;
@@ -261,6 +276,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     this.#permissionMode = options.permissionMode != null
       && options.permissionMode.length > 0
       ? options.permissionMode
+      : null;
+    this.#model = options.model != null && options.model.length > 0
+      ? options.model
+      : null;
+    this.#effort = options.effort != null && options.effort.length > 0
+      ? options.effort
       : null;
     this.#spawnProcess = options.spawnProcess ?? DEFAULT_SPAWN_PROCESS;
     this.#writeDiagnosticLine = options.writeDiagnostic
@@ -320,7 +341,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       "json",
       "--resume",
       session.nativeSessionId,
-      ...this.#permissionArgs()
+      ...this.#permissionArgs(),
+      ...this.#modelArgs(),
+      ...this.#effortArgs()
     ];
     const turn = this.#spawnTurn(live, args);
     live.activeTurn = turn;
@@ -476,7 +499,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           initialPrompt(input),
           "--output-format",
           "json",
-          ...this.#permissionArgs()
+          ...this.#permissionArgs(),
+          ...this.#modelArgs(),
+          ...this.#effortArgs()
         ]
       : [
           "-p",
@@ -485,7 +510,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           "json",
           "--resume",
           resume.resumeId,
-          ...this.#permissionArgs()
+          ...this.#permissionArgs(),
+          ...this.#modelArgs(),
+          ...this.#effortArgs()
         ];
     let turn: ActiveTurn;
     try {
@@ -539,6 +566,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     return this.#permissionMode === null
       ? []
       : ["--permission-mode", this.#permissionMode];
+  }
+
+  #modelArgs(): string[] {
+    return this.#model === null ? [] : ["--model", this.#model];
+  }
+
+  #effortArgs(): string[] {
+    return this.#effort === null ? [] : ["--effort", this.#effort];
   }
 
   #spawnTurn(live: LiveClaudeSession, args: string[]): ActiveTurn {

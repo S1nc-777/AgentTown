@@ -224,7 +224,16 @@ export function buildAdapterMap(
               forbidRealProbes: false,
               // "plan" is read-only (no Bash/write tools), matching the
               // leader's read_only workspace; override via env if needed.
-              permissionMode: env.AGENTTOWN_CLAUDE_PERMISSION_MODE ?? "plan"
+              permissionMode: env.AGENTTOWN_CLAUDE_PERMISSION_MODE ?? "plan",
+              ...(env.AGENTTOWN_CLAUDE_MODEL
+                ? { model: env.AGENTTOWN_CLAUDE_MODEL }
+                : {}),
+              // Claude Code defaults to max effort on this machine, which
+              // pushes real turns past 150s; explicit effort override lets
+              // operators trade reasoning depth for latency.
+              ...(env.AGENTTOWN_CLAUDE_EFFORT
+                ? { effort: env.AGENTTOWN_CLAUDE_EFFORT }
+                : {})
             }
           : {})
       })
