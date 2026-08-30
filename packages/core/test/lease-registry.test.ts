@@ -79,7 +79,7 @@ describe("LeaseRegistry", () => {
     await sweeping;
   });
 
-  it("reports callback rejection and allows a later retry", async () => {
+  it("reports callback rejection and suppresses retries until a new heartbeat", async () => {
     const store = createInitializedMemoryStore();
     let now = 0;
     let attempts = 0;
@@ -94,7 +94,17 @@ describe("LeaseRegistry", () => {
     leases.heartbeat("client-a");
     now = 10_000;
 
+    // First failure is reported...
     await expect(leases.sweep()).rejects.toThrow("pause failed");
+    // ...but the trigger stays latched: repeated sweeps must not re-fire
+    // (that previously produced a per-second pause_failed storm while the
+    // company was still starting its sessions).
+    await expect(leases.sweep()).resolves.toBeUndefined();
+    expect(attempts).toBe(1);
+    // A new client heartbeat resets the latch, so a later disconnect can
+    // trigger the pause callback again.
+    leases.heartbeat("client-a");
+    now = 20_000;
     await expect(leases.sweep()).resolves.toBeUndefined();
     expect(attempts).toBe(2);
   });

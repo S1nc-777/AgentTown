@@ -58,7 +58,11 @@ export class LeaseRegistry {
     const trigger = Promise.resolve()
       .then(() => this.options.onLastClientExpired())
       .catch((error: unknown) => {
-        this.#pauseTriggered = false;
+        // Keep #pauseTriggered set on failure: a failed pause (e.g. the
+        // company is still starting its sessions) must not re-fire on every
+        // sweep, which previously produced a 1-second pause_failed storm.
+        // A new client heartbeat resets the flag so a later disconnect can
+        // trigger pause again.
         throw error;
       })
       .finally(() => {
