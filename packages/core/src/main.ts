@@ -723,7 +723,13 @@ async function setupGitWiring(options: {
       }
       return result;
     },
-    reactivate: () => workspaceManager.reactivateRun(runId)
+    reactivate: async () => {
+      // Re-open the coordinator's action gate first: a pause attempt closed
+      // it via stopNewActions, and without this every subsequent action
+      // silently falls back to the non-Git workflow.
+      hooks.resumeNewActions();
+      await workspaceManager.reactivateRun(runId);
+    }
   };
 
   if (existingRuns.length === 1) {

@@ -236,6 +236,15 @@ export class GitWorkflowCoordinator {
   }
 
   /**
+   * Re-opens action handling after a pause attempt failed or a recovery
+   * reactivated the run; without this the handles() gate stays closed and
+   * every action silently falls back to the non-Git workflow.
+   */
+  resumeNewActions(): void {
+    this.#acceptingActions = true;
+  }
+
+  /**
    * Builds the exact structured context an Agent needs to resume a Git task or
    * review a package after a restart. A running Git task receives its durable
    * task workspace; a task awaiting review receives its latest immutable review
