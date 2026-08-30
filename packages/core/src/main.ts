@@ -912,6 +912,15 @@ function isEntrypoint(): boolean {
 }
 
 if (isEntrypoint()) {
+  // Core is a detached background daemon: the CLI that spawned it may exit
+  // while the pipe carrying our stdout/stderr is still connected, which then
+  // closes and turns the next write into EPIPE. Without these listeners an
+  // unhandled stream error would crash the daemon mid-run.
+  process.stdout.on("error", () => undefined);
+  process.stderr.on("error", () => undefined);
+}
+
+if (isEntrypoint()) {
   void runCore(process.argv.slice(2)).catch((error: unknown) => {
     process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
     process.exitCode = 1;
