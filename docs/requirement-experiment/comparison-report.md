@@ -173,3 +173,46 @@ git.integration.committed（76cb871 → d93549f）→ task.completed ✅
 - **机制层：完整闭环已验证**——从任务拆解到集成交付全部真实运转，且能接住模型的大量随机行为（误 propose、错误 taskId、空 commits、项目根提交、错误角色动作）
 - **模型层：稳定性仍是最大成本**——每轮实验仍需主控修复 core 兜底；真实使用需要更强的模型（Claude 类）或更强的指令遵循
 - **剩余架构项**（下一步）：leader 跨轮记忆（重跑时重复 propose）、无输出诊断记录、leader pause/resume 再驱动
+
+## 八、模型适配深化：Claude 后端可用化（2026-08-30，commit `ec6dbb5`~`a907632`）
+
+> 目标：让 Claude Code CLI 成为可用的真实员工后端。诊断 + 修复 + 闭环验证全部完成。
+
+### 1. 诊断结论（实测数据）
+
+- Claude Code 2.1.233 配置走 DeepSeek Anthropic 兼容端点（`api.deepseek.com/anthropic`），默认 `deepseek-v4-flash[1m]` + `effortLevel: max`
+- **成本澄清（重要）**：此前记录的"$0.13-1.56/轮"是 **C:\ 目录下跑 claude 的系统提示特例**（~25K tokens/轮）。在项目目录（worktree）运行时，claude 每轮仅 **~400-600 input tokens（$0.003-0.006）**——与 opencode 同量级，**成本问题不成立**
+- 慢的根因是 `effortLevel: max`（可被 `--effort` 覆盖）与模型推理波动，非适配器缺陷
+- CLI 支持 `--model <alias>` / `--effort <level>` / `--permission-mode <mode>` 覆盖
+
+### 2. 适配器增强（commit `ec6dbb5`）
+
+- 新增 `AGENTTOWN_CLAUDE_MODEL`（→ `--model`）与 `AGENTTOWN_CLAUDE_EFFORT`（→ `--effort`）env 覆盖；`AGENTTOWN_CLAUDE_EXECUTABLE` 指向 claude.exe（原生 exe，无 shim 问题）、`AGENTTOWN_CLAUDE_PERMISSION_MODE` 默认 `plan`（只读，适合 leader 角色）
+
+### 3. 暴露并修复的 6 个 pause 链缺陷（claude 慢启动 ~70s 与 15s lease TTL 竞态暴露）
+
+| # | 缺陷 | 现象 | 修复（commit） |
+|---|---|---|---|
+| 1 | lease 过期 pause 失败后每秒重试风暴 | 33 次 pause_failed/秒刷屏 | 失败后闩锁触发，仅新客户端心跳重置（`0779c42`） |
+| 2 | retry 时员工场景丢失 | fake 员工恢复后 idle，提交失败 → 依赖死锁 | orchestrator 保存启动场景并在 retry 传递（`e05c7e0`） |
+| 3 | pause 失败后 git run 保持 paused | handles() 拒绝一切动作 → 走 Fake 流程 | pause 失败路径 reactivate run（`283900e`） |
+| 4 | coordinator 动作门未重开 | `#acceptingActions` 永久 false | `resumeNewActions()` 接入 reactivate（`475ff42`） |
+| 5 | 集成 fence 未重开 | "integration dispatch is fenced" | `resumeIntegrationDispatch()`（`6cf1118`） |
+| 6 | 验证 fence 未重开 | "validation dispatch is fenced" | `resumeActive()`（`a907632`） |
+
+### 4. 闭环验证（第六次运行，claude leader + fake 员工）
+
+```
+claude leader propose（被拒 1 次后凭反馈自纠）→ assign → fake 提交
+→ submit → validated → review_requested → reviewer approve
+→ integration.queued → prepared → cherry-pick → validation.completed
+→ git.integration.committed → task.completed ✅（91 事件全程可审计）
+```
+
+- claude leader 行为：主动拆 4 个依赖任务（scaffold/commands/tests/review）、感知依赖门、错误后自纠——**与 opencode leader 同等的自主性**
+- 已知小问题：fake fixture 的第二个任务提交偶发 `git_fixture_failed`（集成后 worktree 状态变化），不影响主结论
+
+### 5. 结论
+
+- **Claude 后端可用**：作为 leader（plan 只读模式）已验证全闭环；真实成本与 opencode 同量级；`--effort`/`--model` 可调
+- **pause 失败路径的 6 个状态恢复缺口全部修复**——慢启动后端（claude 70s）与短 lease TTL 的竞态不再破坏公司状态
