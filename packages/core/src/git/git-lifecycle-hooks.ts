@@ -7,7 +7,7 @@ import type { ValidationRunner } from "./validation-runner.js";
 export interface GitLifecycleHooksOptions {
   runId: string;
   coordinator: Pick<GitWorkflowCoordinator, "stopNewActions" | "resumeNewActions">;
-  validationRunner: Pick<ValidationRunner, "abortActive">;
+  validationRunner: Pick<ValidationRunner, "abortActive" | "resumeActive">;
   integrationService: Pick<IntegrationService, "settleIntegrationIntent" | "resumeIntegrationDispatch">;
   reconciler: Pick<GitReconciler, "snapshot" | "reconcile">;
 }
@@ -29,6 +29,7 @@ export class GitLifecycleHooks {
 
   resumeNewActions(): void {
     this.#coordinator.resumeNewActions();
+    this.#validationRunner.resumeActive();
     this.#integrationService.resumeIntegrationDispatch();
   }
 

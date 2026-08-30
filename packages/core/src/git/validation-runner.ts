@@ -723,6 +723,16 @@ export class ValidationRunner {
     )));
   }
 
+  /**
+   * Re-opens validation dispatch after a failed pause attempt: abortActive
+   * fenced #acceptingRuns and the fence must not persist once the company
+   * is running again, or submissions die with "validation dispatch is
+   * fenced" mid-integration.
+   */
+  resumeActive(): void {
+    this.#acceptingRuns = true;
+  }
+
   async requestGrant(command: ValidationCommand, scope: ValidationScope): Promise<ValidationCommandGrant> {
     assertCommand(command);
     assertGrantContainsNoObviousSecret(command);
