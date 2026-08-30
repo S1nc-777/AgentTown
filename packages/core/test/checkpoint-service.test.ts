@@ -93,6 +93,7 @@ async function createHarness(options: {
     settleIntegrationIntent(signal: AbortSignal, deadlineAt: number): Promise<void>;
     snapshot(): Promise<GitCheckpoint | null>;
     reconcile(runId: string): Promise<ReconciliationResult>;
+    reactivate(): Promise<void>;
   };
 } = {}): Promise<Harness> {
   const project = await createTemporaryProject();
@@ -246,7 +247,10 @@ describe("CheckpointService", () => {
           runId: "run-1",
           classification: "verified",
           discrepancies: []
-        })
+        }),
+        reactivate: async () => {
+          calls.push("reactivate");
+        }
       }
     });
 
@@ -306,7 +310,8 @@ describe("CheckpointService", () => {
           runId: "run-1",
           classification: "tampered",
           discrepancies: [{ kind: "integration_ref", expected: "old", actual: "third" }]
-        })
+        }),
+        reactivate: async () => undefined
       }
     });
 
@@ -333,7 +338,8 @@ describe("CheckpointService", () => {
         abortValidations: async () => undefined,
         settleIntegrationIntent: async () => undefined,
         snapshot: async () => null,
-        reconcile
+        reconcile,
+        reactivate: async () => undefined
       }
     });
 

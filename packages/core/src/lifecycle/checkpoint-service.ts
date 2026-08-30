@@ -50,6 +50,11 @@ export interface CheckpointServiceOptions {
     settleIntegrationIntent(signal: AbortSignal, deadlineAt: number): Promise<void>;
     snapshot(): Promise<GitCheckpoint | null>;
     reconcile(runId: string): Promise<ReconciliationResult>;
+    /**
+     * Reactivates a git run that was paused by an aborted pause attempt, so
+     * the company can keep dispatching Git work after a failed pause.
+     */
+    reactivate(): Promise<void>;
   };
 }
 
@@ -401,6 +406,12 @@ export class CheckpointService {
         cleanup.length === 0 ? "pause_failed" : "cleanup_failed",
         error
       );
+      // The git run was paused by snapshot() before the failure; reactivate
+      // it so the company can keep dispatching Git work after the failed
+      // pause. A reactivation failure is secondary to the pause failure.
+      if (this.#gitLifecycle !== undefined) {
+        await this.#gitLifecycle.reactivate().catch(() => undefined);
+      }
       throw error;
     } finally {
       clearTimeout(deadline.timer);

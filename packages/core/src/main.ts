@@ -722,7 +722,8 @@ async function setupGitWiring(options: {
         await workspaceManager.reactivateRun(reconciledRunId);
       }
       return result;
-    }
+    },
+    reactivate: () => workspaceManager.reactivateRun(runId)
   };
 
   if (existingRuns.length === 1) {
