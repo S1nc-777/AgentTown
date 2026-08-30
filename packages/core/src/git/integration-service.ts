@@ -246,6 +246,16 @@ export class IntegrationService {
     await beforeDeadline(Promise.allSettled(active).then(() => undefined), deadlineAt);
   }
 
+  /**
+   * Re-opens integration dispatch after a failed pause attempt: the fence
+   * set by settleIntegrationIntent must not persist once the company is
+   * running again, or every approved submission dies with
+   * "integration dispatch is fenced".
+   */
+  resumeIntegrationDispatch(): void {
+    this.#accepting = true;
+  }
+
   async integrate(submission: GitSubmissionRecord): Promise<IntegrationResult> {
     if (!this.#accepting) throw new Error("integration dispatch is fenced");
     const operation = this.#integrate(submission);

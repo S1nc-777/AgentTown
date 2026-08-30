@@ -8,7 +8,7 @@ export interface GitLifecycleHooksOptions {
   runId: string;
   coordinator: Pick<GitWorkflowCoordinator, "stopNewActions" | "resumeNewActions">;
   validationRunner: Pick<ValidationRunner, "abortActive">;
-  integrationService: Pick<IntegrationService, "settleIntegrationIntent">;
+  integrationService: Pick<IntegrationService, "settleIntegrationIntent" | "resumeIntegrationDispatch">;
   reconciler: Pick<GitReconciler, "snapshot" | "reconcile">;
 }
 
@@ -29,6 +29,7 @@ export class GitLifecycleHooks {
 
   resumeNewActions(): void {
     this.#coordinator.resumeNewActions();
+    this.#integrationService.resumeIntegrationDispatch();
   }
 
   async abortValidations(signal: AbortSignal, deadlineAt: number): Promise<void> {
