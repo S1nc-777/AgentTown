@@ -72,6 +72,7 @@ const COMMANDS = new Set([
   "approve",
   "reject",
   "cleanup",
+  "watch",
   "_watch"
 ]);
 
@@ -98,6 +99,7 @@ Commands:
   approve        Approve an approval id (--reason "text")
   reject         Reject an approval id (--reason "text")
   cleanup        Clean up a run's worktrees (run id, --yes, --branches, --evidence)
+  watch          Live terminal dashboard (company/tasks/employees/events, q to quit)
   help           Show this help
 
 Options:
@@ -564,6 +566,101 @@ async function watch(pipeName: string): Promise<number> {
   return 0;
 }
 
+const WATCH_REFRESH_MS = 1_000;
+const WATCH_EVENT_LIMIT = 25;
+
+/**
+ * `agenttown watch`: live terminal dashboard. Every second it repaints the
+ * company status, task list, employee states and the most recent events.
+ * Press q to quit; on a non-TTY it prints a single snapshot instead.
+ */
+async function watchDashboard(
+  projectRoot: string,
+  runtime: CliRuntime
+): Promise<number> {
+  const client = await runtime.connectOrStart(projectRoot, false);
+  try {
+    const refresh = async (): Promise<string> => {
+      const snapshot = record(
+        await client.request("status.snapshot", { companyId: COMPANY_ID }),
+        "status.snapshot"
+      );
+      if (!Array.isArray(snapshot.employees)) {
+        throw new Error("status.snapshot employees must be an array");
+      }
+      const employees = snapshot.employees
+        .map(employeeStatus)
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const tasksResult = await client.request("tasks.list", {
+        companyId: COMPANY_ID
+      }) as TaskRecord[];
+      const events = await client.request("events.list", {
+        afterSequence: 0,
+        limit: WATCH_EVENT_LIMIT
+      }) as EventRecord[];
+      const timelineLines = renderTimeline(events).split("\n");
+      return [
+        `AgentTown  ${new Date().toISOString()}  (q 退出)`,
+        "─".repeat(68),
+        renderCompanyStatus({
+          companyId: requiredString(snapshot.companyId, "status.snapshot companyId"),
+          status: requiredString(snapshot.status, "status.snapshot status"),
+          activeTaskCount: requiredNonnegativeInteger(
+            snapshot.activeTaskCount,
+            "status.snapshot activeTaskCount"
+          ),
+          pendingApprovalCount: requiredNonnegativeInteger(
+            snapshot.pendingApprovalCount,
+            "status.snapshot pendingApprovalCount"
+          )
+        }),
+        "",
+        renderTasks(tasksResult),
+        "",
+        ...employees.flatMap((employee) => [
+          renderEmployee(employee),
+          ""
+        ]),
+        `最新事件（最近 ${WATCH_EVENT_LIMIT} 条）:`,
+        ...timelineLines.slice(-WATCH_EVENT_LIMIT)
+      ].join("\n");
+    };
+
+    if (!process.stdout.isTTY) {
+      await writeWithBackpressure(runtime.stdout, `${await refresh()}\n`);
+      return 0;
+    }
+
+    let exit = false;
+    const onKey = (chunk: Buffer | string) => {
+      if (String(chunk).toLowerCase().includes("q")) exit = true;
+    };
+    process.stdin.setRawMode?.(true);
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", onKey);
+    try {
+      while (!exit) {
+        const frame = await refresh();
+        await writeWithBackpressure(
+          runtime.stdout,
+          `\x1b[2J\x1b[H${frame}\n`
+        );
+        await new Promise<void>((resolvePromise) => {
+          setTimeout(resolvePromise, WATCH_REFRESH_MS);
+        });
+      }
+    } finally {
+      process.stdin.off("data", onKey);
+      process.stdin.setRawMode?.(false);
+      process.stdin.pause();
+    }
+    return 0;
+  } finally {
+    await client.close();
+  }
+}
+
 async function status(projectRoot: string, runtime: CliRuntime): Promise<void> {
   const client = await runtime.connectOrStart(projectRoot, false);
   try {
@@ -872,6 +969,9 @@ export async function runCli(
       return 0;
     case "cleanup":
       await cleanup(projectRoot, runtime, parsed);
+      return 0;
+    case "watch":
+      await watchDashboard(projectRoot, runtime);
       return 0;
     default:
       throw new Error(`unsupported command: ${parsed.command}`);

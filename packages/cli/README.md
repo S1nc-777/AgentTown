@@ -27,6 +27,7 @@ agenttown start --detach
 agenttown status
 agenttown tasks
 agenttown timeline
+agenttown watch          # 实时终端看板（公司/任务/员工/最新事件，每秒刷新，q 退出）
 
 # 4. 暂停 / 恢复 / 停止
 agenttown pause
@@ -53,6 +54,7 @@ agenttown stop --yes
 | `approvals` | 待审批列表 |
 | `approve <id> --reason "..."` / `reject <id> --reason "..."` | 审批决策 |
 | `cleanup <run-id> [--yes] [--branches] [--evidence]` | 清理 run 的 worktrees/分支/证据 |
+| `watch` | 实时终端看板：公司/任务/员工/最新事件，每秒刷新，按 q 退出（非 TTY 打印单次快照） |
 | `help` | 帮助 |
 
 ## 环境变量
