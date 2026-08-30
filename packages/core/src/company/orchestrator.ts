@@ -159,6 +159,13 @@ export class CompanyOrchestrator {
   readonly #driveLeaderEnabled: boolean;
   readonly #leaderTurnCap: number;
   #leaderDrive: Promise<void> | undefined;
+  /**
+   * Startup scenarios captured at start(); retries and recoveries re-pass the
+   * employee's original scenario (e.g. a fake developer's git fixture id) so
+   * a rebuilt session behaves like the original instead of falling back to
+   * the idle scenario.
+   */
+  #startupScenarios: Readonly<Record<string, string>> | null = null;
 
   constructor(
     private readonly companyId: string,
@@ -220,6 +227,7 @@ export class CompanyOrchestrator {
 
   async start(scenarios: Readonly<Record<string, string>>): Promise<void> {
     try {
+      this.#startupScenarios = scenarios;
       await this.sessions.startAll(this.company, scenarios);
       this.store.setCompanyStatus(this.companyId, "running", {
         id: randomUUID(),
@@ -360,7 +368,12 @@ export class CompanyOrchestrator {
         handoff: `Retry ${taskId} after Agent session failure`
       };
       try {
-        await this.sessions.resumeOne(employee, checkpoint, signal);
+        await this.sessions.resumeOne(
+          employee,
+          checkpoint,
+          signal,
+          this.#startupScenarios?.[employee.id] ?? "idle"
+        );
         this.#assertEpoch(epoch);
       } catch (resumeError) {
         if (epoch !== this.#dispatchEpoch) return;
