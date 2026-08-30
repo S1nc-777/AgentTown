@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IpcEvent, TaskRecord } from "@agenttown/runtime-contract";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   type CliClient,
   type CliRuntime,
@@ -19,6 +19,22 @@ import {
 } from "../src/main.js";
 
 const roots: string[] = [];
+/**
+ * Commands now fail with a "not initialized" hint before touching Core, so
+ * tests that exercise real command paths run against an initialized
+ * project. Kept out of `roots` (which afterEach wipes) so it survives for
+ * the whole suite.
+ */
+let initializedRoot: string;
+
+beforeAll(async () => {
+  initializedRoot = await mkdtemp(join(tmpdir(), "agenttown-cli-root-"));
+  await runCli(["init"], initializedRoot, fakeRuntime(() => undefined).runtime);
+});
+
+afterAll(async () => {
+  await rm(initializedRoot, { recursive: true, force: true });
+});
 
 function task(id = "task-1"): TaskRecord {
   return {
@@ -112,13 +128,13 @@ afterEach(async () => {
 
 describe("thin CLI commands", () => {
   it("requires exact identifiers and explicit reasons for P1B commands", async () => {
-    await expect(runCli(["cleanup"], process.cwd()))
+    await expect(runCli(["cleanup"], initializedRoot))
       .rejects.toThrow("run id");
-    await expect(runCli(["evidence"], process.cwd()))
+    await expect(runCli(["evidence"], initializedRoot))
       .rejects.toThrow("task id");
-    await expect(runCli(["approve", "grant-1"], process.cwd()))
+    await expect(runCli(["approve", "grant-1"], initializedRoot))
       .rejects.toThrow("--reason");
-    await expect(runCli(["cleanup", "all", "--yes"], process.cwd()))
+    await expect(runCli(["cleanup", "all", "--yes"], initializedRoot))
       .rejects.toThrow("exact run id");
   });
 
@@ -160,7 +176,7 @@ describe("thin CLI commands", () => {
 
     for (const testCase of cases) {
       const fake = fakeRuntime((method) => responses[method]);
-      await expect(runCli(testCase.argv, process.cwd(), fake.runtime)).resolves.toBe(0);
+      await expect(runCli(testCase.argv, initializedRoot, fake.runtime)).resolves.toBe(0);
       expect(fake.calls).toEqual([{ method: testCase.method, params: testCase.params }]);
       expect(fake.starts).toEqual([false]);
       expect(fake.closed).toEqual([1]);
@@ -178,7 +194,7 @@ describe("thin CLI commands", () => {
         "grant-1",
         "--reason",
         "Required project test"
-      ], process.cwd(), fake.runtime)).resolves.toBe(0);
+      ], initializedRoot, fake.runtime)).resolves.toBe(0);
       expect(fake.calls).toEqual([{
         method: "approvals.decide",
         params: {
@@ -204,7 +220,7 @@ describe("thin CLI commands", () => {
         }
       : { removedWorkspaces: 0, removedBranches: 0, removedEvidenceRoots: 0 });
 
-    await expect(runCli(["cleanup", "run-1", "--yes"], process.cwd(), fake.runtime))
+    await expect(runCli(["cleanup", "run-1", "--yes"], initializedRoot, fake.runtime))
       .resolves.toBe(0);
     expect(fake.calls).toEqual([
       {
@@ -231,14 +247,14 @@ describe("thin CLI commands", () => {
 
   it("requires --yes for noninteractive cleanup and separate destructive flags", async () => {
     if (process.stdin.isTTY) return;
-    await expect(runCli(["cleanup", "run-1"], process.cwd()))
+    await expect(runCli(["cleanup", "run-1"], initializedRoot))
       .rejects.toThrow("requires --yes");
     await expect(runCli([
       "cleanup",
       "run-1",
       "--branches",
       "--evidence"
-    ], process.cwd())).rejects.toThrow("requires --yes");
+    ], initializedRoot)).rejects.toThrow("requires --yes");
   });
 
   it("initializes a valid template exclusively and never overwrites it", async () => {
@@ -317,12 +333,12 @@ describe("thin CLI commands", () => {
 
   it("requires --yes for noninteractive stop before attempting IPC", async () => {
     if (process.stdin.isTTY) return;
-    await expect(runCli(["stop"], process.cwd()))
+    await expect(runCli(["stop"], initializedRoot))
       .rejects.toThrow("requires --yes");
   });
 
   it("rejects an explicitly supplied template for non-init commands", async () => {
-    await expect(runCli(["doctor", "--template", "minimal"], process.cwd()))
+    await expect(runCli(["doctor", "--template", "minimal"], initializedRoot))
       .rejects.toThrow("valid only with init");
   });
 
@@ -351,7 +367,7 @@ describe("thin CLI commands", () => {
     const fake = fakeRuntime(() => {
       throw new Error("doctor must not connect");
     });
-    await expect(runCli(["doctor"], process.cwd(), fake.runtime))
+    await expect(runCli(["doctor"], initializedRoot, fake.runtime))
       .resolves.toBe(0);
     expect(fake.starts).toEqual([]);
     expect(fake.output.join("")).toContain("fake-agent");
@@ -384,7 +400,7 @@ describe("thin CLI commands", () => {
     };
     for (const command of ["status", "tasks", "timeline"] as const) {
       const fake = fakeRuntime((method) => responses[method]);
-      await expect(runCli([command], process.cwd(), fake.runtime))
+      await expect(runCli([command], initializedRoot, fake.runtime))
         .resolves.toBe(0);
       expect(fake.starts).toEqual([false]);
       expect(fake.closed).toEqual([1]);
@@ -433,7 +449,7 @@ describe("thin CLI commands", () => {
         expect(method).toBe(testCase.method);
         return testCase.result;
       });
-      await expect(runCli(testCase.command, process.cwd(), fake.runtime))
+      await expect(runCli(testCase.command, initializedRoot, fake.runtime))
         .resolves.toBe(0);
       expect(fake.starts).toEqual([testCase.starts]);
       expect(fake.closed).toEqual([1]);

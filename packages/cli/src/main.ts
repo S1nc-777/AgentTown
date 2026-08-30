@@ -178,7 +178,7 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
   }
   if (command === undefined || !COMMANDS.has(command)) {
     throw new Error(
-      "usage: agenttown <doctor|init|start|status|tasks|timeline|pause|resume|stop|workspaces|evidence|deliver|approvals|approve|reject|cleanup|help>"
+      "unknown command — see 'agenttown --help' for the full list"
     );
   }
   let template: TemplateName = "minimal";
@@ -373,7 +373,10 @@ async function connectOrStart(
     return await connectExisting(pipeName);
   } catch (connectError) {
     if (!startIfMissing) {
-      throw new Error("AgentTown Core is not running", { cause: connectError });
+      throw new Error(
+        "AgentTown Core is not running — run 'agenttown start' first",
+        { cause: connectError }
+      );
     }
     return (await startCore({
       projectRoot,
@@ -382,6 +385,58 @@ async function connectOrStart(
       leaseTtlMs: LEASE_TTL_MS
     })).client;
   }
+}
+
+/**
+ * Commands that need a configured company. Everything except doctor/init
+ * and the internal watcher requires `.agenttown/company.yaml`; without it
+ * the user gets a raw ENOENT, so fail with a helpful hint instead.
+ */
+const COMMANDS_REQUIRING_INIT = new Set([
+  "start",
+  "status",
+  "tasks",
+  "timeline",
+  "pause",
+  "resume",
+  "stop",
+  "workspaces",
+  "evidence",
+  "deliver",
+  "approvals",
+  "approve",
+  "reject",
+  "cleanup",
+  "watch"
+]);
+
+async function assertInitialized(projectRoot: string): Promise<void> {
+  const paths = resolveAgentTownPaths(projectRoot);
+  try {
+    await access(paths.companyPath, fsConstants.R_OK);
+  } catch {
+    throw new Error(
+      `this project is not initialized (missing ${paths.companyPath}) — run 'agenttown init' first`
+    );
+  }
+}
+
+/**
+ * Translates raw Core error messages into user-facing hints for the common
+ * lifecycle mix-ups a human is likely to hit.
+ */
+function friendlyError(error: Error): string {
+  const message = error.message;
+  if (/company is paused/u.test(message)) {
+    return "company is paused — run 'agenttown resume' to continue";
+  }
+  if (/invalid_lifecycle_state/u.test(message)) {
+    return `${message} — check 'agenttown status' or run 'agenttown resume'`;
+  }
+  if (/not initialized/u.test(message)) {
+    return message;
+  }
+  return message;
 }
 
 async function doctor(
@@ -899,6 +954,9 @@ export async function runCli(
     stdout: process.stdout,
     ...overrides
   };
+  if (COMMANDS_REQUIRING_INIT.has(parsed.command)) {
+    await assertInitialized(projectRoot);
+  }
   switch (parsed.command) {
     case "help":
       await writeWithBackpressure(runtime.stdout, USAGE);
@@ -990,7 +1048,9 @@ if (isEntrypoint()) {
       process.exitCode = code;
     },
     (error: unknown) => {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.stderr.write(
+        `${error instanceof Error ? friendlyError(error) : String(error)}\n`
+      );
       process.exitCode = 1;
     }
   );
