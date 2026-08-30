@@ -467,4 +467,33 @@ describe("thin CLI commands", () => {
     expect(fake.output.join("")).toContain("7\ttask.progress");
     expect(fake.closed).toEqual([1]);
   });
+
+  it("prints usage for --help without connecting and guards option placement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttown-cli-help-"));
+    roots.push(root);
+    const setup = fakeRuntime(() => undefined);
+
+    await expect(runCli(["--help"], root, setup.runtime)).resolves.toBe(0);
+    expect(setup.output.join("")).toContain("usage: agenttown <command>");
+
+    await expect(runCli(["help"], root, setup.runtime)).resolves.toBe(0);
+    expect(setup.output.join("")).toContain("Commands:");
+
+    expect(setup.starts).toEqual([]);
+    expect(setup.calls).toEqual([]);
+  });
+
+  it("rejects misplaced --detach and requires a pipe name for _watch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttown-cli-opts-"));
+    roots.push(root);
+    const setup = fakeRuntime(() => undefined);
+
+    await expect(
+      runCli(["status", "--detach"], root, setup.runtime)
+    ).rejects.toThrow("--detach is valid only with start");
+    await expect(
+      runCli(["_watch"], root, setup.runtime)
+    ).rejects.toThrow("_watch requires one pipe name");
+    expect(setup.starts).toEqual([]);
+  });
 });

@@ -3,12 +3,15 @@ import {
   spawn,
   type ChildProcess
 } from "node:child_process";
+import { openSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LIVE_ONLY_AFTER_SEQUENCE } from "@agenttown/runtime-contract";
 import { AgentTownClient } from "./client.js";
 import type { AgentTownPaths } from "./paths.js";
 
 const READY_TIMEOUT_MS = 10_000;
+const DETACH_READY_TIMEOUT_MS = 90_000;
 const STDERR_LIMIT_BYTES = 8 * 1024;
 
 interface ReadyLine {
@@ -84,6 +87,44 @@ export async function terminateChild(
   }
 }
 
+function coreCommandLine(input: {
+  projectRoot: string;
+  paths: AgentTownPaths;
+  pipeName: string;
+  leaseTtlMs: number;
+}): { coreMain: string; tsxImport: string; args: string[] } {
+  const coreMain = fileURLToPath(new URL("../../core/src/main.ts", import.meta.url));
+  const tsxImport = import.meta.resolve("tsx");
+  return {
+    coreMain,
+    tsxImport,
+    args: [
+      "--import",
+      tsxImport,
+      coreMain,
+      "--project-root",
+      input.projectRoot,
+      "--database",
+      input.paths.databasePath,
+      "--company",
+      input.paths.companyPath,
+      "--pipe-name",
+      input.pipeName,
+      "--lease-ttl-ms",
+      String(input.leaseTtlMs)
+    ]
+  };
+}
+
+function coreEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    AGENTTOWN_FORBID_REAL_PROBES: process.env.AGENTTOWN_FORBID_REAL_PROBES ?? "1",
+    AGENTTOWN_REAL_CODEX: process.env.AGENTTOWN_REAL_CODEX ?? "0",
+    AGENTTOWN_REAL_CLAUDE: process.env.AGENTTOWN_REAL_CLAUDE ?? "0"
+  };
+}
+
 export async function startCore(input: {
   projectRoot: string;
   paths: AgentTownPaths;
@@ -91,23 +132,8 @@ export async function startCore(input: {
   leaseTtlMs: number;
 }): Promise<{ child: ChildProcess; client: AgentTownClient }> {
   const deadlineAt = Date.now() + READY_TIMEOUT_MS;
-  const coreMain = fileURLToPath(new URL("../../core/src/main.ts", import.meta.url));
-  const tsxImport = import.meta.resolve("tsx");
-  const child = spawn(process.execPath, [
-    "--import",
-    tsxImport,
-    coreMain,
-    "--project-root",
-    input.projectRoot,
-    "--database",
-    input.paths.databasePath,
-    "--company",
-    input.paths.companyPath,
-    "--pipe-name",
-    input.pipeName,
-    "--lease-ttl-ms",
-    String(input.leaseTtlMs)
-  ], {
+  const { args } = coreCommandLine(input);
+  const child = spawn(process.execPath, args, {
     cwd: input.projectRoot,
     windowsHide: true,
     detached: true,
@@ -115,12 +141,7 @@ export async function startCore(input: {
     // Safe defaults for tests, but an operator who explicitly opts into real
     // agents (AGENTTOWN_FORBID_REAL_PROBES=0 + AGENTTOWN_REAL_*="1") must not
     // have their settings overridden — inherit them verbatim.
-    env: {
-      ...process.env,
-      AGENTTOWN_FORBID_REAL_PROBES: process.env.AGENTTOWN_FORBID_REAL_PROBES ?? "1",
-      AGENTTOWN_REAL_CODEX: process.env.AGENTTOWN_REAL_CODEX ?? "0",
-      AGENTTOWN_REAL_CLAUDE: process.env.AGENTTOWN_REAL_CLAUDE ?? "0"
-    }
+    env: coreEnv()
   });
 
   let stderrTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -202,4 +223,50 @@ export async function startCore(input: {
   } finally {
     child.stderr?.off("data", onStderr);
   }
+}
+
+/**
+ * Starts Core fully detached (`agenttown start --detach`): the process is
+ * spawned with stdout/stderr redirected to `.agenttown/core.log` and is
+ * unref'd so the CLI returns immediately. The function polls the pipe until
+ * Core becomes reachable and returns a short-lived client the caller uses
+ * to issue `company.start` before closing.
+ */
+export async function spawnCoreDetached(input: {
+  projectRoot: string;
+  paths: AgentTownPaths;
+  pipeName: string;
+  leaseTtlMs: number;
+}): Promise<AgentTownClient> {
+  const { args } = coreCommandLine(input);
+  const logFd = openSync(join(input.paths.stateDir, "core.log"), "a");
+  const child = spawn(process.execPath, args, {
+    cwd: input.projectRoot,
+    windowsHide: true,
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    env: coreEnv()
+  });
+  child.unref();
+  const deadlineAt = Date.now() + DETACH_READY_TIMEOUT_MS;
+  let lastError: unknown = new Error("Core did not become ready");
+  while (Date.now() < deadlineAt) {
+    try {
+      return await AgentTownClient.connect(
+        input.pipeName,
+        `cli-${randomUUID()}`,
+        LIVE_ONLY_AFTER_SEQUENCE,
+        2_000
+      );
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise<void>((resolvePromise) => {
+      setTimeout(resolvePromise, 1_000);
+    });
+  }
+  throw new Error(
+    `Core did not become ready within ${DETACH_READY_TIMEOUT_MS}ms (see ${join(input.paths.stateDir, "core.log")})`,
+    { cause: lastError }
+  );
 }

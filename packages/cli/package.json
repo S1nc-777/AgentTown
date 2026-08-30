@@ -3,7 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "agenttown": "dist/main.js"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "start": "tsx src/main.ts",
     "pretest": "pnpm --filter @agenttown/runtime-contract build",
     "test": "vitest run",

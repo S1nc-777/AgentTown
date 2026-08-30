@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
@@ -9,7 +9,7 @@ import {
   writeFile
 } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import {
   LIVE_ONLY_AFTER_SEQUENCE,
@@ -26,7 +26,7 @@ import {
 import type { EventRecord } from "@agenttown/core";
 import type { IpcEvent } from "@agenttown/runtime-contract";
 import { AgentTownClient } from "./client.js";
-import { startCore } from "./core-process.js";
+import { spawnCoreDetached, startCore } from "./core-process.js";
 import {
   renderApprovals,
   renderCleanupPreview,
@@ -71,13 +71,51 @@ const COMMANDS = new Set([
   "approvals",
   "approve",
   "reject",
-  "cleanup"
+  "cleanup",
+  "_watch"
 ]);
+
+const USAGE = `agenttown - AgentTown command line
+
+usage: agenttown <command> [options]
+
+Commands:
+  doctor         Check the environment (node, git, project writability)
+  init           Initialize .agenttown/company.yaml from a template
+                 (--template minimal|software-company)
+  start          Start the company and stream events; with --detach,
+                 start Core in the background and return immediately
+  status         Show company and employee status
+  tasks          List tasks
+  timeline       Show the event timeline
+  pause          Pause the company (checkpoint)
+  resume         Resume from the latest checkpoint
+  stop           Stop the company (--yes to skip confirmation)
+  workspaces     List git workspaces
+  evidence       Show evidence for a task (--revision N)
+  deliver        Show the delivery view (integration status)
+  approvals      List pending approvals
+  approve        Approve an approval id (--reason "text")
+  reject         Reject an approval id (--reason "text")
+  cleanup        Clean up a run's worktrees (run id, --yes, --branches, --evidence)
+  help           Show this help
+
+Options:
+  -h, --help     Show this help
+  --detach       With start: run Core in the background and return
+  --template     With init: template name
+  --revision     With evidence: evidence revision
+  --reason       With approve/reject: decision reason
+  --yes          With stop/cleanup: skip confirmation
+  --branches     With cleanup: also remove branch refs
+  --evidence     With cleanup: also remove evidence roots
+`;
 
 interface ParsedCommand {
   command: string;
   template: TemplateName;
   yes: boolean;
+  detach: boolean;
   positional: string[];
   revision: number | undefined;
   reason: string | undefined;
@@ -123,14 +161,28 @@ export async function writeWithBackpressure(
 
 function parseCommand(argv: readonly string[]): ParsedCommand {
   const command = argv[0];
+  if (command === "--help" || command === "-h" || command === "help") {
+    return {
+      command: "help",
+      template: "minimal",
+      yes: false,
+      detach: false,
+      positional: [],
+      revision: undefined,
+      reason: undefined,
+      removeBranches: false,
+      removeEvidence: false
+    };
+  }
   if (command === undefined || !COMMANDS.has(command)) {
     throw new Error(
-      "usage: agenttown <doctor|init|start|status|tasks|timeline|pause|resume|stop|workspaces|evidence|deliver|approvals|approve|reject|cleanup>"
+      "usage: agenttown <doctor|init|start|status|tasks|timeline|pause|resume|stop|workspaces|evidence|deliver|approvals|approve|reject|cleanup|help>"
     );
   }
   let template: TemplateName = "minimal";
   let templateSpecified = false;
   let yes = false;
+  let detach = false;
   const positional: string[] = [];
   let revision: number | undefined;
   let reason: string | undefined;
@@ -140,6 +192,10 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
     const value = argv[index];
     if (value === "--yes") {
       yes = true;
+      continue;
+    }
+    if (value === "--detach") {
+      detach = true;
       continue;
     }
     if (value === "--template") {
@@ -193,6 +249,9 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
   if (command !== "stop" && command !== "cleanup" && yes) {
     throw new Error("--yes is valid only with stop or cleanup");
   }
+  if (command !== "start" && detach) {
+    throw new Error("--detach is valid only with start");
+  }
   if (command !== "evidence" && revision !== undefined) {
     throw new Error("--revision is valid only with evidence");
   }
@@ -210,6 +269,8 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
   } else if (command === "cleanup") {
     if (positional.length !== 1) throw new Error("cleanup requires one exact run id");
     if (positional[0] === "all") throw new Error("cleanup requires an exact run id, not all");
+  } else if (command === "_watch") {
+    if (positional.length !== 1) throw new Error("_watch requires one pipe name");
   } else if (positional.length !== 0) {
     throw new Error(`${command} does not accept positional arguments`);
   }
@@ -217,6 +278,7 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
     command,
     template,
     yes,
+    detach,
     positional,
     revision,
     reason,
@@ -400,10 +462,18 @@ async function ensureExactDirectory(path: string): Promise<void> {
   }
 }
 
-async function start(projectRoot: string, runtime: CliRuntime): Promise<void> {
+async function start(
+  projectRoot: string,
+  runtime: CliRuntime,
+  detach: boolean
+): Promise<void> {
   const paths = resolveAgentTownPaths(projectRoot);
   const yaml = await readFile(paths.companyPath, "utf8");
   parseCompanyYaml(yaml);
+  if (detach) {
+    await startDetached(projectRoot, paths, runtime);
+    return;
+  }
   const client = await runtime.connectOrStart(projectRoot, true);
   await client.request("company.start", {});
   await writeWithBackpressure(runtime.stdout, "running\n");
@@ -427,6 +497,71 @@ async function start(projectRoot: string, runtime: CliRuntime): Promise<void> {
     process.off("SIGTERM", interrupt);
     await client.close();
   }
+}
+
+/**
+ * `agenttown start --detach`: starts Core in the background (logging to
+ * .agenttown/core.log), issues company.start, then spawns a detached
+ * watcher process that holds a client connection (the client heartbeats the
+ * lease automatically, so Core stays alive without a foreground terminal),
+ * and returns immediately.
+ */
+async function startDetached(
+  projectRoot: string,
+  paths: ReturnType<typeof resolveAgentTownPaths>,
+  runtime: CliRuntime
+): Promise<void> {
+  const pipeName = pipeNameForProject(projectRoot);
+  let client: AgentTownClient;
+  try {
+    client = await connectExisting(pipeName);
+  } catch {
+    client = await spawnCoreDetached({
+      projectRoot,
+      paths,
+      pipeName,
+      leaseTtlMs: LEASE_TTL_MS
+    });
+  }
+  try {
+    await client.request("company.start", {});
+  } finally {
+    await client.close();
+  }
+  // Detached watcher keeps the lease alive in the background.
+  const entry = fileURLToPath(import.meta.url);
+  const watcher = spawn(
+    process.execPath,
+    [entry, "_watch", pipeName],
+    {
+      cwd: projectRoot,
+      windowsHide: true,
+      detached: true,
+      stdio: "ignore",
+      env: process.env
+    }
+  );
+  watcher.unref();
+  await writeWithBackpressure(runtime.stdout, "running (detached)\n");
+}
+
+/**
+ * Internal background process for `start --detach`: holds a client
+ * connection (heartbeats the lease) and consumes the event stream until
+ * Core goes away.
+ */
+async function watch(pipeName: string): Promise<number> {
+  const client = await connectExisting(pipeName);
+  try {
+    for await (const _event of client.events()) {
+      // Keeping the connection alive maintains the lease; events are
+      // intentionally not printed (they remain fully queryable via
+      // `agenttown timeline`).
+    }
+  } finally {
+    await client.close();
+  }
+  return 0;
 }
 
 async function status(projectRoot: string, runtime: CliRuntime): Promise<void> {
@@ -668,13 +803,18 @@ export async function runCli(
     ...overrides
   };
   switch (parsed.command) {
+    case "help":
+      await writeWithBackpressure(runtime.stdout, USAGE);
+      return 0;
+    case "_watch":
+      return watch(requiredString(parsed.positional[0], "pipe name"));
     case "doctor":
       return doctor(projectRoot, runtime);
     case "init":
       await initialize(projectRoot, parsed.template, runtime);
       return 0;
     case "start":
-      await start(projectRoot, runtime);
+      await start(projectRoot, runtime, parsed.detach);
       return 0;
     case "status":
       await status(projectRoot, runtime);
