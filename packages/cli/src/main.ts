@@ -44,6 +44,7 @@ import {
   renderEmployee,
   renderTasks,
   renderTimeline,
+  describeEventType,
   type EmployeeStatusView
 } from "./render.js";
 import {
@@ -543,9 +544,10 @@ async function start(
   process.once("SIGTERM", interrupt);
   try {
     for await (const event of client.events()) {
+      const description = describeEventType(event.type);
       await writeWithBackpressure(
         runtime.stdout,
-        `${event.sequence}\t${event.type}\n`
+        `${event.sequence}\t${event.type}${description.length === 0 ? "" : `\t${description}`}\n`
       );
       if (interrupted) break;
     }
@@ -885,7 +887,10 @@ async function pause(projectRoot: string, runtime: CliRuntime): Promise<void> {
       "company.pause"
     );
     if (result.status !== "paused") throw new Error("Core did not confirm paused");
-    await writeWithBackpressure(runtime.stdout, "paused\n");
+    await writeWithBackpressure(
+      runtime.stdout,
+      "paused\n公司已暂停。下次继续：先运行 'agenttown start'，再运行 'agenttown resume'\n"
+    );
   } finally {
     await client.close();
   }
