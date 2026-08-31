@@ -11,6 +11,21 @@ node packages/cli/dist/main.js --help      # 直接调用（或 pnpm --filter @a
 
 安装 bin 后可直接使用 `agenttown` 命令。
 
+## 交互式 TUI
+
+在项目目录直接运行 `agenttown`（无参数）进入交互式界面（需要交互式终端）：
+
+- 顶部状态栏：公司状态 / 任务数 / 待审批 / 员工数
+- 主区视图：`Tab` 循环切换 事件流 / 任务 / 员工 / 审批
+- 底部输入框：
+  - 命令：`pause`、`resume`、`tasks`、`status`、`timeline`、`start` 等
+  - 自然语言：`让 developer-a 做登录页面`、`暂停`、`看下任务`、`?`
+  - 任务创建进入分步向导（标题 → 目标 → 负责人 → 验收标准 → 确认）
+- 快捷键：`↑↓` 输入历史、`Ctrl+C` 两次退出（不停止公司）、`Ctrl+L` 清空结果区
+- 高风险命令（approve/reject/stop/cleanup）在 TUI 内只提示，确认操作请退出后执行
+
+TUI 内执行 `start` 自动以 `--detach` 方式启动。
+
 ## 快速开始
 
 ```sh
