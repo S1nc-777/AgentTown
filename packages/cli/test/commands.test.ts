@@ -59,6 +59,17 @@ describe("dispatchInput", () => {
     }
   });
 
+  it("flags failed command results as errors", async () => {
+    const { ctx: context } = ctx();
+    const outcome = await dispatchInput("status", context);
+    expect(outcome.kind).toBe("result");
+    if (outcome.kind === "result") {
+      // not-initialized error surfaces from runCli → ok must be false
+      expect(outcome.ok).toBe(false);
+      expect(outcome.text.length).toBeGreaterThan(0);
+    }
+  });
+
   it("starts a wizard for task creation", async () => {
     const { ctx: context } = ctx();
     const outcome = await dispatchInput("让 developer-a 做登录页面", context);

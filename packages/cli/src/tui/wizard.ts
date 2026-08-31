@@ -43,7 +43,8 @@ export function wizardSubmit(view: WizardView, line: string): WizardResult {
   const value = line.trim();
   switch (view.step) {
     case "title": {
-      if (value.length === 0) {
+      const title = value.length > 0 ? value : view.preview.title;
+      if (title.length === 0) {
         return { kind: "continue", view: { ...view, error: "标题不能为空" } };
       }
       return {
@@ -52,13 +53,14 @@ export function wizardSubmit(view: WizardView, line: string): WizardResult {
           ...view,
           step: "objective",
           prompt: "任务目标（必填，一句话说明要达成的结果）：",
-          preview: { ...view.preview, title: value },
+          preview: { ...view.preview, title },
           error: null
         }
       };
     }
     case "objective": {
-      if (value.length === 0) {
+      const objective = value.length > 0 ? value : view.preview.objective;
+      if (objective.length === 0) {
         return { kind: "continue", view: { ...view, error: "目标不能为空" } };
       }
       return {
@@ -67,13 +69,13 @@ export function wizardSubmit(view: WizardView, line: string): WizardResult {
           ...view,
           step: "assignee",
           prompt: `负责人（输入编号或员工 id，留空不分配）：${view.candidates.map((candidate, index) => `${index + 1}. ${candidate}`).join(" ")}`,
-          preview: { ...view.preview, objective: value },
+          preview: { ...view.preview, objective },
           error: null
         }
       };
     }
     case "assignee": {
-      let assignee: string | null = null;
+      let assignee: string | null = view.preview.assignee;
       if (value.length > 0) {
         const number = Number(value);
         if (Number.isInteger(number) && number >= 1 && number <= view.candidates.length) {

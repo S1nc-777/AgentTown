@@ -78,9 +78,8 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
   let exitResetTimer: ReturnType<typeof setTimeout> | null = null;
   let exited = false;
 
-  const editor = createEditor();
+  let editor = createEditor();
   const parser = new KeyParser();
-  const history: string[] = [];
 
   const connect = async (): Promise<void> => {
     if (client !== null || connected) return;
@@ -130,6 +129,8 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       connected = true;
     } catch {
       connected = false;
+      await client?.close().catch(() => undefined);
+      client = null;
     }
   };
 
@@ -230,32 +231,29 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       if (wizard !== null) {
         if (key.type === "enter") {
           const outcome = wizardSubmit(wizard, editor.text);
-          editor.text = "";
-          editor.cursor = 0;
+          editor = { ...editor, text: "", cursor: 0, historyIndex: -1 };
           applyWizardOutcome(outcome);
         } else if (key.type === "escape") {
           wizard = null;
+          editor = { ...editor, text: "", cursor: 0, historyIndex: -1 };
           showResult("已取消任务创建");
         } else {
           const applied = applyEditorKey(editor, key);
-          editor.text = applied.editor.text;
-          editor.cursor = applied.editor.cursor;
+          editor = applied.editor;
         }
         continue;
       }
 
       const applied = applyEditorKey(editor, key);
-      editor.text = applied.editor.text;
-      editor.cursor = applied.editor.cursor;
+      editor = applied.editor;
 
       if (applied.effect.type === "submit") {
         const submitted = applied.effect.text;
-        editor.text = "";
-        editor.cursor = 0;
         if (submitted.trim().length > 0) {
-          history.unshift(...rememberHistory(history, submitted));
+          editor.history = rememberHistory(editor.history, submitted);
           handleSubmit(submitted);
         }
+        editor = { ...editor, text: "", cursor: 0, historyIndex: -1 };
         continue;
       }
       if (applied.effect.type === "clear-input") continue;

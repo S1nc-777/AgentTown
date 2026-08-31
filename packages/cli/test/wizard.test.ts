@@ -87,6 +87,22 @@ describe("wizardSubmit", () => {
     const result = wizardSubmit(view, "no");
     expect(result.kind).toBe("cancel");
   });
+
+  it("falls back to hint values on blank input", () => {
+    let view = startWizard(CANDIDATES, { title: "登录页面", assignee: "developer-a" });
+    view = step(view, ""); // title falls back to hint
+    expect(view.preview.title).toBe("登录页面");
+    view = step(view, "用户可以登录");
+    view = step(view, ""); // assignee keeps hint
+    expect(view.preview.assignee).toBe("developer-a");
+    view = step(view, "");
+    const result = wizardSubmit(view, "");
+    expect(result.kind).toBe("submit");
+    if (result.kind === "submit") {
+      expect(result.draft.title).toBe("登录页面");
+      expect(result.draft.assignee).toBe("developer-a");
+    }
+  });
 });
 
 function step(view: ReturnType<typeof startWizard>, line: string): ReturnType<typeof startWizard> {

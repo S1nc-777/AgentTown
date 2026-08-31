@@ -51,8 +51,8 @@ export async function dispatchInput(
       const args = intent.command === "start" && !intent.args.includes("--detach")
         ? [...intent.args, "--detach"]
         : intent.args;
-      const text = await runCliCapture(intent.command, args, ctx);
-      return { kind: "result", ok: true, text };
+      const { text, ok } = await runCliCapture(intent.command, args, ctx);
+      return { kind: "result", ok, text };
     }
     case "task-create": {
       const candidates = ctx.employees
@@ -126,7 +126,7 @@ async function runCliCapture(
   command: string,
   args: string[],
   ctx: DispatchContext
-): Promise<string> {
+): Promise<{ text: string; ok: boolean }> {
   const chunks: string[] = [];
   const stdout: BackpressureWritable = {
     write(chunk) {
@@ -138,12 +138,12 @@ async function runCliCapture(
     }
   };
   try {
-    await runCli([command, ...args], ctx.projectRoot, {
+    const code = await runCli([command, ...args], ctx.projectRoot, {
       connectOrStart: ctx.connectOrStart,
       stdout
     });
-    return chunks.join("").trim();
+    return { text: chunks.join("").trim(), ok: code === 0 };
   } catch (error) {
-    return error instanceof Error ? error.message : String(error);
+    return { text: error instanceof Error ? error.message : String(error), ok: false };
   }
 }
