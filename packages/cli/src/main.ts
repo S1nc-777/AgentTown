@@ -292,14 +292,14 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
   };
 }
 
-function record(value: unknown, label: string): Record<string, unknown> {
+export function record(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${label} returned an invalid response`);
   }
   return value as Record<string, unknown>;
 }
 
-function requiredString(value: unknown, label: string): string {
+export function requiredString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${label} must be a non-empty string`);
   }
@@ -313,7 +313,7 @@ function exactIdentifier(value: string, label: string): string {
   return value;
 }
 
-function requiredNonnegativeInteger(value: unknown, label: string): number {
+export function requiredNonnegativeInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new Error(`${label} must be a nonnegative integer`);
   }
@@ -325,7 +325,7 @@ function nullableUsageNumber(value: unknown, label: string): number | null {
   return requiredNonnegativeInteger(value, label);
 }
 
-function employeeStatus(value: unknown): EmployeeStatusView {
+export function employeeStatus(value: unknown): EmployeeStatusView {
   const employee = record(value, "status.snapshot employee");
   const usage = record(employee.usage, "status.snapshot usage");
   const currentTaskId = employee.currentTaskId;
