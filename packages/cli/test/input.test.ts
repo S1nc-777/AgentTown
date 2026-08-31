@@ -60,6 +60,17 @@ describe("applyEditorKey", () => {
     expect(result.editor.cursor).toBe(0);
   });
 
+  it("does not delete at the line start", () => {
+    let editor = createEditor();
+    editor = applyEditorKey(editor, { type: "char", value: "a" }).editor;
+    editor = applyEditorKey(editor, { type: "char", value: "b" }).editor;
+    editor = applyEditorKey(editor, { type: "home" }).editor;
+    expect(editor.cursor).toBe(0);
+    const result = applyEditorKey(editor, { type: "backspace" });
+    expect(result.editor.text).toBe("ab");
+    expect(result.editor.cursor).toBe(0);
+  });
+
   it("moves the cursor", () => {
     let editor = createEditor();
     for (const ch of "abc") {
