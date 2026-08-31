@@ -9,6 +9,7 @@ interface FakeTui {
   text: () => string;
   waitFor: (pattern: RegExp, timeoutMs?: number) => Promise<void>;
   send: (text: string) => void;
+  connectOrStart: () => Promise<CliClient>;
 }
 
 function fakeTui(respond: Record<string, unknown>): FakeTui {
@@ -41,7 +42,7 @@ function fakeTui(respond: Record<string, unknown>): FakeTui {
     throw new Error(`output did not match ${pattern}: ${JSON.stringify(output)}`);
   };
   const send = (data: string) => stdin.write(data);
-  return { stdin, stdout, text, waitFor, send };
+  return { stdin, stdout, text, waitFor, send, connectOrStart };
 }
 
 function snapshotResponse(overrides: Record<string, unknown> = {}) {
@@ -127,7 +128,7 @@ describe("runTui", () => {
     expect(exit).toBe(0);
   });
 
-  it("displays snapshot data and switches views with Tab", async () => {
+  it("renders snapshot data when connected and switches views with Tab", async () => {
     const root = await makeProject();
     const tui = fakeTui({
       "status.snapshot": snapshotResponse({ status: "running" }),
@@ -136,15 +137,18 @@ describe("runTui", () => {
       "approvals.list": []
     });
     const run = runTui(root, {
-      connectOrStart: async () => {
-        throw new Error("not connected");
-      },
+      connectOrStart: tui.connectOrStart,
       stdin: tui.stdin,
       stdout: tui.stdout
     });
-    await tui.waitFor(/○/);
+    // connected state: solid dot + real snapshot data rendered
+    await tui.waitFor(/● running/);
+    await tui.waitFor(/任务 1/);
+    await tui.waitFor(/任务已提交/);
+    // Tab switches the view (task rows come from the live client)
     tui.send("\t");
     await tui.waitFor(/2任务/);
+    await tui.waitFor(/task-1/);
     tui.send("\x03");
     tui.send("\x03");
     await run;

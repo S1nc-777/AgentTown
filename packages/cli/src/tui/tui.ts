@@ -40,6 +40,7 @@ export interface TuiRuntime {
     columns?: number;
     rows?: number;
     on?(event: "resize", listener: () => void): unknown;
+    off?(event: "resize", listener: () => void): unknown;
   };
 }
 
@@ -58,6 +59,8 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
   const leader = company.employees.find((employee) => employee.reportsTo === "owner");
   const leaderId = leader?.id ?? company.employees[0]?.id ?? "";
 
+  // TypeScript narrows this to never in the finally block below; the
+  // cast keeps the closure assignment legal (runtime value stays null).
   let client: CliClient | null = null as CliClient | null;
   let connected = false;
   let view: ViewId = "events";
@@ -174,6 +177,9 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       }).then((text) => {
         showResult(text);
         render();
+      }).catch((error: unknown) => {
+        showResult(error instanceof Error ? error.message : String(error), false);
+        render();
       });
     } else {
       wizard = null;
@@ -211,6 +217,9 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
           showResult(`没看懂「${text}」。输入 ? 查看帮助`, false);
           break;
       }
+      render();
+    }).catch((error: unknown) => {
+      showResult(error instanceof Error ? error.message : String(error), false);
       render();
     });
   };
@@ -300,7 +309,7 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
     runtime.stdin.off?.("data", onData);
     runtime.stdin.setRawMode?.(false);
     runtime.stdin.pause?.();
-    runtime.stdout.on?.("resize", onResize);
+    runtime.stdout.off?.("resize", onResize);
     runtime.stdout.write("\x1b[?25h\x1b[0m\n");
     await client?.close().catch(() => undefined);
   }
