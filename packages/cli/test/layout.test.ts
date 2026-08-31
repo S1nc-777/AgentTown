@@ -87,9 +87,17 @@ describe("renderFrame", () => {
 
   it("renders the input line with a cursor column", () => {
     const frame = renderFrame(snapshot({ input: "暂停", inputCursor: 2 }), 60, 10);
-    expect(frame.frame).toContain("> 暂停");
     // "> " 前缀宽 2，加两个中文字符宽 4 → 光标列 = 1 + 2 + 4 = 7
     expect(frame.cursorCol).toBe(7);
+    expect(frame.cursorRow).toBe(10);
+    expect(frame.frame.split("\n")[9]).toBe("> 暂停");
+  });
+
+  it("pins the input line to the bottom row even for sparse views", () => {
+    const frame = renderFrame(snapshot({ view: "tasks" }), 60, 10);
+    const lines = frame.frame.split("\n");
+    expect(lines[0]).toContain("● running");
+    expect(lines[9]).toBe("> ");
     expect(frame.cursorRow).toBe(10);
   });
 

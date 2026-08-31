@@ -74,13 +74,13 @@ export function renderFrame(snapshot: TuiSnapshot, width: number, height: number
   const viewHeight = Math.max(1, height - 1 - resultHeight - 1);
 
   const viewLines = renderView(snapshot, width, viewHeight);
-  const paddedResult = [
-    ...resultLines,
-    ...Array.from({ length: resultHeight - resultLines.length }, () => "")
-  ];
+  // Pad the view area to exactly viewHeight rows so the input line is
+  // always the bottom row and cursorRow = height stays correct even for
+  // sparse/empty views.
+  while (viewLines.length < viewHeight) viewLines.push("");
 
   const inputLine = `> ${snapshot.input}`;
-  const lines = [statusLine, ...viewLines, ...paddedResult, inputLine];
+  const lines = [statusLine, ...viewLines, ...resultLines, inputLine];
   while (lines.length < height) lines.push("");
   const frame = lines.slice(0, height).join("\n");
 
