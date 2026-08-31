@@ -1,6 +1,8 @@
+#!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
+import { realpathSync } from "node:fs";
 import {
   access,
   lstat,
@@ -1043,8 +1045,15 @@ export async function runCli(
 
 function isEntrypoint(): boolean {
   const script = process.argv[1];
-  return script !== undefined
-    && pathToFileURL(resolve(script)).href === import.meta.url;
+  if (script === undefined) return false;
+  try {
+    // resolve symlinks/junctions so the check also works when the CLI is
+    // invoked through a global npm link (argv[1] is the link path while
+    // import.meta.url is the real path Node resolved at load time).
+    return pathToFileURL(realpathSync(script)).href === import.meta.url;
+  } catch {
+    return pathToFileURL(resolve(script)).href === import.meta.url;
+  }
 }
 
 if (isEntrypoint()) {
