@@ -513,3 +513,19 @@ describe("thin CLI commands", () => {
     expect(setup.starts).toEqual([]);
   });
 });
+
+describe("tui entry", () => {
+  it("enters the TUI with no arguments but requires a TTY", async () => {
+    const fake = fakeRuntime(() => ({}));
+    const code = await runCli([], initializedRoot, fake.runtime);
+    expect(code).toBe(0);
+    expect(fake.output.join("")).toContain("interactive terminal");
+  });
+
+  it("enters the TUI via the tui command but requires a TTY", async () => {
+    const fake = fakeRuntime(() => ({}));
+    const code = await runCli(["tui"], initializedRoot, fake.runtime);
+    expect(code).toBe(0);
+    expect(fake.output.join("")).toContain("interactive terminal");
+  });
+});

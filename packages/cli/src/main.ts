@@ -55,12 +55,14 @@ import {
   templateYaml,
   type TemplateName
 } from "./templates.js";
+import { runTui } from "./tui/tui.js";
 
 const COMPANY_ID = "company";
 const LEASE_TTL_MS = 15_000;
 const COMMANDS = new Set([
   "doctor",
   "init",
+  "tui",
   "start",
   "status",
   "tasks",
@@ -82,6 +84,7 @@ const COMMANDS = new Set([
 const USAGE = `agenttown - AgentTown command line
 
 usage: agenttown <command> [options]
+       (no command)     Enter the interactive TUI
 
 Commands:
   doctor         Check the environment (node, git, project writability)
@@ -103,6 +106,7 @@ Commands:
   reject         Reject an approval id (--reason "text")
   cleanup        Clean up a run's worktrees (run id, --yes, --branches, --evidence)
   watch          Live terminal dashboard (company/tasks/employees/events, q to quit)
+  tui            Enter the interactive TUI (default when run with no command)
   help           Show this help
 
 Options:
@@ -179,7 +183,20 @@ function parseCommand(argv: readonly string[]): ParsedCommand {
       removeEvidence: false
     };
   }
-  if (command === undefined || !COMMANDS.has(command)) {
+  if (command === undefined) {
+    return {
+      command: "tui",
+      template: "minimal",
+      yes: false,
+      detach: false,
+      positional: [],
+      revision: undefined,
+      reason: undefined,
+      removeBranches: false,
+      removeEvidence: false
+    };
+  }
+  if (!COMMANDS.has(command)) {
     throw new Error(
       "unknown command — see 'agenttown --help' for the full list"
     );
@@ -968,6 +985,20 @@ export async function runCli(
     case "help":
       await writeWithBackpressure(runtime.stdout, USAGE);
       return 0;
+    case "tui": {
+      if ((runtime.stdout as { isTTY?: boolean }).isTTY !== true) {
+        await writeWithBackpressure(
+          runtime.stdout,
+          "agenttown TUI requires an interactive terminal — run 'agenttown --help' for the command list\n"
+        );
+        return 0;
+      }
+      return runTui(projectRoot, {
+        connectOrStart: runtime.connectOrStart,
+        stdin: process.stdin,
+        stdout: process.stdout
+      });
+    }
     case "_watch":
       return watch(requiredString(parsed.positional[0], "pipe name"));
     case "doctor":
