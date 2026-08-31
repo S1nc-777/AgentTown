@@ -1,0 +1,163 @@
+import type { EventRecord } from "@agenttown/core";
+import type { ApprovalView, TaskRecord } from "@agenttown/runtime-contract";
+import { describeEventType, type EmployeeStatusView } from "../render.js";
+import type { WizardView } from "./wizard.js";
+
+export type ViewId = "events" | "tasks" | "employees" | "approvals";
+
+export interface TuiSnapshot {
+  status: string;
+  activeTaskCount: number;
+  pendingApprovalCount: number;
+  employeeCount: number;
+  view: ViewId;
+  events: readonly EventRecord[];
+  tasks: readonly TaskRecord[];
+  employees: readonly EmployeeStatusView[];
+  approvals: readonly ApprovalView[];
+  result: { kind: "ok" | "error"; text: string } | null;
+  input: string;
+  inputCursor: number;
+  wizard: WizardView | null;
+  helpVisible: boolean;
+  connected: boolean;
+}
+
+export interface RenderFrame {
+  frame: string;
+  cursorRow: number;
+  cursorCol: number;
+}
+
+const WIDE = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/u;
+
+export function visualWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) {
+    width += WIDE.test(ch) ? 2 : 1;
+  }
+  return width;
+}
+
+export function truncate(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (visualWidth(text) <= width) return text;
+  let out = "";
+  let used = 0;
+  for (const ch of text) {
+    const chWidth = WIDE.test(ch) ? 2 : 1;
+    if (used + chWidth > width - 1) break;
+    out += ch;
+    used += chWidth;
+  }
+  return `${out}…`;
+}
+
+const VIEW_LABELS: Record<ViewId, string> = {
+  events: "1事件",
+  tasks: "2任务",
+  employees: "3员工",
+  approvals: "4审批"
+};
+
+const RESULT_HEIGHT = 3;
+
+export function renderFrame(snapshot: TuiSnapshot, width: number, height: number): RenderFrame {
+  const dot = snapshot.connected ? "●" : "○";
+  const statusLine = truncate(
+    `${dot} ${snapshot.status} │ 任务 ${snapshot.activeTaskCount} │ 待审批 ${snapshot.pendingApprovalCount} │ 员工 ${snapshot.employeeCount} │ ${VIEW_LABELS[snapshot.view]}`,
+    width
+  );
+
+  const resultLines = buildResultLines(snapshot, width);
+  const resultHeight = Math.min(RESULT_HEIGHT, resultLines.length);
+  const viewHeight = Math.max(1, height - 1 - resultHeight - 1);
+
+  const viewLines = renderView(snapshot, width, viewHeight);
+  const paddedResult = [
+    ...resultLines,
+    ...Array.from({ length: resultHeight - resultLines.length }, () => "")
+  ];
+
+  const inputLine = `> ${snapshot.input}`;
+  const lines = [statusLine, ...viewLines, ...paddedResult, inputLine];
+  while (lines.length < height) lines.push("");
+  const frame = lines.slice(0, height).join("\n");
+
+  const cursorCol = 1 + visualWidth(`> ${snapshot.input.slice(0, snapshot.inputCursor)}`);
+  const cursorRow = height; // input line is the last row
+  return { frame, cursorRow, cursorCol };
+}
+
+function buildResultLines(snapshot: TuiSnapshot, width: number): string[] {
+  if (snapshot.wizard !== null) {
+    const { wizard } = snapshot;
+    const preview = wizard.preview;
+    return [
+      truncate(`▶ 向导：${wizard.prompt}`, width),
+      truncate(
+        `  标题：${preview.title || "—"} │ 目标：${preview.objective || "—"} │ 负责人：${preview.assignee ?? "—"}`,
+        width
+      ),
+      ...(wizard.error !== null
+        ? [truncate(`  ⚠ ${wizard.error}`, width)]
+        : [truncate(`  候选：${wizard.candidates.join(" / ") || "（无）"}`, width)])
+    ];
+  }
+  if (snapshot.helpVisible) {
+    return [
+      truncate("快捷键：Tab 切换视图 │ ↑↓ 历史 │ Ctrl+C 退出（两次）│ Ctrl+L 清空结果", width),
+      truncate("命令：start status tasks timeline pause resume workspaces evidence deliver approvals", width),
+      truncate("自然语言：让 张三 做 登录页面 │ 暂停 │ 看下任务 │ 输入 ? 隐藏帮助", width)
+    ];
+  }
+  if (snapshot.result !== null) {
+    const prefix = snapshot.result.kind === "ok" ? "✔" : "✘";
+    return [truncate(`${prefix} ${snapshot.result.text}`, width)];
+  }
+  return [];
+}
+
+function renderView(snapshot: TuiSnapshot, width: number, height: number): string[] {
+  switch (snapshot.view) {
+    case "events": {
+      const rows = [...snapshot.events]
+        .sort((left, right) => left.sequence - right.sequence)
+        .slice(-height);
+      if (rows.length === 0) return [truncate("（暂无事件）", width)];
+      return rows.map((event) => {
+        const time = event.occurredAt.length >= 19
+          ? event.occurredAt.slice(11, 19)
+          : event.occurredAt;
+        const description = describeEventType(event.type) || event.type;
+        const detail = JSON.stringify(event.payload ?? {});
+        const suffix = detail === "{}" ? "" : ` ${detail}`;
+        return truncate(`${time} ${description}${suffix} ${event.actorId}`, width);
+      });
+    }
+    case "tasks": {
+      const rows = [...snapshot.tasks]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .slice(0, height);
+      if (rows.length === 0) return [truncate("（暂无任务）", width)];
+      return rows.map((task) =>
+        truncate(`${task.id} ${task.status} ${task.ownerEmployeeId ?? "-"} ${task.title}`, width));
+    }
+    case "employees": {
+      if (snapshot.employees.length === 0) return [truncate("（暂无员工）", width)];
+      return snapshot.employees.slice(0, height).map((employee) =>
+        truncate(
+          `${employee.id} (${employee.role}) ${employee.status} task=${employee.currentTaskId ?? "-"}`,
+          width
+        ));
+    }
+    case "approvals": {
+      if (snapshot.approvals.length === 0) return [truncate("（暂无待审批）", width)];
+      return snapshot.approvals.slice(0, height).map((approval) =>
+        truncate(
+          `${approval.approvalId} ${approval.taskId} ${approval.requestingEmployeeId} ${approval.reason}`,
+          width
+        ));
+    }
+  }
+}
