@@ -11,6 +11,7 @@ import {
   type CliClient
 } from "../main.js";
 import type { EmployeeStatusView } from "../render.js";
+import { describeEventType } from "../render.js";
 import { dispatchInput, submitWizardDraft, type DispatchContext } from "./commands.js";
 import {
   applyEditorKey,
@@ -18,13 +19,43 @@ import {
   KeyParser,
   rememberHistory
 } from "./input.js";
-import { renderFrame, type TuiSnapshot, type ViewId } from "./layout.js";
+import {
+  renderFrame,
+  type ChatMessage,
+  type TuiSnapshot,
+  type ViewId
+} from "./layout.js";
 import { wizardSubmit, type WizardView } from "./wizard.js";
 
 const REFRESH_MS = 1000;
 const EVENT_LIMIT = 50;
 const EXIT_CONFIRM_RESET_MS = 5000;
-const VIEW_ORDER: ViewId[] = ["events", "tasks", "employees", "approvals"];
+const MAX_CHAT_MESSAGES = 200;
+const VIEW_ORDER: ViewId[] = ["chat", "events", "tasks", "employees", "approvals"];
+
+/**
+ * Event types that matter to a human watching the company work; they are
+ * surfaced in the chat view as brief lines (the events view keeps the full
+ * firehose).
+ */
+const CHAT_WORTHY_EVENTS = new Set([
+  "company.started",
+  "company.paused",
+  "company.resumed",
+  "company.stopped",
+  "task.created",
+  "task.assigned",
+  "task.submitted",
+  "task.review_requested",
+  "task.review_approved",
+  "task.review_rejected",
+  "task.completed",
+  "task.failed",
+  "task.blocked",
+  "git.integration.committed",
+  "git.integration.conflicted",
+  "user.approval.requested"
+]);
 
 export interface TuiRuntime {
   connectOrStart(root: string, startIfMissing: boolean): Promise<CliClient>;
@@ -63,11 +94,20 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
   // cast keeps the closure assignment legal (runtime value stays null).
   let client: CliClient | null = null as CliClient | null;
   let connected = false;
-  let view: ViewId = "events";
+  let view: ViewId = "chat";
+  const chat: ChatMessage[] = [];
+  let lastChatEventSequence: number | null = null;
   let events: EventRecord[] = [];
   let tasks: TaskRecord[] = [];
   let approvals: ApprovalView[] = [];
   let employees: EmployeeStatusView[] = [];
+
+  const pushChat = (kind: ChatMessage["kind"], text: string): void => {
+    chat.push({ kind, text });
+    if (chat.length > MAX_CHAT_MESSAGES) {
+      chat.splice(0, chat.length - MAX_CHAT_MESSAGES);
+    }
+  };
   let status = "unknown";
   let activeTaskCount = 0;
   let pendingApprovalCount = 0;
@@ -122,6 +162,28 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
         afterSequence: 0,
         limit: EVENT_LIMIT
       })) as EventRecord[];
+      // Surface newly-arrived key events in the chat view. The first pull
+      // seeds the high-water mark without replaying history.
+      if (lastChatEventSequence === null) {
+        lastChatEventSequence = events.reduce(
+          (max, event) => Math.max(max, event.sequence),
+          0
+        );
+      } else {
+        for (const event of events) {
+          if (
+            event.sequence > lastChatEventSequence
+            && CHAT_WORTHY_EVENTS.has(event.type)
+          ) {
+            const description = describeEventType(event.type) || event.type;
+            pushChat("event", `${description} ${event.actorId}${event.taskId === null ? "" : ` ${event.taskId}`}`);
+          }
+        }
+        lastChatEventSequence = events.reduce(
+          (max, event) => Math.max(max, event.sequence),
+          lastChatEventSequence
+        );
+      }
       try {
         approvals = (await client.request("approvals.list", {})) as ApprovalView[];
       } catch {
@@ -146,6 +208,7 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       pendingApprovalCount,
       employeeCount: employees.length,
       view,
+      chat,
       events,
       tasks,
       employees,
@@ -168,8 +231,10 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       || painted.width !== width
       || painted.height !== height
     ) {
-      // First paint or resize: clear once, draw everything.
-      runtime.stdout.write(`\x1b[2J\x1b[H\x1b[?25l${frame}\n${placeCursor}`);
+      // First paint or resize: clear the screen AND the scrollback once,
+      // then draw everything. No trailing newline — writing exactly
+      // `height` rows must not push the terminal into scrolling.
+      runtime.stdout.write(`\x1b[2J\x1b[3J\x1b[H\x1b[?25l${frame}${placeCursor}`);
       painted = { lines, width, height };
       lastCursor = placeCursor;
       return;
@@ -207,19 +272,25 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
         employees: company.employees,
         leaderId
       }).then((text) => {
+        pushChat("system", `✔ ${text}`);
         showResult(text);
         render();
       }).catch((error: unknown) => {
-        showResult(error instanceof Error ? error.message : String(error), false);
+        const message = error instanceof Error ? error.message : String(error);
+        pushChat("system", `✘ ${message}`);
+        showResult(message, false);
         render();
       });
     } else {
       wizard = null;
+      pushChat("system", "已取消任务创建");
       showResult("已取消任务创建");
     }
   };
 
   const handleSubmit = (text: string): void => {
+    const trimmed = text.trim();
+    pushChat("user", trimmed);
     const ctx: DispatchContext = {
       projectRoot,
       connectOrStart: runtime.connectOrStart,
@@ -229,10 +300,12 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
     void dispatchInput(text, ctx).then((outcome) => {
       switch (outcome.kind) {
         case "result":
+          pushChat("system", `${outcome.ok ? "✔ " : "✘ "}${outcome.text}`);
           showResult(outcome.text, outcome.ok);
           break;
         case "view":
           view = outcome.view;
+          pushChat("system", `✔ 已切换到${viewLabel(outcome.view)}视图`);
           result = null;
           helpVisible = false;
           break;
@@ -246,15 +319,28 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
           result = null;
           break;
         case "unknown":
-          showResult(`没看懂「${text}」。输入 ? 查看帮助`, false);
+          pushChat("system", `✘ 没看懂「${trimmed}」。输入 ? 查看帮助`);
+          showResult(`没看懂「${trimmed}」。输入 ? 查看帮助`, false);
           break;
       }
       render();
     }).catch((error: unknown) => {
-      showResult(error instanceof Error ? error.message : String(error), false);
+      const message = error instanceof Error ? error.message : String(error);
+      pushChat("system", `✘ ${message}`);
+      showResult(message, false);
       render();
     });
   };
+
+  function viewLabel(id: ViewId): string {
+    switch (id) {
+      case "chat": return "对话";
+      case "events": return "事件";
+      case "tasks": return "任务";
+      case "employees": return "员工";
+      case "approvals": return "审批";
+    }
+  }
 
   const onData = (chunk: Buffer | string): void => {
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");

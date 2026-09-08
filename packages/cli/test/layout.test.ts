@@ -13,6 +13,7 @@ function snapshot(overrides: Partial<TuiSnapshot> = {}): TuiSnapshot {
     pendingApprovalCount: 1,
     employeeCount: 3,
     view: "events",
+    chat: [],
     events: [],
     tasks: [],
     employees: [],
@@ -133,6 +134,26 @@ describe("renderFrame", () => {
   it("guides task creation when connected with no events", () => {
     const frame = renderFrame(snapshot({ connected: true }), 60, 10).frame;
     expect(frame).toContain("（暂无事件）");
+    expect(frame).toContain("让 developer-a 做 登录页面");
+  });
+
+  it("renders chat messages with kind prefixes", () => {
+    const frame = renderFrame(snapshot({
+      view: "chat",
+      chat: [
+        { kind: "user", text: "暂停" },
+        { kind: "system", text: "✔ 公司已暂停" },
+        { kind: "event", text: "任务已完成 task-1" }
+      ]
+    }), 60, 10).frame;
+    expect(frame).toContain("❯ 暂停");
+    expect(frame).toContain("✔ 公司已暂停");
+    expect(frame).toContain("· 任务已完成 task-1");
+  });
+
+  it("guides chat usage when there is no conversation yet", () => {
+    const frame = renderFrame(snapshot({ view: "chat", connected: true }), 60, 10).frame;
+    expect(frame).toContain("还没有对话");
     expect(frame).toContain("让 developer-a 做 登录页面");
   });
 });

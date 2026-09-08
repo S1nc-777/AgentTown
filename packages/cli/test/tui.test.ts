@@ -141,13 +141,18 @@ describe("runTui", () => {
       stdin: tui.stdin,
       stdout: tui.stdout
     });
-    // connected state: solid dot + real snapshot data rendered
+    // connected state: solid dot + real snapshot data on the status bar
     await tui.waitFor(/● running/);
     await tui.waitFor(/任务 1/);
-    await tui.waitFor(/任务已提交/);
-    // Tab switches the view (task rows come from the live client)
+    // the default view is the chat with usage guidance
+    await tui.waitFor(/还没有对话/);
+    // Tab: chat → events (event rows come from the live client)
     tui.send("\t");
-    await tui.waitFor(/2任务/);
+    await tui.waitFor(/2事件/);
+    await tui.waitFor(/任务已提交/);
+    // Tab: events → tasks
+    tui.send("\t");
+    await tui.waitFor(/3任务/);
     await tui.waitFor(/task-1/);
     // A static screen must not repaint: no new output while nothing changes
     // (the 1s refresh tick runs during this window).
@@ -176,6 +181,8 @@ describe("runTui", () => {
     });
     await tui.waitFor(/○/);
     tui.send("status\r");
+    // the user line lands in the chat view, the error lands in result + chat
+    await tui.waitFor(/❯ status/);
     await tui.waitFor(/AgentTown Core is not running/);
     tui.send("\x03");
     tui.send("\x03");

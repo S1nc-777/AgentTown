@@ -3,7 +3,12 @@ import type { ApprovalView, TaskRecord } from "@agenttown/runtime-contract";
 import { describeEventType, type EmployeeStatusView } from "../render.js";
 import type { WizardView } from "./wizard.js";
 
-export type ViewId = "events" | "tasks" | "employees" | "approvals";
+export type ViewId = "chat" | "events" | "tasks" | "employees" | "approvals";
+
+export interface ChatMessage {
+  kind: "user" | "system" | "event";
+  text: string;
+}
 
 export interface TuiSnapshot {
   status: string;
@@ -11,6 +16,7 @@ export interface TuiSnapshot {
   pendingApprovalCount: number;
   employeeCount: number;
   view: ViewId;
+  chat: readonly ChatMessage[];
   events: readonly EventRecord[];
   tasks: readonly TaskRecord[];
   employees: readonly EmployeeStatusView[];
@@ -54,10 +60,11 @@ export function truncate(text: string, width: number): string {
 }
 
 const VIEW_LABELS: Record<ViewId, string> = {
-  events: "1事件",
-  tasks: "2任务",
-  employees: "3员工",
-  approvals: "4审批"
+  chat: "1对话",
+  events: "2事件",
+  tasks: "3任务",
+  employees: "4员工",
+  approvals: "5审批"
 };
 
 const RESULT_HEIGHT = 3;
@@ -120,6 +127,27 @@ function buildResultLines(snapshot: TuiSnapshot, width: number): string[] {
 
 function renderView(snapshot: TuiSnapshot, width: number, height: number): string[] {
   switch (snapshot.view) {
+    case "chat": {
+      if (snapshot.chat.length === 0) {
+        return snapshot.connected
+          ? [
+              truncate("（还没有对话）", width),
+              "",
+              truncate("在下方输入指令，例如：", width),
+              truncate("  暂停 │ 看下任务 │ 让 developer-a 做 登录页面", width),
+              truncate("  输入 ? 查看全部命令", width)
+            ]
+          : notRunningLines(width);
+      }
+      const rows = snapshot.chat.slice(-height);
+      return rows.map((message) => {
+        // system texts already carry their own ✔/✘ prefix from the caller.
+        const prefix = message.kind === "user" ? "❯ "
+          : message.kind === "event" ? "· "
+          : "";
+        return truncate(prefix + message.text, width);
+      });
+    }
     case "events": {
       const rows = [...snapshot.events]
         .sort((left, right) => left.sequence - right.sequence)
