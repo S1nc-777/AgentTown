@@ -252,7 +252,9 @@ describe("core startup scenarios for real-agent leaders", () => {
 
   it("keeps fake employees on fixture scenarios without mission text", () => {
     const scenarios = coreStartupScenarios(parseCompanyYaml(fakeCompany));
-    expect(scenarios.leader).toBe("idle");
+    // fake leader uses the lead-assign script: quiet until an external task
+    // appears, then assigns it to a developer (no mission text involved).
+    expect(scenarios.leader).toBe("lead-assign");
     expect(scenarios.reviewer).toBe("review-approve");
     expect(Object.values(scenarios).some((scenario) =>
       scenario.includes("Mission:")

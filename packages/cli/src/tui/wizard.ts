@@ -1,18 +1,16 @@
 export interface WizardDraft {
   title: string;
   objective: string;
-  assignee: string | null;
   acceptanceCriteria: string[];
 }
 
-export type WizardStep = "title" | "objective" | "assignee" | "acceptance" | "confirm";
+export type WizardStep = "title" | "objective" | "acceptance" | "confirm";
 
 export interface WizardView {
   step: WizardStep;
   /** Single-line prompt shown above the input line. */
   prompt: string;
   preview: WizardDraft;
-  candidates: readonly string[];
   error: string | null;
 }
 
@@ -21,20 +19,21 @@ export type WizardResult =
   | { kind: "submit"; draft: WizardDraft }
   | { kind: "cancel" };
 
-export function startWizard(
-  candidates: readonly string[],
-  hint: Partial<WizardDraft> = {}
-): WizardView {
+/**
+ * The wizard collects ONLY what the user must decide (title / objective /
+ * acceptance criteria). Assignment is deliberately NOT asked: a task the
+ * user drops on the company is handed to the leader, who picks the
+ * developer (the leader drive nudges the leader to assign new tasks).
+ */
+export function startWizard(hint: Partial<WizardDraft> = {}): WizardView {
   return {
     step: "title",
     prompt: "任务标题（必填）：",
     preview: {
       title: hint.title ?? "",
       objective: hint.objective ?? "",
-      assignee: hint.assignee ?? null,
       acceptanceCriteria: []
     },
-    candidates,
     error: null
   };
 }
@@ -67,35 +66,9 @@ export function wizardSubmit(view: WizardView, line: string): WizardResult {
         kind: "continue",
         view: {
           ...view,
-          step: "assignee",
-          prompt: `负责人（输入编号或员工 id，留空不分配）：${view.candidates.map((candidate, index) => `${index + 1}. ${candidate}`).join(" ")}`,
-          preview: { ...view.preview, objective },
-          error: null
-        }
-      };
-    }
-    case "assignee": {
-      let assignee: string | null = view.preview.assignee;
-      if (value.length > 0) {
-        const number = Number(value);
-        if (Number.isInteger(number) && number >= 1 && number <= view.candidates.length) {
-          assignee = view.candidates[number - 1] ?? null;
-        } else if (view.candidates.includes(value)) {
-          assignee = value;
-        } else {
-          return {
-            kind: "continue",
-            view: { ...view, error: `未知负责人：${value}（输入编号或员工 id）` }
-          };
-        }
-      }
-      return {
-        kind: "continue",
-        view: {
-          ...view,
           step: "acceptance",
           prompt: "验收标准（逗号分隔，可留空）：",
-          preview: { ...view.preview, assignee },
+          preview: { ...view.preview, objective },
           error: null
         }
       };
@@ -109,7 +82,7 @@ export function wizardSubmit(view: WizardView, line: string): WizardResult {
         view: {
           ...view,
           step: "confirm",
-          prompt: "回车确认创建任务，输入 no 取消：",
+          prompt: "回车确认创建任务（由 leader 分配开发），输入 no 取消：",
           preview: { ...view.preview, acceptanceCriteria: criteria },
           error: null
         }

@@ -184,6 +184,32 @@ if (scenario === "crash") {
       return;
     }
 
+    if (scenario === "lead-assign") {
+      // Deterministic leader that reacts to externally proposed tasks: when a
+      // drive message announces an unassigned task it assigns it to the
+      // developer named in the message (real-agent leaders read the same
+      // text). Anything else is ignored so the leader stays quiet until work
+      // actually arrives.
+      const text = line.text ?? "";
+      const taskMatch = /Task (task-[\w-]+) has been created/u.exec(text);
+      const assigneeMatch = /assignee "([\w-]+)"/u.exec(text);
+      if (taskMatch !== null && assigneeMatch !== null) {
+        emit({ type: "output.completed", text: `leader:assign:${taskMatch[1]}` });
+        emitAction(
+          line,
+          "task.assign",
+          { assignee: assigneeMatch[1]! },
+          "leader assigned the externally proposed task",
+          taskMatch[1]!
+        );
+        emitUsage();
+        return;
+      }
+      emit({ type: "output.completed", text: `leader:${taskLabel(line)}` });
+      emitUsage();
+      return;
+    }
+
     if (scenario === "idle") {
       emit({ type: "output.completed", text: `idle:${taskLabel(line)}` });
       emitUsage();

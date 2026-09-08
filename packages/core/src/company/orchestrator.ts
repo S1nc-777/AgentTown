@@ -610,9 +610,17 @@ export class CompanyOrchestrator {
     let text: string;
     if (unassigned !== undefined) {
       taskId = unassigned.id;
+      const developers = this.company.employees
+        .filter((employee) => employee.workspace === "git_worktree")
+        .map((employee) => employee.id);
+      const who = developers.length === 0
+        ? "there is no git_worktree developer to assign it to"
+        : developers.length === 1
+          ? `emit a task.assign action with assignee "${developers[0]}"`
+          : `emit a task.assign action; pick the assignee from: ${developers.map((id) => `"${id}"`).join(", ")}`;
       text = [
-        `Task ${unassigned.id} has been created.`,
-        `Assign it to a developer by emitting a task.assign action with assignee "developer-a" or "developer-b".`
+        `Task ${unassigned.id} has been created and needs a developer.`,
+        `Assign it by emitting a task.assign action with the task id ${unassigned.id}; ${who}.`
       ].join("\n");
     } else if (allTerminal) {
       taskId = createdTaskId;

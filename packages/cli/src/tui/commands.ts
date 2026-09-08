@@ -53,17 +53,11 @@ export async function dispatchInput(
       return { kind: "result", ok, text };
     }
     case "task-create": {
-      const candidates = ctx.employees
-        .filter((employee) => employee.workspace === "git_worktree")
-        .map((employee) => employee.id);
-      // No explicit assignee → default to the first developer so a task the
-      // user drops on the company actually gets picked up (a draft task has
-      // no one to run it until a leader assigns it).
-      const assignee = intent.assignee ?? (candidates.length > 0 ? candidates[0]! : null);
+      // The wizard does not ask for an assignee: the task is handed to the
+      // leader drive, which assigns it to a developer.
       return {
         kind: "wizard",
-        view: startWizard(candidates, {
-          assignee,
+        view: startWizard({
           title: intent.title,
           ...(intent.objective === null ? {} : { objective: intent.objective })
         })
@@ -104,22 +98,37 @@ export async function submitWizardDraft(
       reason: "created by user from the TUI wizard",
       causationEventId: null
     };
+    // Assignment strategy:
+    // - All-fake companies have no autonomous leader (leader driving is only
+    //   enabled for real-agent companies), so the user's request is assigned
+    //   directly to the first git_worktree developer here.
+    // - Companies with a real-agent leader get a propose only; the core wakes
+    //   the leader drive, and the leader picks the developer itself.
     await client.request("action.dispatch", { action: proposal });
-    if (draft.assignee !== null) {
-      await client.request("action.dispatch", {
-        action: {
-          schemaVersion: 1 as const,
-          actionId: randomUUID(),
-          type: "task.assign" as const,
-          actorEmployeeId: ctx.leaderId,
-          taskId,
-          payload: { assignee: draft.assignee },
-          reason: "assigned by user from the TUI wizard",
-          causationEventId: null
-        }
-      });
+    const leaderIsFake = ctx.employees.find((employee) => employee.id === ctx.leaderId)?.agent === "fake";
+    const hasRealAgents = ctx.employees.some((employee) => employee.agent !== "fake");
+    if (leaderIsFake && !hasRealAgents) {
+      const developers = ctx.employees
+        .filter((employee) => employee.workspace === "git_worktree")
+        .map((employee) => employee.id);
+      const assignee = developers.length > 0 ? developers[0]! : null;
+      if (assignee !== null) {
+        await client.request("action.dispatch", {
+          action: {
+            schemaVersion: 1 as const,
+            actionId: randomUUID(),
+            type: "task.assign" as const,
+            actorEmployeeId: ctx.leaderId,
+            taskId,
+            payload: { assignee },
+            reason: "fake-company auto assignment for a user request",
+            causationEventId: null
+          }
+        });
+        return `任务已创建：${taskId}（${draft.title}），已分配给 ${assignee}`;
+      }
     }
-    return `任务已创建：${taskId}${draft.assignee !== null ? ` → ${draft.assignee}` : ""}（${draft.title}）`;
+    return `任务已创建：${taskId}（${draft.title}），等待 leader 分配开发`;
   } catch (error) {
     return `创建任务失败：${error instanceof Error ? error.message : String(error)}`;
   } finally {

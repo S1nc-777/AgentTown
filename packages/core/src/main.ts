@@ -142,7 +142,9 @@ export function coreStartupScenarios(
         ? "review-approve"
         : employee.role === "developer"
           ? "complete"
-          : "idle"
+          : employee.role === "product_lead"
+            ? "lead-assign"
+            : "idle"
     ];
   }));
 }

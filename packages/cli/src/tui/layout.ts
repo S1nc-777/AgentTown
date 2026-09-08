@@ -103,19 +103,19 @@ function buildResultLines(snapshot: TuiSnapshot, width: number): string[] {
     return [
       truncate(`▶ 向导：${wizard.prompt}`, width),
       truncate(
-        `  标题：${preview.title || "—"} │ 目标：${preview.objective || "—"} │ 负责人：${preview.assignee ?? "—"}`,
+        `  标题：${preview.title || "—"} │ 目标：${preview.objective || "—"}`,
         width
       ),
       ...(wizard.error !== null
         ? [truncate(`  ⚠ ${wizard.error}`, width)]
-        : [truncate(`  候选：${wizard.candidates.join(" / ") || "（无）"}`, width)])
+        : [truncate("  确认后任务交给 leader 分配开发，回车继续", width)])
     ];
   }
   if (snapshot.helpVisible) {
     return [
       truncate("快捷键：Tab 切换视图 │ ↑↓ 历史 │ Ctrl+C 退出（两次）│ Ctrl+L 清空结果", width),
-      truncate("命令：start status tasks timeline pause resume workspaces evidence deliver approvals", width),
-      truncate("自然语言：让 张三 做 登录页面 │ 暂停 │ 看下任务 │ 输入 ? 隐藏帮助", width)
+      truncate("直接说需求即可，例如：帮我写一个使用说明文档 │ 暂停 │ 公司现在怎么样", width),
+      truncate("命令：start status tasks pause resume stop timeline │ ? 隐藏帮助", width)
     ];
   }
   if (snapshot.result !== null) {
@@ -133,8 +133,8 @@ function renderView(snapshot: TuiSnapshot, width: number, height: number): strin
           ? [
               truncate("（还没有对话）", width),
               "",
-              truncate("在下方输入指令，例如：", width),
-              truncate("  暂停 │ 看下任务 │ 让 developer-a 做 登录页面", width),
+              truncate("直接说需求，例如：", width),
+              truncate("  帮我写一个使用说明文档，保存在当前目录", width),
               truncate("  输入 ? 查看全部命令", width)
             ]
           : notRunningLines(width);
@@ -157,8 +157,8 @@ function renderView(snapshot: TuiSnapshot, width: number, height: number): strin
           ? [
               truncate("（暂无事件）", width),
               "",
-              truncate("公司已运行，还没有活动。试试：", width),
-              truncate("  让 developer-a 做 登录页面    来创建第一个任务", width),
+              truncate("公司已运行，还没有活动。直接说需求：", width),
+              truncate("  帮我写一个使用说明文档    任务会由 leader 分配开发", width),
               truncate("  输入 ? 查看全部命令", width)
             ]
           : notRunningLines(width);

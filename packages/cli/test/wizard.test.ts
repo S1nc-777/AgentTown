@@ -1,35 +1,30 @@
 import { describe, expect, it } from "vitest";
 import { startWizard, wizardSubmit } from "../src/tui/wizard.js";
 
-const CANDIDATES = ["developer-a", "developer-b"];
-
 describe("startWizard", () => {
   it("starts at the title step with hints applied", () => {
-    const view = startWizard(CANDIDATES, { assignee: "developer-a", title: "登录页面" });
+    const view = startWizard({ title: "登录页面", objective: "用户可以登录" });
     expect(view.step).toBe("title");
     expect(view.preview.title).toBe("登录页面");
-    expect(view.preview.assignee).toBe("developer-a");
+    expect(view.preview.objective).toBe("用户可以登录");
     expect(view.error).toBeNull();
   });
 });
 
 describe("wizardSubmit", () => {
   it("requires a non-empty title", () => {
-    const view = startWizard(CANDIDATES);
+    const view = startWizard();
     const result = wizardSubmit(view, "   ");
     expect(result.kind).toBe("continue");
     if (result.kind === "continue") expect(result.view.error).toBe("标题不能为空");
   });
 
   it("walks through all steps and submits", () => {
-    let view = startWizard(CANDIDATES);
+    let view = startWizard();
     view = step(view, "登录页面");
     expect(view.step).toBe("objective");
     view = step(view, "用户可以登录");
-    expect(view.step).toBe("assignee");
-    view = step(view, "1");
     expect(view.step).toBe("acceptance");
-    expect(view.preview.assignee).toBe("developer-a");
     view = step(view, "表单校验, 会话保持");
     expect(view.step).toBe("confirm");
     expect(view.preview.acceptanceCriteria).toEqual(["表单校验", "会话保持"]);
@@ -39,68 +34,45 @@ describe("wizardSubmit", () => {
       draft: {
         title: "登录页面",
         objective: "用户可以登录",
-        assignee: "developer-a",
         acceptanceCriteria: ["表单校验", "会话保持"]
       }
     });
   });
 
-  it("accepts employee ids as assignee", () => {
-    let view = startWizard(CANDIDATES);
-    view = step(view, "标题");
-    view = step(view, "目标");
-    view = step(view, "developer-b");
-    expect(view.preview.assignee).toBe("developer-b");
-    view = step(view, ""); // acceptance → confirm
-    const result = wizardSubmit(view, ""); // confirm → submit
-    expect(result.kind).toBe("submit");
-    if (result.kind === "submit") expect(result.draft.assignee).toBe("developer-b");
-  });
-
-  it("leaves assignee null when left empty", () => {
-    let view = startWizard(CANDIDATES);
+  it("accepts empty acceptance criteria", () => {
+    let view = startWizard();
     view = step(view, "标题");
     view = step(view, "目标");
     view = step(view, "");
-    expect(view.preview.assignee).toBeNull();
-    view = step(view, ""); // acceptance → confirm
-    const result = wizardSubmit(view, ""); // confirm → submit
+    expect(view.preview.acceptanceCriteria).toEqual([]);
+    const result = wizardSubmit(view, "");
     expect(result.kind).toBe("submit");
-    if (result.kind === "submit") expect(result.draft.assignee).toBeNull();
-  });
-
-  it("rejects unknown assignees", () => {
-    let view = startWizard(CANDIDATES);
-    view = step(view, "标题");
-    view = step(view, "目标");
-    const result = wizardSubmit(view, "nobody");
-    expect(result.kind).toBe("continue");
-    if (result.kind === "continue") expect(result.view.error).toContain("未知负责人");
+    if (result.kind === "submit") {
+      expect(result.draft.acceptanceCriteria).toEqual([]);
+    }
   });
 
   it("cancels on no at the confirm step", () => {
-    let view = startWizard(CANDIDATES);
+    let view = startWizard();
     view = step(view, "标题");
     view = step(view, "目标");
-    view = step(view, "");
     view = step(view, "");
     const result = wizardSubmit(view, "no");
     expect(result.kind).toBe("cancel");
   });
 
   it("falls back to hint values on blank input", () => {
-    let view = startWizard(CANDIDATES, { title: "登录页面", assignee: "developer-a" });
+    let view = startWizard({ title: "登录页面", objective: "写一个登录页面" });
     view = step(view, ""); // title falls back to hint
     expect(view.preview.title).toBe("登录页面");
-    view = step(view, "用户可以登录");
-    view = step(view, ""); // assignee keeps hint
-    expect(view.preview.assignee).toBe("developer-a");
+    view = step(view, ""); // objective falls back to hint
+    expect(view.preview.objective).toBe("写一个登录页面");
     view = step(view, "");
     const result = wizardSubmit(view, "");
     expect(result.kind).toBe("submit");
     if (result.kind === "submit") {
       expect(result.draft.title).toBe("登录页面");
-      expect(result.draft.assignee).toBe("developer-a");
+      expect(result.draft.objective).toBe("写一个登录页面");
     }
   });
 });

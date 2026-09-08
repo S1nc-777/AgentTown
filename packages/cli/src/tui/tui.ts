@@ -463,7 +463,7 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
           .sort((left, right) => left.id.localeCompare(right.id))
           .slice(0, 5);
         if (rows.length === 0) {
-          return { text: "目前没有任何任务。输入「让 developer-a 做 xxx」或直接描述需求来创建。", ok: true };
+          return { text: "目前没有任何任务。直接说需求即可，例如：帮我写一个使用说明文档（任务会交给 leader 分配开发）。", ok: true };
         }
         const lines = rows.map((task) => {
           const state = TASK_STATE_LABELS[task.status] ?? task.status;

@@ -107,8 +107,7 @@ describe("renderFrame", () => {
       wizard: {
         step: "title",
         prompt: "任务标题（必填）：",
-        preview: { title: "", objective: "", assignee: null, acceptanceCriteria: [] },
-        candidates: ["developer-a", "developer-b"],
+        preview: { title: "", objective: "", acceptanceCriteria: [] },
         error: null
       }
     }), 60, 10).frame;
@@ -134,7 +133,8 @@ describe("renderFrame", () => {
   it("guides task creation when connected with no events", () => {
     const frame = renderFrame(snapshot({ connected: true }), 60, 10).frame;
     expect(frame).toContain("（暂无事件）");
-    expect(frame).toContain("让 developer-a 做 登录页面");
+    expect(frame).toContain("使用说明文档");
+    expect(frame).toContain("leader 分配开发");
   });
 
   it("renders chat messages with kind prefixes", () => {
@@ -154,6 +154,6 @@ describe("renderFrame", () => {
   it("guides chat usage when there is no conversation yet", () => {
     const frame = renderFrame(snapshot({ view: "chat", connected: true }), 60, 10).frame;
     expect(frame).toContain("还没有对话");
-    expect(frame).toContain("让 developer-a 做 登录页面");
+    expect(frame).toContain("使用说明文档");
   });
 });
