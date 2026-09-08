@@ -1,8 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type {
-  EmployeeDefinition,
-  WorkspaceMode
-} from "@agenttown/runtime-contract";
+import type { EmployeeDefinition } from "@agenttown/runtime-contract";
 import {
   runCli,
   type BackpressureWritable,
@@ -21,6 +18,7 @@ export interface DispatchContext {
 
 export type DispatchOutcome =
   | { kind: "result"; text: string; ok: boolean }
+  | { kind: "question"; topic: "employees" | "tasks" | "status" }
   | { kind: "view"; view: ViewId }
   | { kind: "wizard"; view: WizardView }
   | { kind: "help" }
@@ -62,10 +60,13 @@ export async function dispatchInput(
         kind: "wizard",
         view: startWizard(candidates, {
           assignee: intent.assignee,
-          title: intent.title
+          title: intent.title,
+          ...(intent.objective === null ? {} : { objective: intent.objective })
         })
       };
     }
+    case "question":
+      return { kind: "question", topic: intent.topic };
     case "view":
       return { kind: "view", view: intent.view };
     case "help":

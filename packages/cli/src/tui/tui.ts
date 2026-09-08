@@ -358,6 +358,12 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
           pushChat("system", `${outcome.ok ? "✔ " : "✘ "}${outcome.text}`);
           showResult(outcome.text, outcome.ok);
           break;
+        case "question": {
+          const answer = answerQuestion(outcome.topic);
+          pushChat("system", `${answer.ok ? "✔ " : "✘ "}${answer.text}`);
+          showResult(answer.text, answer.ok);
+          break;
+        }
         case "view":
           view = outcome.view;
           pushChat("system", `✔ 已切换到${viewLabel(outcome.view)}视图`);
@@ -372,6 +378,9 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
         case "help":
           helpVisible = !helpVisible;
           result = null;
+          if (helpVisible) {
+            pushChat("system", "✔ 已显示帮助（结果区；再输入 ? 或 /help 隐藏）");
+          }
           break;
         case "unknown":
           pushChat("system", `✘ 没看懂「${trimmed}」。输入 ? 查看帮助`);
@@ -396,6 +405,81 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       case "approvals": return "审批";
     }
   }
+
+  const ROLE_LABELS: Record<string, string> = {
+    product_lead: "产品负责人",
+    developer: "开发",
+    reviewer: "审核",
+    designer: "设计",
+    qa: "测试"
+  };
+
+  const EMPLOYEE_STATE_LABELS: Record<string, string> = {
+    idle: "空闲",
+    starting: "启动中",
+    busy: "忙碌",
+    running: "工作中",
+    stopped: "已停止"
+  };
+
+  const TASK_STATE_LABELS: Record<string, string> = {
+    draft: "草稿",
+    ready: "就绪",
+    running: "进行中",
+    review: "审核中",
+    completed: "已完成",
+    blocked: "阻塞",
+    failed: "失败"
+  };
+
+  /**
+   * Answers a natural-language question from live snapshot data. Returns
+   * { text, ok } — plain text without a prefix; the caller adds ✔/✘.
+   */
+  const answerQuestion = (
+    topic: "employees" | "tasks" | "status"
+  ): { text: string; ok: boolean } => {
+    if (!connected) {
+      return {
+        text: "公司未运行，无法回答。按 s 或输入 start 启动公司。",
+        ok: false
+      };
+    }
+    switch (topic) {
+      case "employees": {
+        if (employees.length === 0) {
+          return { text: "公司配置里没有员工（检查 .agenttown/company.yaml）", ok: true };
+        }
+        const lines = employees.map((employee) => {
+          const role = ROLE_LABELS[employee.role] ?? employee.role;
+          const state = EMPLOYEE_STATE_LABELS[employee.status] ?? employee.status;
+          const task = employee.currentTaskId === null ? "" : `，正在做 ${employee.currentTaskId}`;
+          return `${employee.id}（${role}，${state}${task}）`;
+        });
+        return { text: `公司现有 ${employees.length} 名员工：${lines.join("、")}`, ok: true };
+      }
+      case "tasks": {
+        const rows = [...tasks]
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .slice(0, 5);
+        if (rows.length === 0) {
+          return { text: "目前没有任何任务。输入「让 developer-a 做 xxx」或直接描述需求来创建。", ok: true };
+        }
+        const lines = rows.map((task) => {
+          const state = TASK_STATE_LABELS[task.status] ?? task.status;
+          const owner = task.ownerEmployeeId === null ? "未分配" : task.ownerEmployeeId;
+          return `${task.id}「${task.title}」${state}，负责人 ${owner}`;
+        });
+        const more = tasks.length > rows.length ? `…共 ${tasks.length} 个任务` : "";
+        return { text: lines.join("；") + more, ok: true };
+      }
+      case "status":
+        return {
+          text: `公司${status}中，进行中任务 ${activeTaskCount} 个，待审批 ${pendingApprovalCount} 项，员工 ${employees.length} 名。`,
+          ok: true
+        };
+    }
+  };
 
   const onData = (chunk: Buffer | string): void => {
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");

@@ -146,6 +146,11 @@ describe("runTui", () => {
     await tui.waitFor(/任务 1/);
     // the default view is the chat with usage guidance
     await tui.waitFor(/还没有对话/);
+    // natural-language questions get real answers in the chat
+    tui.send("现在有哪些员工\r");
+    await tui.waitFor(/❯ 现在有哪些员工/);
+    await tui.waitFor(/现有 1 名员工/);
+    await tui.waitFor(/产品负责人/);
     // Tab: chat → events (event rows come from the live client)
     tui.send("\t");
     await tui.waitFor(/\[事件\]/);
