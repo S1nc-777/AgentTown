@@ -60,11 +60,11 @@ export function truncate(text: string, width: number): string {
 }
 
 const VIEW_LABELS: Record<ViewId, string> = {
-  chat: "1对话",
-  events: "2事件",
-  tasks: "3任务",
-  employees: "4员工",
-  approvals: "5审批"
+  chat: "[对话]",
+  events: "[事件]",
+  tasks: "[任务]",
+  employees: "[员工]",
+  approvals: "[审批]"
 };
 
 const RESULT_HEIGHT = 3;

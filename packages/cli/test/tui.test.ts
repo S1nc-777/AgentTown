@@ -148,11 +148,11 @@ describe("runTui", () => {
     await tui.waitFor(/还没有对话/);
     // Tab: chat → events (event rows come from the live client)
     tui.send("\t");
-    await tui.waitFor(/2事件/);
+    await tui.waitFor(/\[事件\]/);
     await tui.waitFor(/任务已提交/);
     // Tab: events → tasks
     tui.send("\t");
-    await tui.waitFor(/3任务/);
+    await tui.waitFor(/\[任务\]/);
     await tui.waitFor(/task-1/);
     // A static screen must not repaint: no new output while nothing changes
     // (the 1s refresh tick runs during this window).
