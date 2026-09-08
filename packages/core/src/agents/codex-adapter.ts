@@ -65,7 +65,11 @@ const FORMAT_INSTRUCTION = [
 
 const DEFAULT_SPAWN_PROCESS: NonNullable<
   CodexAgentAdapterOptions["spawnProcess"]
-> = (executable, args, options) => spawn(executable, args, options);
+> = (executable, args, options) => spawn(executable, args, {
+  ...options,
+  // Never pop a new terminal window on Windows when an agent CLI is launched.
+  windowsHide: true
+});
 
 function initialPrompt(input: StartSessionInput): string {
   return [

@@ -172,7 +172,9 @@ export class FakeAgentAdapter implements AgentAdapter {
     this.#allowedEmployeeIds = new Set(options.allowedEmployeeIds);
     this.#spawnProcess = options.spawnProcess
       ?? ((executable, args, spawnOptions) =>
-        spawn(executable, args, spawnOptions));
+        // Never pop a new terminal window on Windows when the fake agent
+        // executable is launched.
+        spawn(executable, args, { ...spawnOptions, windowsHide: true }));
     this.#writeDiagnosticLine = options.writeDiagnostic
       ?? ((fileDescriptor, line) =>
         appendFileSync(fileDescriptor, line, "utf8"));
