@@ -82,6 +82,10 @@ export interface TuiRuntime {
  * legacy Windows console without VT enabled) stays silent — the full-screen
  * TUI cannot work there, so we bail out with guidance instead of rendering
  * garbage.
+ *
+ * The probe must run in RAW mode: in cooked (line-buffered) mode the reply
+ * is neither echoed-readily nor delivered until a newline, so it would be
+ * missed and left as stray input on screen.
  */
 function detectCursorReporting(
   stdin: TuiRuntime["stdin"],
@@ -92,6 +96,7 @@ function detectCursorReporting(
     const cleanup = (): void => {
       clearTimeout(timer);
       stdin.off?.("data", onData);
+      stdin.setRawMode?.(false);
       stdin.pause?.();
     };
     const onData = (chunk: Buffer | string): void => {
@@ -106,6 +111,7 @@ function detectCursorReporting(
       resolve(false);
     }, 400);
     stdin.on("data", onData);
+    stdin.setRawMode?.(true);
     stdin.resume?.();
     stdout.write("\x1b[6n");
   });
