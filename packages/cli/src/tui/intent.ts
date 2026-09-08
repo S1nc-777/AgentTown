@@ -115,7 +115,7 @@ export function parseIntent(input: string, employees: readonly string[]): Intent
 
   // 6. Questions ("现在有哪些员工" / "任务进度怎么样") — answered with real
   //    data instead of switching views.
-  const questionLike = /哪些|有谁|是谁|叫什么|有几个|多少|干嘛|干活|在做什么|怎么样|什么情况|状态|吗|呢/u.test(text);
+  const questionLike = /哪些|哪几个|有谁|都是谁|是谁|叫什么|有几个|多少|干嘛|干活|在做什么|做什么|怎么样|什么情况|什么|状态|吗|呢/u.test(text);
   if (questionLike) {
     if (/员工|谁在|谁在干活/u.test(text)) return { kind: "question", topic: "employees" };
     if (/任务/u.test(text)) return { kind: "question", topic: "tasks" };

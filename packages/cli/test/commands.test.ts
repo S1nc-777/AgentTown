@@ -81,6 +81,19 @@ describe("dispatchInput", () => {
     }
   });
 
+  it("defaults the assignee to the first developer when none is named", async () => {
+    const { ctx: context } = ctx();
+    const outcome = await dispatchInput("帮我写一个笑话文档", context);
+    expect(outcome.kind).toBe("wizard");
+    if (outcome.kind === "wizard") {
+      // no employee named → first git_worktree developer is pre-selected so
+      // the task does not sit in draft with no one to run it
+      expect(outcome.view.preview.assignee).toBe("developer-a");
+      expect(outcome.view.preview.title).toBe("一个笑话文档");
+      expect(outcome.view.preview.objective).toBe("写一个笑话文档");
+    }
+  });
+
   it("maps view intents", async () => {
     const { ctx: context } = ctx();
     expect(await dispatchInput("看下任务", context)).toEqual({ kind: "view", view: "tasks" });

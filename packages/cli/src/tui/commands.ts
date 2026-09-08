@@ -56,10 +56,14 @@ export async function dispatchInput(
       const candidates = ctx.employees
         .filter((employee) => employee.workspace === "git_worktree")
         .map((employee) => employee.id);
+      // No explicit assignee → default to the first developer so a task the
+      // user drops on the company actually gets picked up (a draft task has
+      // no one to run it until a leader assigns it).
+      const assignee = intent.assignee ?? (candidates.length > 0 ? candidates[0]! : null);
       return {
         kind: "wizard",
         view: startWizard(candidates, {
-          assignee: intent.assignee,
+          assignee,
           title: intent.title,
           ...(intent.objective === null ? {} : { objective: intent.objective })
         })

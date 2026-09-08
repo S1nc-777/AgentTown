@@ -257,6 +257,11 @@ export class CompanyOrchestrator {
     switch (action.type) {
       case "task.propose":
         this.#createProposedTask(action);
+        // A task proposed from outside the leader loop (e.g. the user via the
+        // TUI) has no one to assign it once the leader drive has finished.
+        // Wake the drive so the leader sees the unassigned task and assigns
+        // it; without this the draft sits forever.
+        this.#kickLeaderDriveIfIdle();
         return;
       case "task.assign":
         await this.#taskWorkflow(action).assign(action);
@@ -429,6 +434,17 @@ export class CompanyOrchestrator {
         if (this.#leaderDrive === tracked) this.#leaderDrive = undefined;
       });
     this.#leaderDrive = tracked;
+  }
+
+  /**
+   * Restarts the leader drive loop when it is not already running. Used when
+   * work arrives from outside the loop (an externally dispatched task.propose)
+   * so the leader is nudged to assign the new draft task.
+   */
+  #kickLeaderDriveIfIdle(): void {
+    if (this.#driveLeaderEnabled && this.#leaderDrive === undefined) {
+      this.#startLeaderDrive();
+    }
   }
 
   /**

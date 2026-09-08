@@ -88,6 +88,7 @@ describe("parseIntent", () => {
 
   it("maps questions to answer topics instead of views", () => {
     expect(parseIntent("现在有哪些员工", EMPLOYEES)).toEqual({ kind: "question", topic: "employees" });
+    expect(parseIntent("现在有哪几个员工，分别负责什么", EMPLOYEES)).toEqual({ kind: "question", topic: "employees" });
     expect(parseIntent("员工分别叫什么", EMPLOYEES)).toEqual({ kind: "question", topic: "employees" });
     expect(parseIntent("谁在干活", EMPLOYEES)).toEqual({ kind: "question", topic: "employees" });
     expect(parseIntent("有哪些任务", EMPLOYEES)).toEqual({ kind: "question", topic: "tasks" });
