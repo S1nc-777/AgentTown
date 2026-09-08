@@ -65,6 +65,7 @@ export interface TuiRuntime {
     setRawMode?(mode: boolean): unknown;
     resume?(): unknown;
     pause?(): unknown;
+    isTTY?: boolean;
   };
   stdout: {
     write(chunk: string): boolean;
@@ -75,7 +76,55 @@ export interface TuiRuntime {
   };
 }
 
+/**
+ * Probes the terminal with a cursor-position report (DSR, ESC[6n). A real
+ * ANSI-capable terminal answers with ESC[row;colR; anything else (e.g. the
+ * legacy Windows console without VT enabled) stays silent — the full-screen
+ * TUI cannot work there, so we bail out with guidance instead of rendering
+ * garbage.
+ */
+function detectCursorReporting(
+  stdin: TuiRuntime["stdin"],
+  stdout: TuiRuntime["stdout"]
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let buffer = "";
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      stdin.off?.("data", onData);
+      stdin.pause?.();
+    };
+    const onData = (chunk: Buffer | string): void => {
+      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (buffer.includes("\x1b[") && /R$/u.test(buffer)) {
+        cleanup();
+        resolve(true);
+      }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, 400);
+    stdin.on("data", onData);
+    stdin.resume?.();
+    stdout.write("\x1b[6n");
+  });
+}
+
 export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<number> {
+  // Full-screen rendering needs an ANSI-capable terminal. Real TTYs are
+  // probed; injected test streams (no isTTY) skip the probe.
+  if (runtime.stdin.isTTY === true) {
+    const terminalOk = await detectCursorReporting(runtime.stdin, runtime.stdout);
+    if (!terminalOk) {
+      await runtime.stdout.write(
+        "当前终端不支持全屏界面（未检测到光标定位响应）。\n"
+        + "请改用 Windows Terminal（开始菜单搜索 \"Terminal\"，或 Win+R 输入 wt），\n"
+        + "或在传统控制台中启用 VT：reg add HKCU\\Console /v VirtualTerminalLevel /t REG_DWORD /d 1 /f 后重开窗口。\n"
+      );
+      return 1;
+    }
+  }
   const companyPath = resolveAgentTownPaths(projectRoot).companyPath;
   let companyText: string;
   try {
