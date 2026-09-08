@@ -89,6 +89,7 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       exitPending = false;
     } catch {
       connected = false;
+      status = "未运行";
     }
   };
 
@@ -129,10 +130,14 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
       connected = true;
     } catch {
       connected = false;
+      status = "未运行";
       await client?.close().catch(() => undefined);
       client = null;
     }
   };
+
+  let painted: { lines: string[]; width: number; height: number } | null = null;
+  let lastCursor = "";
 
   const render = (): void => {
     const snapshot: TuiSnapshot = {
@@ -155,9 +160,35 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
     const width = runtime.stdout.columns ?? 80;
     const height = runtime.stdout.rows ?? 24;
     const { frame, cursorRow, cursorCol } = renderFrame(snapshot, width, height);
-    const hideCursor = "\x1b[?25l";
+    const lines = frame.split("\n");
     const placeCursor = `\x1b[${cursorRow};${cursorCol}H\x1b[?25h`;
-    runtime.stdout.write(`\x1b[2J\x1b[H${hideCursor}${frame}\n${placeCursor}`);
+
+    if (
+      painted === null
+      || painted.width !== width
+      || painted.height !== height
+    ) {
+      // First paint or resize: clear once, draw everything.
+      runtime.stdout.write(`\x1b[2J\x1b[H\x1b[?25l${frame}\n${placeCursor}`);
+      painted = { lines, width, height };
+      lastCursor = placeCursor;
+      return;
+    }
+
+    // Incremental repaint: rewrite only rows whose text changed, then place
+    // the cursor. When nothing changed and the cursor is already in place,
+    // emit NOTHING — a static screen must not repaint every second (no
+    // flicker, no scrolling garbage on terminals without clear support).
+    let patch = "";
+    for (let index = 0; index < lines.length; index += 1) {
+      if (lines[index] !== painted.lines[index]) {
+        patch += `\x1b[${index + 1};1H${lines[index]}\x1b[K`;
+      }
+    }
+    if (patch.length === 0 && placeCursor === lastCursor) return;
+    runtime.stdout.write(`\x1b[?25l${patch}${placeCursor}`);
+    painted = { lines, width, height };
+    lastCursor = placeCursor;
   };
 
   const showResult = (text: string, ok = true): void => {

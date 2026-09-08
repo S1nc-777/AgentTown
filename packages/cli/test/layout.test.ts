@@ -123,4 +123,16 @@ describe("renderFrame", () => {
     const frame = renderFrame(snapshot(), 60, 12).frame;
     expect(frame.split("\n")).toHaveLength(12);
   });
+
+  it("guides the user when the company is not running", () => {
+    const frame = renderFrame(snapshot({ connected: false }), 60, 10).frame;
+    expect(frame).toContain("公司未运行");
+    expect(frame).toContain("start 启动公司");
+  });
+
+  it("guides task creation when connected with no events", () => {
+    const frame = renderFrame(snapshot({ connected: true }), 60, 10).frame;
+    expect(frame).toContain("（暂无事件）");
+    expect(frame).toContain("让 developer-a 做 登录页面");
+  });
 });

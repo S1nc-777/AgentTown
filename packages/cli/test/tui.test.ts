@@ -149,6 +149,11 @@ describe("runTui", () => {
     tui.send("\t");
     await tui.waitFor(/2任务/);
     await tui.waitFor(/task-1/);
+    // A static screen must not repaint: no new output while nothing changes
+    // (the 1s refresh tick runs during this window).
+    const quietLength = tui.text().length;
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    expect(tui.text().length).toBe(quietLength);
     tui.send("\x03");
     tui.send("\x03");
     await run;

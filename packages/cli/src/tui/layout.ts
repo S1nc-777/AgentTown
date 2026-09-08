@@ -124,7 +124,17 @@ function renderView(snapshot: TuiSnapshot, width: number, height: number): strin
       const rows = [...snapshot.events]
         .sort((left, right) => left.sequence - right.sequence)
         .slice(-height);
-      if (rows.length === 0) return [truncate("（暂无事件）", width)];
+      if (rows.length === 0) {
+        return snapshot.connected
+          ? [
+              truncate("（暂无事件）", width),
+              "",
+              truncate("公司已运行，还没有活动。试试：", width),
+              truncate("  让 developer-a 做 登录页面    来创建第一个任务", width),
+              truncate("  输入 ? 查看全部命令", width)
+            ]
+          : notRunningLines(width);
+      }
       return rows.map((event) => {
         const time = event.occurredAt.length >= 19
           ? event.occurredAt.slice(11, 19)
@@ -139,12 +149,20 @@ function renderView(snapshot: TuiSnapshot, width: number, height: number): strin
       const rows = [...snapshot.tasks]
         .sort((left, right) => left.id.localeCompare(right.id))
         .slice(0, height);
-      if (rows.length === 0) return [truncate("（暂无任务）", width)];
+      if (rows.length === 0) {
+        return snapshot.connected
+          ? [truncate("（暂无任务）", width), "", truncate("有任务后会显示在这里。输入 ? 查看帮助", width)]
+          : notRunningLines(width);
+      }
       return rows.map((task) =>
         truncate(`${task.id} ${task.status} ${task.ownerEmployeeId ?? "-"} ${task.title}`, width));
     }
     case "employees": {
-      if (snapshot.employees.length === 0) return [truncate("（暂无员工）", width)];
+      if (snapshot.employees.length === 0) {
+        return snapshot.connected
+          ? [truncate("（暂无员工）", width), "", truncate("员工来自 .agenttown/company.yaml", width)]
+          : notRunningLines(width);
+      }
       return snapshot.employees.slice(0, height).map((employee) =>
         truncate(
           `${employee.id} (${employee.role}) ${employee.status} task=${employee.currentTaskId ?? "-"}`,
@@ -152,7 +170,11 @@ function renderView(snapshot: TuiSnapshot, width: number, height: number): strin
         ));
     }
     case "approvals": {
-      if (snapshot.approvals.length === 0) return [truncate("（暂无待审批）", width)];
+      if (snapshot.approvals.length === 0) {
+        return snapshot.connected
+          ? [truncate("（暂无待审批）", width), "", truncate("审批需求会出现在这里。输入 ? 查看帮助", width)]
+          : notRunningLines(width);
+      }
       return snapshot.approvals.slice(0, height).map((approval) =>
         truncate(
           `${approval.approvalId} ${approval.taskId} ${approval.requestingEmployeeId} ${approval.reason}`,
@@ -160,4 +182,13 @@ function renderView(snapshot: TuiSnapshot, width: number, height: number): strin
         ));
     }
   }
+}
+
+function notRunningLines(width: number): string[] {
+  return [
+    truncate("○ 公司未运行", width),
+    "",
+    truncate("按 s 键或输入 start 启动公司", width),
+    truncate("启动后这里会实时显示员工的活动", width)
+  ];
 }
