@@ -714,10 +714,13 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
       causationEventId: null,
       payload: {}
     });
+    // A paused company starts again via recovery — "start" is the user's
+    // universal "run it" verb, no need to learn resume.
     await expect(client.request("company.start", {})).resolves.toMatchObject({
-      ok: false,
-      error: { message: expect.stringContaining("company.resume") }
+      ok: true,
+      result: { status: "running" }
     });
+    expect(lifecycle.recoverLatestCalls).toBe(1);
     store.setCompanyStatus("company-1", "running", {
       id: randomUUID(),
       type: "test.running",
@@ -745,7 +748,8 @@ describe.runIf(process.platform === "win32")("CoreServer", () => {
       result: { status: "running" }
     });
     expect(orchestrator.starts).toHaveLength(2);
-    expect(lifecycle.recoverLatestCalls).toBe(0);
+    // one recovery happened during the paused-start above
+    expect(lifecycle.recoverLatestCalls).toBe(1);
 
     await expect(client.request("company.stop", {})).resolves.toMatchObject({
       ok: true,

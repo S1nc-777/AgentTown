@@ -929,13 +929,21 @@ export class CoreServer {
       case "company.start":
         {
           const status = this.#store.getOnlyCompanyStatus();
-          if (status === "paused") {
-            throw new RequestError(
-              "invalid_lifecycle_state",
-              "company is paused; use company.resume"
-            );
-          }
           if (status === "running") return { status: "running" };
+          // "start" is the user's universal "get it running again" verb: a
+          // paused company resumes from its checkpoint instead of forcing the
+          // user to learn the resume command.
+          if (status === "paused") {
+            if (this.#lifecycle === undefined) {
+              await this.#orchestrator.start();
+              return { status: "running" };
+            }
+            const recovery = await this.#lifecycle.recoverLatest();
+            return {
+              status: "running",
+              decisions: recovery.decisions
+            };
+          }
           if (
             status === "pausing"
             || status === "stopping"
