@@ -1158,11 +1158,22 @@ export class CoreServer {
       activeTaskCount: tasks.filter(
         (task) => task.status === "running" || task.status === "review"
       ).length,
-      pendingApprovalCount: events.filter(
-        (event) => event.type === "user.approval.requested"
-      ).length,
+      // Count exactly the approvals the user can actually act on (the same
+      // set the approvals view lists). Historical user.approval.requested
+      // events are not actionable here and only ever accumulated.
+      pendingApprovalCount: this.#pendingApprovalCount(),
       employees
     };
+  }
+
+  #pendingApprovalCount(): number {
+    if (this.#gitWorkflow === undefined) return 0;
+    try {
+      return this.#gitWorkflow.listApprovals().length;
+    } catch {
+      // No owned git run yet → nothing waits for the user's decision.
+      return 0;
+    }
   }
 
   #handshake(
