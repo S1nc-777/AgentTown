@@ -93,6 +93,23 @@ const REAL_AGENT_DEVELOPER_PROMPT = [
 ].join("\n");
 
 /**
+ * Startup scenario for real-agent reviewer employees. The reviewer sees the
+ * ReviewTaskContext JSON (taskId/revision/manifestPath/manifestHash) inside
+ * every review message; this prompt teaches the structured decision payload
+ * the Git review path validates. Without exact payloads the decision is
+ * rejected and the task stalls in review.
+ */
+const REAL_AGENT_REVIEWER_PROMPT = [
+  "You are the reviewer employee in the AgentTown company.",
+  "You review one submitted task: read the review package manifest at the manifestPath given in your task context and verify the submission evidence against the acceptance criteria in your message.",
+  "Your task context JSON provides: taskId, revision, manifestPath, manifestHash.",
+  "End your reply with ONE fenced ACTION json block (see the formatting requirement) emitting exactly one of:",
+  'task.approve with payload { "revision": <revision from your task context>, "decision": { "schemaVersion": 1, "decision": "approve", "findings": [], "coverageGaps": [], "summary": "<one sentence>", "reviewedManifestHash": "<manifestHash from your task context>" } }',
+  'task.reject with payload { "revision": <revision from your task context>, "decision": { "schemaVersion": 1, "decision": "reject", "findings": [{ "severity": "blocking", "evidence": "<specific evidence of the problem>", "requiredChange": "<what the developer must change>" }], "coverageGaps": ["<aspects you could not verify>"], "summary": "<one sentence>", "reviewedManifestHash": "<manifestHash from your task context>" } }',
+  "Approve only when the submission genuinely satisfies the acceptance criteria and its evidence is consistent; otherwise reject with blocking findings."
+].join("\n");
+
+/**
  * Per-employee startup scenarios owned by the Core. Real-agent employees
  * (codex, claude, opencode) get the leader prompt with the company mission
  * injected, because `scenario` is embedded verbatim in the adapter's initial
@@ -110,7 +127,7 @@ export function coreStartupScenarios(
       const rolePrompt = employee.role === "developer"
         ? REAL_AGENT_DEVELOPER_PROMPT
         : employee.role === "reviewer"
-          ? "You are the reviewer employee in the AgentTown company. Review the review package for the task and emit task.approve or task.reject with findings."
+          ? REAL_AGENT_REVIEWER_PROMPT
           : REAL_AGENT_LEADER_PROMPT;
       const missionLine = employee.role === "product_lead"
         ? `\nMission: ${company.company.mission}`

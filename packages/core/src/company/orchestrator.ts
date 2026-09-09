@@ -689,56 +689,63 @@ export class CompanyOrchestrator {
   ): Promise<void> {
     this.#assertEpoch(epoch);
     const reviewer = this.#employee(this.reviewerId);
-    let decisionReceived = false;
-    for await (const event of this.sessions.send(reviewer, {
-      messageId: randomUUID(),
-      employeeId: reviewer.id,
-      taskId,
-      text: `Review task ${taskId} and propose approval or rejection.`,
-      actionRequest: null,
-      taskContext: this.#gitTaskWorkflow?.taskContext?.(this.tasks.get(taskId))
-        ?? null
-    }, signal)) {
-      this.#assertEpoch(epoch);
-      if (event.type === "action.proposed") {
-        try {
-          if (event.action.type !== "task.approve" && event.action.type !== "task.reject") {
-            throw new Error("reviewer must propose task.approve or task.reject");
+    // A rejected review action (e.g. a real reviewer emitting an approve
+    // without the structured decision payload) is NOT terminal: the reviewer
+    // gets the rejection reason back and retries, like a developer's resend
+    // loop. Only a session failure or repeated failure escalates to the
+    // user-approval request.
+    let feedback: string | null = null;
+    const attempts = 3;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (epoch !== this.#dispatchEpoch || signal.aborted) return;
+      let decisionReceived = false;
+      const text = feedback === null
+        ? `Review task ${taskId} and propose approval or rejection.`
+        : `Your previous review action was rejected: ${feedback}. Review the package again and emit a corrected task.approve or task.reject action.`;
+      for await (const event of this.sessions.send(reviewer, {
+        messageId: randomUUID(),
+        employeeId: reviewer.id,
+        taskId,
+        text,
+        actionRequest: null,
+        taskContext: this.#gitTaskWorkflow?.taskContext?.(this.tasks.get(taskId))
+          ?? null
+      }, signal)) {
+        this.#assertEpoch(epoch);
+        if (event.type === "action.proposed") {
+          try {
+            if (event.action.type !== "task.approve" && event.action.type !== "task.reject") {
+              throw new Error("reviewer must propose task.approve or task.reject");
+            }
+            this.#assertProposalTask(event.action, taskId);
+            await this.dispatch(event.action);
+            decisionReceived = true;
+          } catch (error) {
+            if (epoch !== this.#dispatchEpoch) return;
+            feedback = this.#errorMessage(error);
           }
-          this.#assertProposalTask(event.action, taskId);
-          await this.dispatch(event.action);
-          decisionReceived = true;
-        } catch (error) {
-          if (epoch !== this.#dispatchEpoch) return;
+        } else if (event.type === "adapter.error" || event.type === "session.exited") {
           this.#recordApprovalRequest(
             taskId,
             this.leaderId,
-            "reviewer_invalid_decision",
-            {
-              reviewerId: reviewer.id,
-              decisionActionId: event.action.actionId,
-              error: this.#errorMessage(error)
-            }
+            "reviewer_session_failed",
+            { reviewerId: reviewer.id }
           );
           return;
         }
-      } else if (event.type === "adapter.error" || event.type === "session.exited") {
-        this.#recordApprovalRequest(
-          taskId,
-          this.leaderId,
-          "reviewer_session_failed",
-          { reviewerId: reviewer.id }
-        );
-        return;
       }
+      if (epoch !== this.#dispatchEpoch) return;
+      if (decisionReceived) return;
     }
-    if (epoch !== this.#dispatchEpoch) return;
-    if (!decisionReceived && this.tasks.get(taskId).status === "review") {
+    if (this.tasks.get(taskId).status === "review") {
       this.#recordApprovalRequest(
         taskId,
         this.leaderId,
         "reviewer_returned_no_decision",
-        { reviewerId: reviewer.id }
+        {
+          reviewerId: reviewer.id,
+          ...(feedback === null ? {} : { lastError: feedback })
+        }
       );
     }
   }

@@ -778,7 +778,7 @@ describe("CompanyOrchestrator", () => {
     )).toBe(false);
   });
 
-  it("does not let a reviewer decision mutate a different task", async () => {
+  it("lets a reviewer correct a decision aimed at the wrong task", async () => {
     const { adapter, orchestrator, store, tasks } = createHarness();
     await orchestrator.start({});
     for (const [taskId, owner] of [
@@ -793,15 +793,19 @@ describe("CompanyOrchestrator", () => {
 
     const review = orchestrator.requestReview("task-a");
     await adapter.waitForPending("reviewer");
+    // First decision names the WRONG task — it must not mutate task-b, and
+    // the reviewer gets a rejection feedback instead of an instant bail-out.
     await adapter.complete("reviewer", approveAction("task-b"));
+    await adapter.waitForPending("reviewer");
+    await adapter.complete("reviewer", approveAction("task-a"));
     await review;
 
-    expect(tasks.get("task-a").status).toBe("review");
+    expect(tasks.get("task-a").status).toBe("completed");
     expect(tasks.get("task-b").status).toBe("review");
     expect(store.listEvents(0).some(
       (event) => event.type === "user.approval.requested"
         && event.taskId === "task-a"
-    )).toBe(true);
+    )).toBe(false);
   });
 
   it("enforces capacity and actor ownership for every task.start", async () => {
