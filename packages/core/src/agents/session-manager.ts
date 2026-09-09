@@ -98,7 +98,16 @@ export class SessionManager {
 
     if (failedEmployeeIds.length > 0) {
       await this.#stopStartedHandles(company, results);
-      throw new Error(`failed to start employees: ${failedEmployeeIds.join(", ")}`);
+      const reasons = results
+        .map((result, index) =>
+          result.status === "rejected"
+            ? `${company.employees[index]?.id ?? `index-${index}`}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`
+            : null
+        )
+        .filter((entry): entry is string => entry !== null);
+      throw new Error(
+        `failed to start employees: ${failedEmployeeIds.join(", ")} — ${reasons.join(" | ")}`
+      );
     }
 
     try {
