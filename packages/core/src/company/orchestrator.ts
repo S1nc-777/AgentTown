@@ -626,19 +626,27 @@ export class CompanyOrchestrator {
       taskId = createdTaskId;
       text = [
         "All tasks are completed or blocked.",
-        "Emit a company.complete.request to finish the mission, or propose the next task."
+        "Emit a company.complete.request to finish the mission, or propose the next task only if your mission requires it."
       ].join("\n");
     } else if (createdTaskId === null) {
       taskId = null;
+      // No task exists yet. The leader must follow its mission instead of a
+      // hard-coded "propose now" order: a company whose mission says to wait
+      // for the user (chat-driven usage) stays quiet, while a mission-driven
+      // company (e.g. "deliver a runnable Mario game") lets the leader start
+      // on its own. Hard-coding "propose the first task" made chat-driven
+      // leaders invent whole projects nobody asked for.
       text = [
         `Mission: ${this.company.company.mission}`,
-        "Propose the first task by emitting a task.propose action with a title, objective and acceptance criteria."
+        "Current state: no tasks yet.",
+        "Emit your next action according to your mission and the current state."
       ].join("\n");
     } else {
       taskId = createdTaskId;
       text = [
         `Task ${createdTaskId} is in progress.`,
-        "Propose the next task, or emit a company.complete.request when the mission is complete."
+        `Mission: ${this.company.company.mission}`,
+        "Consider whether your mission requires more tasks; do not propose new tasks unless they serve the mission."
       ].join("\n");
     }
     // Always show the leader the current task landscape so it does not
