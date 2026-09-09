@@ -114,8 +114,8 @@ function buildResultLines(snapshot: TuiSnapshot, width: number): string[] {
   if (snapshot.helpVisible) {
     return [
       truncate("快捷键：Tab 切换视图 │ ↑↓ 历史 │ Ctrl+C 退出（两次）│ Ctrl+L 清空结果", width),
-      truncate("直接说需求即可，例如：帮我写一个使用说明文档 │ 暂停 │ 公司现在怎么样", width),
-      truncate("命令：start status tasks pause resume stop timeline │ ? 隐藏帮助", width)
+      truncate("会话：/new 新对话 │ /sessions 历史 │ /open N 打开 │ /rm N 删除", width),
+      truncate("直接说需求即布置任务（如：帮我写一个使用说明文档）│ ? 隐藏帮助", width)
     ];
   }
   if (snapshot.result !== null) {
@@ -124,7 +124,6 @@ function buildResultLines(snapshot: TuiSnapshot, width: number): string[] {
   }
   return [];
 }
-
 function renderView(snapshot: TuiSnapshot, width: number, height: number): string[] {
   switch (snapshot.view) {
     case "chat": {

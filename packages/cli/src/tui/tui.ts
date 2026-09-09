@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { parseCompanyYaml } from "@agenttown/runtime-contract";
 import type { ApprovalView, TaskRecord } from "@agenttown/runtime-contract";
 import type { EventRecord } from "@agenttown/core";
@@ -25,6 +26,13 @@ import {
   type TuiSnapshot,
   type ViewId
 } from "./layout.js";
+import {
+  createSession,
+  loadSessions,
+  MAX_SESSIONS,
+  saveSessions,
+  type StoredSession
+} from "./sessions.js";
 import { wizardSubmit, type WizardView } from "./wizard.js";
 
 const REFRESH_MS = 1000;
@@ -150,17 +158,114 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
   let client: CliClient | null = null as CliClient | null;
   let connected = false;
   let view: ViewId = "chat";
-  const chat: ChatMessage[] = [];
+  const sessionsFile = join(resolveAgentTownPaths(projectRoot).stateDir, "tui-sessions.json");
+  // Persisted sessions (newest first) WITHOUT the current conversation.
+  let sessionHistory: StoredSession[] = loadSessions(sessionsFile);
+  // A fresh conversation per terminal open — history stays one command away.
+  let currentSession = createSession();
+  let chat: ChatMessage[] = currentSession.messages;
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let lastChatEventSequence: number | null = null;
   let events: EventRecord[] = [];
   let tasks: TaskRecord[] = [];
   let approvals: ApprovalView[] = [];
   let employees: EmployeeStatusView[] = [];
 
+  const scheduleSave = (): void => {
+    if (saveTimer !== null) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      saveSessions(sessionsFile, [
+        ...(currentSession.messages.length > 0 ? [currentSession] : []),
+        ...sessionHistory
+      ]);
+    }, 300);
+  };
+
   const pushChat = (kind: ChatMessage["kind"], text: string): void => {
     chat.push({ kind, text });
     if (chat.length > MAX_CHAT_MESSAGES) {
       chat.splice(0, chat.length - MAX_CHAT_MESSAGES);
+    }
+    currentSession.updatedAt = new Date().toISOString();
+    scheduleSave();
+  };
+
+  const switchToSession = (session: StoredSession): void => {
+    if (currentSession.messages.length > 0) {
+      sessionHistory = [currentSession, ...sessionHistory.filter((s) => s.id !== currentSession.id)];
+    }
+    sessionHistory = sessionHistory.filter((s) => s.id !== session.id);
+    currentSession = session;
+    chat = session.messages;
+    scheduleSave();
+  };
+
+  /** Handles TUI-local commands (/new /sessions /open /rm); false = not local. */
+  const handleSessionCommand = (input: string): boolean => {
+    const [command, arg] = input.split(/\s+/);
+    switch (command) {
+      case "/new":
+      case "/clear": {
+        if (currentSession.messages.length > 0) {
+          sessionHistory = [currentSession, ...sessionHistory].slice(0, MAX_SESSIONS);
+        }
+        currentSession = createSession();
+        chat = currentSession.messages;
+        pushChat("system", "✔ 已开始新对话。输入 /sessions 查看历史对话");
+        return true;
+      }
+      case "/sessions":
+      case "/ls": {
+        const lines = sessionHistory.map((session, index) =>
+          `${index + 1}. ${session.title}（${session.messages.length} 条，${session.updatedAt.slice(5, 16).replace("T", " ")}）`
+        );
+        pushChat(
+          "system",
+          lines.length === 0
+            ? "（暂无历史对话）输入 /open <编号> 或 /new"
+            : `历史对话：\n${lines.join("\n")}`
+        );
+        return true;
+      }
+      case "/open":
+      case "/resume": {
+        const index = Number(arg);
+        const target = Number.isInteger(index) && index >= 1 && index <= sessionHistory.length
+          ? sessionHistory[index - 1]
+          : undefined;
+        if (target === undefined) {
+          pushChat("system", `✘ 没有编号 ${arg ?? ""} 的历史对话（/sessions 查看列表）`);
+          return true;
+        }
+        switchToSession(target);
+        pushChat("system", `✔ 已打开历史对话：${target.title}`);
+        return true;
+      }
+      case "/rm":
+      case "/delete":
+      case "/del": {
+        if (arg === "current" || arg === "0") {
+          currentSession = createSession();
+          chat = currentSession.messages;
+          pushChat("system", "✔ 已删除当前对话并开始新对话");
+          return true;
+        }
+        const index = Number(arg);
+        const target = Number.isInteger(index) && index >= 1 && index <= sessionHistory.length
+          ? sessionHistory[index - 1]
+          : undefined;
+        if (target === undefined) {
+          pushChat("system", `✘ 没有编号 ${arg ?? ""} 的历史对话（/sessions 查看列表）`);
+          return true;
+        }
+        sessionHistory = sessionHistory.filter((session) => session.id !== target.id);
+        pushChat("system", `✔ 已删除对话：${target.title}`);
+        scheduleSave();
+        return true;
+      }
+      default:
+        return false;
     }
   };
   let status = "unknown";
@@ -346,6 +451,10 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
   const handleSubmit = (text: string): void => {
     const trimmed = text.trim();
     pushChat("user", trimmed);
+    if (handleSessionCommand(trimmed)) {
+      render();
+      return;
+    }
     const ctx: DispatchContext = {
       projectRoot,
       connectOrStart: runtime.connectOrStart,
@@ -560,6 +669,15 @@ export async function runTui(projectRoot: string, runtime: TuiRuntime): Promise<
     return 0;
   } finally {
     clearInterval(interval);
+    if (saveTimer !== null) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    // Persist the current conversation on exit so /sessions can resume it.
+    saveSessions(sessionsFile, [
+      ...(currentSession.messages.length > 0 ? [currentSession] : []),
+      ...sessionHistory
+    ]);
     runtime.stdin.off?.("data", onData);
     runtime.stdin.setRawMode?.(false);
     runtime.stdin.pause?.();
