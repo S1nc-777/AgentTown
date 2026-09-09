@@ -875,7 +875,14 @@ export async function runCore(
       ttlMs: args.leaseTtlMs,
       now: Date.now,
       onLastClientExpired: async () => {
-        await lifecycle.pause("last_client_exited");
+        // Only a RUNNING company auto-pauses when the last client leaves (so
+        // a closed terminal does not leave agents burning tokens). A company
+        // that was already stopped/blocked must NOT be rewritten into a
+        // paused checkpoint — that would break "stop, then start again".
+        const status = store.getCompany(DEFAULT_COMPANY_ID)?.status;
+        if (status === "running" || status === "pausing") {
+          await lifecycle.pause("last_client_exited");
+        }
         await server?.closeTransportAfterResponses();
       }
     });
