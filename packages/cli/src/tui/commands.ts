@@ -130,7 +130,11 @@ export async function submitWizardDraft(
     }
     return `任务已创建：${taskId}（${draft.title}），等待 leader 分配开发`;
   } catch (error) {
-    return `创建任务失败：${error instanceof Error ? error.message : String(error)}`;
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("orchestrator is not dispatching")) {
+      return "公司未在运行（blocked/paused）：按 Ctrl+C 退出，运行 'agenttown stop --yes'，再运行 'agenttown' 并输入 start";
+    }
+    return `创建任务失败：${message}`;
   } finally {
     await client.close().catch(() => undefined);
   }
