@@ -53,9 +53,20 @@ describe("dispatchInput", () => {
     }
   });
 
-  it("blocks high-risk commands with a hint", async () => {
-    const { ctx: context } = ctx();
+  it("requires an explicit yes before stopping inside the TUI", async () => {
+    const { ctx: context, calls } = ctx();
     const outcome = await dispatchInput("stop", context);
+    expect(outcome.kind).toBe("result");
+    if (outcome.kind === "result") {
+      expect(outcome.ok).toBe(false);
+      expect(outcome.text).toContain("stop --yes");
+    }
+    expect(calls).toHaveLength(0); // nothing executed without --yes
+  });
+
+  it("blocks approve/reject/cleanup with an exit hint", async () => {
+    const { ctx: context } = ctx();
+    const outcome = await dispatchInput("cleanup", context);
     expect(outcome.kind).toBe("result");
     if (outcome.kind === "result") {
       expect(outcome.ok).toBe(false);

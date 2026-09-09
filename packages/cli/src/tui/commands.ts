@@ -25,10 +25,11 @@ export type DispatchOutcome =
   | { kind: "unknown" };
 
 /**
- * Commands that are only shown in the TUI; their confirmation flows stay in
- * the one-shot CLI (see the TUI spec, "明确不做").
+ * Commands whose confirmation flows stay in the one-shot CLI; inside the TUI
+ * they are only explained. `stop` is the exception: it is executable in the
+ * TUI but requires the explicit "--yes" flag (see dispatch below).
  */
-const READ_ONLY_COMMANDS = new Set(["approve", "reject", "stop", "cleanup"]);
+const READ_ONLY_COMMANDS = new Set(["approve", "reject", "cleanup"]);
 
 export async function dispatchInput(
   input: string,
@@ -42,6 +43,16 @@ export async function dispatchInput(
           kind: "result",
           ok: false,
           text: `「${intent.command}」需要显式确认：请退出 TUI 后运行 'agenttown ${intent.command} ...'`
+        };
+      }
+      // Stopping the company kills every employee session — require the same
+      // explicit confirmation as the one-shot CLI (which would otherwise
+      // prompt on stdin and clash with the TUI's raw key handling).
+      if (intent.command === "stop" && !intent.args.includes("--yes")) {
+        return {
+          kind: "result",
+          ok: false,
+          text: "停止公司将断开所有员工。确认请输入：stop --yes"
         };
       }
       // start must detach inside the TUI so the main loop is not blocked by

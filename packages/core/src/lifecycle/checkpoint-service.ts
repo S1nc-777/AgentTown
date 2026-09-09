@@ -335,7 +335,14 @@ export class CheckpointService {
         await this.#gitLifecycle.settleIntegrationIntent(deadline.controller.signal, deadline.at);
         git = await this.#gitLifecycle.snapshot();
       }
-      const checkpoint = this.#buildCheckpoint(reason, git);
+      const checkpoint = this.#buildCheckpoint(
+        reason,
+        git,
+        // A company being STOPPED must always be able to finish the stop,
+        // even when an earlier failed start left partial session facts. A
+        // paused company is expected to resume, so it stays strict.
+        terminalStatus === "stopped"
+      );
       const stored: StoredCheckpoint = {
         id: randomUUID(),
         companyId: this.#companyId,
@@ -618,7 +625,11 @@ export class CheckpointService {
     return checkpoint;
   }
 
-  #buildCheckpoint(reason: PauseReason, git: GitCheckpoint | null): CompanyCheckpoint {
+  #buildCheckpoint(
+    reason: PauseReason,
+    git: GitCheckpoint | null,
+    tolerateMissingSessions = false
+  ): CompanyCheckpoint {
     const tasks = this.#store.listTasks(this.#companyId);
     const sessions = new Map(
       this.#store.listSessions(this.#companyId).map((session) => [session.employeeId, session])
@@ -628,19 +639,22 @@ export class CheckpointService {
       reason,
       lastEventSequence: this.#store.getLatestEventSequence(),
       git,
-      sessions: this.#company.employees.map((employee) => {
+      sessions: this.#company.employees.flatMap((employee) => {
         const session = sessions.get(employee.id);
-        if (session === undefined) throw new Error(`active session fact missing: ${employee.id}`);
+        if (session === undefined) {
+          if (tolerateMissingSessions) return [];
+          throw new Error(`active session fact missing: ${employee.id}`);
+        }
         const task = tasks.find((candidate) =>
           candidate.ownerEmployeeId === employee.id
           && (candidate.status === "running" || candidate.status === "review")
         );
-        return {
+        return [{
           employeeId: employee.id,
           handle: session.handle,
           activeTaskId: task?.id ?? null,
           handoff: this.#handoff(employee, task)
-        };
+        }];
       })
     };
   }
