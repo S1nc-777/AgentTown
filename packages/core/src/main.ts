@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   lstat,
   readFile,
@@ -593,6 +594,24 @@ function gitEnabledFor(
   });
 }
 
+/**
+ * True when `ancestor` is reachable from `descendant` in the repository —
+ * used to confirm that a Git run's integration commit was actually merged
+ * into the branch before the run adopts a new baseline.
+ */
+function isGitAncestor(
+  projectRoot: string,
+  ancestor: string,
+  descendant: string
+): boolean {
+  const result = spawnSync(
+    "git",
+    ["merge-base", "--is-ancestor", ancestor, descendant],
+    { cwd: projectRoot, windowsHide: true, stdio: "ignore" }
+  );
+  return result.status === 0;
+}
+
 interface GitWiring {
   workflow: GitTaskWorkflow;
   coordinator: GitWorkflowCoordinator;
@@ -631,13 +650,34 @@ async function setupGitWiring(options: {
     run = await workspaceManager.createRun(runId, baseline);
   } else if (existingRuns.length === 1) {
     run = existingRuns[0]!;
-    if (
-      resolve(run.projectRoot) !== resolve(baseline.projectRoot)
-      || run.baseCommit !== baseline.baseCommit
-    ) {
-      throw new Error(
-        "existing Git run baseline does not match the current repository"
+    const sameBaseline = resolve(run.projectRoot) === resolve(baseline.projectRoot)
+      && run.baseCommit === baseline.baseCommit;
+    if (!sameBaseline) {
+      // The repository advanced past this run's baseline — normally because
+      // the run's own integration commit was merged into the user's branch.
+      // When that delivery is fully integrated and no task is still running
+      // or under review, the run is finished: adopt the new HEAD as the
+      // baseline so the next start works instead of failing forever.
+      const hasUnfinishedTask = options.tasks.list().some((task) =>
+        task.status === "running" || task.status === "review"
       );
+      const sameRoot = resolve(run.projectRoot) === resolve(baseline.projectRoot);
+      const integrated = sameRoot
+        && isGitAncestor(options.projectRoot, run.integrationCommit, baseline.baseCommit);
+      if (hasUnfinishedTask || !integrated) {
+        throw new Error(
+          "existing Git run baseline does not match the current repository"
+        );
+      }
+      const now = new Date().toISOString();
+      run = {
+        ...run,
+        originalBranch: baseline.originalBranch,
+        baseCommit: baseline.baseCommit,
+        status: "active",
+        updatedAt: now
+      };
+      options.store.putGitRun(run);
     }
   } else {
     throw new Error(
