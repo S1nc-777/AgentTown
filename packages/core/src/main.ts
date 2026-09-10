@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import {
   lstat,
   readFile,
@@ -594,24 +593,6 @@ function gitEnabledFor(
   });
 }
 
-/**
- * True when `ancestor` is reachable from `descendant` in the repository —
- * used to confirm that a Git run's integration commit was actually merged
- * into the branch before the run adopts a new baseline.
- */
-function isGitAncestor(
-  projectRoot: string,
-  ancestor: string,
-  descendant: string
-): boolean {
-  const result = spawnSync(
-    "git",
-    ["merge-base", "--is-ancestor", ancestor, descendant],
-    { cwd: projectRoot, windowsHide: true, stdio: "ignore" }
-  );
-  return result.status === 0;
-}
-
 interface GitWiring {
   workflow: GitTaskWorkflow;
   coordinator: GitWorkflowCoordinator;
@@ -654,17 +635,22 @@ async function setupGitWiring(options: {
       && run.baseCommit === baseline.baseCommit;
     if (!sameBaseline) {
       // The repository advanced past this run's baseline — normally because
-      // the run's own integration commit was merged into the user's branch.
-      // When that delivery is fully integrated and no task is still running
-      // or under review, the run is finished: adopt the new HEAD as the
-      // baseline so the next start works instead of failing forever.
+      // the run's own work was integrated into the user's branch (integration
+      // re-commits, so the integration SHA is usually NOT an ancestor of the
+      // new HEAD). When the run has no unfinished work left, adopt the new
+      // HEAD as the baseline so the next start works instead of failing
+      // forever.
+      // Every task of the run is terminal (completed/failed/blocked) and the
+      // project root is unchanged — the run has no work left, so adopting the
+      // advanced HEAD as the new baseline is safe. Task-workspace facts are
+      // NOT consulted here: a finished task's workspace row can stay "active"
+      // in the store after its removal event, which would otherwise block
+      // starting forever.
       const hasUnfinishedTask = options.tasks.list().some((task) =>
         task.status === "running" || task.status === "review"
       );
       const sameRoot = resolve(run.projectRoot) === resolve(baseline.projectRoot);
-      const integrated = sameRoot
-        && isGitAncestor(options.projectRoot, run.integrationCommit, baseline.baseCommit);
-      if (hasUnfinishedTask || !integrated) {
+      if (hasUnfinishedTask || !sameRoot) {
         throw new Error(
           "existing Git run baseline does not match the current repository"
         );
