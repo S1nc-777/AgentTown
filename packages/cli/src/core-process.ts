@@ -3,7 +3,7 @@ import {
   spawn,
   type ChildProcess
 } from "node:child_process";
-import { openSync } from "node:fs";
+import { openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LIVE_ONLY_AFTER_SEQUENCE } from "@agenttown/runtime-contract";
@@ -11,7 +11,10 @@ import { AgentTownClient } from "./client.js";
 import type { AgentTownPaths } from "./paths.js";
 
 const READY_TIMEOUT_MS = 10_000;
-const DETACH_READY_TIMEOUT_MS = 90_000;
+// A healthy core is reachable within a couple of seconds; a core that is
+// still unreachable after this window has failed to start (its log now
+// explains why, and an exited child is detected immediately).
+const DETACH_READY_TIMEOUT_MS = 30_000;
 const STDERR_LIMIT_BYTES = 8 * 1024;
 
 interface ReadyLine {
@@ -261,12 +264,41 @@ export async function spawnCoreDetached(input: {
     } catch (error) {
       lastError = error;
     }
+    // A core that died during startup (bad repository state, invalid
+    // company, port clash) never becomes reachable: surface its real error
+    // immediately instead of making the user wait out the whole timeout.
+    if (child.exitCode !== null) {
+      throw new Error(
+        `Core exited during startup (${describeCoreFailure(input.paths.stateDir)})`,
+        { cause: lastError }
+      );
+    }
     await new Promise<void>((resolvePromise) => {
       setTimeout(resolvePromise, 1_000);
     });
   }
   throw new Error(
-    `Core did not become ready within ${DETACH_READY_TIMEOUT_MS}ms (see ${join(input.paths.stateDir, "core.log")})`,
+    `Core did not become ready within ${DETACH_READY_TIMEOUT_MS}ms (${describeCoreFailure(input.paths.stateDir)})`,
     { cause: lastError }
   );
+}
+
+/**
+ * Reads the tail of `.agenttown/core.log` and extracts the last error line so
+ * a failed core startup explains itself in the CLI output.
+ */
+function describeCoreFailure(stateDir: string): string {
+  const logPath = join(stateDir, "core.log");
+  try {
+    const text = readFileSync(logPath, "utf8");
+    const lines = text.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+    const errorLine = [...lines].reverse().find((line) =>
+      /error|Error|invalid|failed|missing|not clean/u.test(line)
+    );
+    return errorLine === undefined
+      ? `see ${logPath}`
+      : `${errorLine} (see ${logPath})`;
+  } catch {
+    return `see ${logPath}`;
+  }
 }

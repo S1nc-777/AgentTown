@@ -323,8 +323,23 @@ export class RepositoryPreflight {
       ["status", "--porcelain=v2", "--untracked-files=normal"],
       { cwd: canonicalProjectRoot }
     );
-    if (statusResult.stdout.split(/\r?\n/u).some((line) => line.length > 0)) {
-      throw new Error("project worktree is not clean");
+    const dirtyEntries = statusResult.stdout
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        // porcelain v2: "1 <XY> ... <path>" / "? <path>" / "2 <XY> ... <path>"
+        const parts = line.split(" ");
+        return parts[parts.length - 1] ?? line;
+      });
+    if (dirtyEntries.length > 0) {
+      const shown = dirtyEntries.slice(0, 8).join(", ");
+      const more = dirtyEntries.length > 8 ? ` …(+${dirtyEntries.length - 8})` : "";
+      throw new Error(
+        `project worktree is not clean: ${shown}${more} — commit, restore or `
+        + "gitignore these changes (the company needs a clean baseline before "
+        + "it can integrate work)"
+      );
     }
 
     const worktreeResult = await this.#git.run(
