@@ -788,9 +788,18 @@ async function setupGitWiring(options: {
         + JSON.stringify(reconciliation.discrepancies)
       );
     }
-    // The run and its workspaces stay paused here: the pause checkpoint stores
-    // the paused statuses, and company.resume validates that checkpoint before
-    // the reconcile wrapper reactivates the run.
+    // The run and its workspaces stay paused only when the company is
+    // resuming from a pause checkpoint (company.resume validates that
+    // checkpoint and the reconcile wrapper reactivates the run). A company
+    // that is starting FRESH (stopped/blocked/created) must reactivate the
+    // run here: a paused run keeps the Git workflow gate closed, so every
+    // Git-backed action silently falls back to the non-Git workflow and
+    // submissions are rejected.
+    const persistedStatus = options.store.getCompany(options.companyId)?.status;
+    if (persistedStatus !== "paused") {
+      hooks.resumeNewActions();
+      await workspaceManager.reactivateRun(runId);
+    }
   }
 
   const workflow = new GitTaskWorkflow(coordinator);
